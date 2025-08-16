@@ -936,6 +936,9 @@ async def run_drops_workflow(context):
 				name = (st.get('streamer') or '').strip()
 				if not name:
 					continue
+				# Always ignore offline streamers
+				if not bool(st.get('is_live')):
+					continue
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
 					continue

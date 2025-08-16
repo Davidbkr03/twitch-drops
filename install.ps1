@@ -139,9 +139,9 @@ if ($startupChoice -eq 'Y') {
 	if (-not (Test-Path $batPath)) {
 		# Create a default batch if missing
 		@(
-			"@echo off",
-			"cd /d \"%~dp0\"",
-			".\venv\Scripts\pythonw.exe twitch_drop_automator.py"
+			'@echo off',
+			'cd /d "%~dp0"',
+			'.\venv\Scripts\pythonw.exe twitch_drop_automator.py'
 		) | Set-Content -Path $batPath -Encoding ASCII
 	}
 	$shortcutPath = Join-Path $startupFolder 'Twitch Drop Automator.lnk'
