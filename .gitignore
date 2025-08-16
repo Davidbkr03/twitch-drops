@@ -1,0 +1,37 @@
+# Virtual environment
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# Logs and state
+*.log
+logs/
+drops_log.txt
+config.json
+
+# Playwright and browser user data
+user_data/
+user_data_edge/
+user_data_firefox/
+user_data_stealth/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Archives and installers
+*.zip
+*.tar
+*.tar.gz
+*.7z
+python_installer.exe
+
+# Generated icons
+tray.ico
