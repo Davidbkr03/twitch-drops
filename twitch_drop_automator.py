@@ -374,6 +374,30 @@ async def launch_context(p, compat_mode: bool):
 
 	return context, page
 
+async def wait_until_logged_in(context, page) -> None:
+	"""Keep the app open and poll Twitch inventory until the user is logged in (avatar present)."""
+	try:
+		# One-time reminder toast
+		try:
+			send_notification("Twitch Drops", "Waiting for login… Right-click tray → untick 'Headless mode'")
+		except Exception:
+			pass
+		while not EXIT_EVENT.is_set():
+			try:
+				await goto_with_exit(page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+				await maybe_accept_cookies(page)
+				await page.wait_for_timeout(500)
+				avatar = await page.query_selector('img[alt="User Avatar"]')
+				if avatar:
+					logging.info("Detected user avatar; login complete.")
+					return
+				logging.info("Not logged in yet; still waiting…")
+			except Exception:
+				pass
+			await asyncio.sleep(5)
+	finally:
+		return
+
 async def run_flow(p):
 	tried_compat = False
 
@@ -429,10 +453,15 @@ async def run_flow(p):
 				success = True
 				return context
 			except Exception:
-				logging.warning("Could not find user avatar. User may not be logged in.")
-				if passport_429_count["count"] >= PASSPORT_429_THRESHOLD and not tried_compat:
-					logging.warning("Multiple 429s detected during login. Retrying once in compatibility mode.")
-				else:
+				logging.warning("Could not find user avatar. User may not be logged in. Waiting for user to complete login.")
+				await wait_until_logged_in(context, page)
+				# After wait, verify again
+				try:
+					await page.wait_for_selector('img[alt="User Avatar"]', timeout=20000)
+					logging.info("Login detected after waiting.")
+					success = True
+					return context
+				except Exception:
 					raise
 		except Exception as e:
 			if passport_429_count["count"] >= PASSPORT_429_THRESHOLD and not tried_compat:
