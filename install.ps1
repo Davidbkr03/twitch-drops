@@ -155,6 +155,24 @@ if ($startupChoice -eq 'Y') {
 	Write-Info "Startup shortcut created: $shortcutPath"
 }
 
+# 10) Launch now
+Write-Info "Launching Twitch Drop Automator…"
+$batPath = Join-Path $InstallDir 'run_automator.bat'
+if (-not (Test-Path $batPath)) {
+	@(
+		'@echo off',
+		'cd /d "%~dp0"',
+		'.\venv\Scripts\pythonw.exe twitch_drop_automator.py'
+	) | Set-Content -Path $batPath -Encoding ASCII
+}
+if (Test-Path $batPath) {
+	Start-Process -FilePath $batPath -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
+	Write-Host "Tip: To log in the first time, right-click the tray icon and untick 'Headless mode'." -ForegroundColor Yellow
+	Write-Host "The app will restart and open a browser window. After login, you can re-enable headless." -ForegroundColor Yellow
+} else {
+	Write-Warn "Could not find run_automator.bat to launch automatically."
+}
+
 Write-Host "\nInstall complete." -ForegroundColor Green
 Write-Host "- Folder: $InstallDir"
-Write-Host "- To run now: double-click 'run_automator.bat' in the install folder." 
+Write-Host "- To run later: double-click 'run_automator.bat' in the install folder." 

@@ -854,6 +854,15 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 		if EXIT_EVENT.is_set():
 			logging.info("Exit requested; stopping progress polling.")
 			return False
+		# Check live status on Facepunch periodically (every ~2 minutes)
+		try:
+			if waited % max(1, (2 * 60)) == 0:
+				status = await is_streamer_online_on_facepunch(context, streamer_name)
+				if status is False:
+					logging.info(f"Streamer '{streamer_name}' appears offline on Facepunch. Moving on.")
+					return False
+		except Exception:
+			pass
 		try:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
@@ -898,13 +907,11 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 				best = data[0]
 				percent = best.get('percent')
 				title = best.get('title') or streamer_name
-				logging.info(f"Matched Twitch inventory title '{title}' for streamer '{streamer_name}'")
-				if isinstance(percent, int):
-					logging.info(f"[{title}] Progress: {percent}%")
-					last_percent = percent
-					if percent >= 100:
-						await claim_available_rewards(inv_page)
-						return True
+				logging.info(f"[{title}] Progress: {percent}%")
+				last_percent = percent if isinstance(percent, int) else last_percent
+				if isinstance(percent, int) and percent >= 100:
+					await claim_available_rewards(inv_page)
+					return True
 			else:
 				logging.info(f"No inventory entry found for streamer '{streamer_name}'.")
 			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
@@ -914,6 +921,68 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
 			waited += INVENTORY_POLL_INTERVAL_SECONDS
 	logging.info("Max watch time reached without detecting completion.")
+	return False
+
+async def poll_until_title_complete(context, inv_page, target_title_substr: str) -> bool:
+	"""Track progress for an inventory title substring until it reaches 100% or exit is requested."""
+	total_wait_seconds = MAX_WATCH_HOURS_PER_REWARD * 3600
+	waited = 0
+	target_lower = (target_title_substr or '').strip().lower()
+	while waited < total_wait_seconds:
+		if EXIT_EVENT.is_set():
+			return False
+		try:
+			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+			await maybe_accept_cookies(inv_page)
+			await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
+			await inv_page.wait_for_timeout(600)
+			items = await inv_page.evaluate(
+				r"""
+				() => {
+				  const out = [];
+				  const findTitleFrom = (container) => {
+					let node = container;
+					while (node) {
+					  let prev = node.previousElementSibling;
+					  while (prev) {
+						const p = prev.querySelector('p');
+						if (p && p.textContent && p.textContent.trim()) {
+						  return p.textContent.trim();
+						}
+						prev = prev.previousElementSibling;
+					  }
+					  node = node.parentElement;
+					}
+					return null;
+				  };
+				  document.querySelectorAll('[role="progressbar"][aria-valuenow]').forEach(pb => {
+					const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
+					const container = pb.parentElement;
+					const title = findTitleFrom(container);
+					if (title) out.push({ title, percent });
+				  });
+				  return out;
+				}
+				"""
+			)
+			match = None
+			for it in items or []:
+				t = (it.get('title') or '').lower()
+				if target_lower and target_lower in t:
+					match = it
+					break
+			if match and isinstance(match.get('percent'), int):
+				p = match['percent']
+				logging.info(f"[General] {match.get('title')} Progress: {p}%")
+				if p >= 100:
+					await claim_available_rewards(inv_page)
+					return True
+			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
+			waited += INVENTORY_POLL_INTERVAL_SECONDS
+		except Exception as e:
+			logging.warning(f"Poll general title issue: {e}")
+			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
+			waited += INVENTORY_POLL_INTERVAL_SECONDS
 	return False
 
 async def run_drops_workflow(context):
@@ -930,6 +999,16 @@ async def run_drops_workflow(context):
 			# Gather in-progress titles to prioritize watching those
 			progress_map = await get_inventory_progress_map(inv_page)
 			in_progress_titles = { (t or '').lower() for t in progress_map.keys() }
+
+			# If general drops exist, choose the one with the longest required hours
+			longest_general = None
+			try:
+				if fp and fp.get('general'):
+					vals = [g for g in fp['general'] if isinstance(g.get('hours'), int)]
+					if vals:
+						longest_general = max(vals, key=lambda g: g.get('hours') or 0)
+			except Exception:
+				longest_general = None
 
 			candidates = []
 			for st in streamer_targets:
@@ -952,74 +1031,215 @@ async def run_drops_workflow(context):
 						continue
 				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority})
 
-			if not candidates:
-				logging.info("No eligible streamer targets found (all look completed or recently claimed). Stopping workflow.")
-				return
-
-			# Prefer in-progress, then live
-			candidates.sort(key=lambda s: (s.get('priority', 1), 0 if s.get('is_live') else 1))
-			target_st = candidates[0]
-			target_name = target_st.get('streamer')
-			target_url = target_st.get('url')
-			logging.info(f"Chosen streamer: {target_name} (live={bool(target_st.get('is_live'))}, priority={target_st.get('priority')})")
-
-			# Open Facepunch and click the target drop to navigate directly to the stream
-			fp_page = await context.new_page()
-			stream_page = None
-			try:
+			if longest_general:
+				# Watch any live streamer while tracking the general item with longest hours
+				if not candidates:
+					logging.info("No live streamer candidates found; skipping general tracking this cycle.")
+					return
+				candidates.sort(key=lambda s: (s.get('priority', 1)))
+				target_st = candidates[0]
+				target_name = target_st.get('streamer')
+				target_url = target_st.get('url')
+				logging.info(f"General drop mode: tracking '{longest_general.get('item')}' (hours={longest_general.get('hours')}) while watching {target_name}")
+				# Open stream for any live streamer
+				fp_page = await context.new_page()
+				stream_page = None
 				try:
-					await goto_with_exit(fp_page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
-					await asyncio.sleep(0.5)
-					box = await fp_page.query_selector(f'.streamer-drops .drop-box:has(.streamer-name:has-text("{target_name}"))')
-					if box:
-						try:
-							async with context.expect_page() as p_info:
-								btn = await box.query_selector('a.drop-box-body, .drop-box-body')
-								if btn:
-									await btn.click()
-								else:
-									header_link = await box.query_selector('.drop-box-header a.streamer-info')
-									if header_link:
-										await header_link.click()
-							stream_page = await p_info.value
-						except Exception:
-							stream_page = None
-				except Exception:
-					stream_page = None
-				if not stream_page and target_url:
-					stream_page = await context.new_page()
-					await goto_with_exit(stream_page, target_url, timeout=120000, wait_until="domcontentloaded")
-			finally:
+					try:
+						await goto_with_exit(fp_page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
+						await asyncio.sleep(0.5)
+						box = await fp_page.query_selector(f'.streamer-drops .drop-box:has(.streamer-name:has-text("{target_name}"))')
+						if box:
+							try:
+								async with context.expect_page() as p_info:
+									btn = await box.query_selector('a.drop-box-body, .drop-box-body')
+									if btn:
+										await btn.click()
+									else:
+										header_link = await box.query_selector('.drop-box-header a.streamer-info')
+										if header_link:
+											await header_link.click()
+								stream_page = await p_info.value
+							except Exception:
+								stream_page = None
+					except Exception:
+						stream_page = None
+					if not stream_page and target_url:
+						stream_page = await context.new_page()
+						await goto_with_exit(stream_page, target_url, timeout=120000, wait_until="domcontentloaded")
+				finally:
+					try:
+						await fp_page.close()
+					except Exception:
+						pass
+				if not stream_page:
+					logging.error("Could not open stream for chosen target in general mode. Will refresh and pick again.")
+					await asyncio.sleep(2)
+					continue
+				await maybe_accept_cookies(stream_page)
+				send_notification("Twitch Drops", f"Watching {target_name} for general drop '{longest_general.get('item')}'")
+				await ensure_stream_playing(stream_page)
+				await set_low_quality(stream_page)
+				completed = await poll_until_title_complete(context, inv_page, target_title_substr=longest_general.get('item'))
 				try:
-					await fp_page.close()
+					await stream_page.close()
 				except Exception:
 					pass
-
-			if not stream_page:
-				logging.error("Could not open stream for chosen target. Will refresh and pick again.")
-				await asyncio.sleep(2)
+				if completed:
+					logging.info("General drop completed or claimable.")
+					await claim_available_rewards(inv_page)
+				else:
+					logging.info("Moving to next candidate for general drop tracking.")
+				# Refresh targets next loop
+				await asyncio.sleep(1)
 				continue
 
-			await maybe_accept_cookies(stream_page)
-			send_notification("Twitch Drops", f"Now watching {target_name}")
-			await ensure_stream_playing(stream_page)
-			await set_low_quality(stream_page)
+			# Prefer live streamer-specific drops first
+			if candidates:
+				# Prefer in-progress, then live (all are live already)
+				candidates.sort(key=lambda s: (s.get('priority', 1)))
+				target_st = candidates[0]
+				target_name = target_st.get('streamer')
+				target_url = target_st.get('url')
+				logging.info(f"Chosen streamer: {target_name} (live={bool(target_st.get('is_live'))}, priority={target_st.get('priority')})")
+				# Open streamer and run per-streamer completion tracking
+				fp_page = await context.new_page()
+				stream_page = None
+				try:
+					try:
+						await goto_with_exit(fp_page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
+						await asyncio.sleep(0.5)
+						box = await fp_page.query_selector(f'.streamer-drops .drop-box:has(.streamer-name:has-text("{target_name}"))')
+						if box:
+							try:
+								async with context.expect_page() as p_info:
+									btn = await box.query_selector('a.drop-box-body, .drop-box-body')
+									if btn:
+										await btn.click()
+									else:
+										header_link = await box.query_selector('.drop-box-header a.streamer-info')
+										if header_link:
+											await header_link.click()
+								stream_page = await p_info.value
+							except Exception:
+								stream_page = None
+					except Exception:
+						stream_page = None
+					if not stream_page and target_url:
+						stream_page = await context.new_page()
+						await goto_with_exit(stream_page, target_url, timeout=120000, wait_until="domcontentloaded")
+				finally:
+					try:
+						await fp_page.close()
+					except Exception:
+						pass
+				if not stream_page:
+					logging.error("Could not open stream for chosen target. Will refresh and pick again.")
+					await asyncio.sleep(2)
+					continue
+				await maybe_accept_cookies(stream_page)
+				send_notification("Twitch Drops", f"Now watching {target_name}")
+				await ensure_stream_playing(stream_page)
+				await set_low_quality(stream_page)
+				completed = await poll_until_reward_complete(context, inv_page, streamer_name=target_name)
+				try:
+					await stream_page.close()
+				except Exception:
+					pass
+				if completed:
+					logging.info("Streamer reward completed or claimable. Attempting to claim any available rewards and moving to next.")
+					await claim_available_rewards(inv_page)
+					completed_streamers.add((target_name or "").lower())
+				else:
+					logging.info("Moving to next candidate.")
+				# Refresh and next loop
+				await asyncio.sleep(1)
+				continue
 
-			completed = await poll_until_reward_complete(context, inv_page, streamer_name=target_name)
+			# No live streamer candidates left; evaluate general drops
+			if await are_all_general_drops_complete(inv_page, fp.get('general') if fp else None):
+				logging.info("All general drops are complete. Exiting program.")
+				EXIT_EVENT.set()
+				return
+
+			# If general drops remain and any live streamer exists, watch any live streamer while tracking the longest general drop
+			longest_general = None
 			try:
-				await stream_page.close()
+				if fp and fp.get('general'):
+					vals = [g for g in fp['general'] if isinstance(g.get('hours'), int)]
+					if vals:
+						longest_general = max(vals, key=lambda g: g.get('hours') or 0)
 			except Exception:
-				pass
+				longest_general = None
+			if longest_general:
+				# Fetch fresh list of live streamers for general mode
+				live_any = []
+				for st in streamer_targets:
+					if bool(st.get('is_live')) and (st.get('streamer') or '').strip():
+						live_any.append(st)
+				if not live_any:
+					logging.info("No live streamers available to track general drops right now. Retrying later.")
+					await asyncio.sleep(10)
+					continue
+				live_any.sort(key=lambda s: 0 if (s.get('streamer') or '').strip().lower() in in_progress_titles else 1)
+				target_name = (live_any[0].get('streamer') or '').strip()
+				target_url = live_any[0].get('url')
+				logging.info(f"General drop mode: tracking '{longest_general.get('item')}' (hours={longest_general.get('hours')}) while watching {target_name}")
+				fp_page = await context.new_page()
+				stream_page = None
+				try:
+					try:
+						await goto_with_exit(fp_page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
+						await asyncio.sleep(0.5)
+						box = await fp_page.query_selector(f'.streamer-drops .drop-box:has(.streamer-name:has-text("{target_name}"))')
+						if box:
+							try:
+								async with context.expect_page() as p_info:
+									btn = await box.query_selector('a.drop-box-body, .drop-box-body')
+									if btn:
+										await btn.click()
+									else:
+										header_link = await box.query_selector('.drop-box-header a.streamer-info')
+										if header_link:
+											await header_link.click()
+								stream_page = await p_info.value
+							except Exception:
+								stream_page = None
+					except Exception:
+						stream_page = None
+					if not stream_page and target_url:
+						stream_page = await context.new_page()
+						await goto_with_exit(stream_page, target_url, timeout=120000, wait_until="domcontentloaded")
+				finally:
+					try:
+						await fp_page.close()
+					except Exception:
+						pass
+				if not stream_page:
+					logging.error("Could not open stream for chosen target in general mode. Will refresh and pick again.")
+					await asyncio.sleep(2)
+					continue
+				await maybe_accept_cookies(stream_page)
+				send_notification("Twitch Drops", f"Watching {target_name} for general drop '{longest_general.get('item')}'")
+				await ensure_stream_playing(stream_page)
+				await set_low_quality(stream_page)
+				completed = await poll_until_title_complete(context, inv_page, target_title_substr=longest_general.get('item'))
+				try:
+					await stream_page.close()
+				except Exception:
+					pass
+				if completed:
+					logging.info("General drop completed or claimable.")
+					await claim_available_rewards(inv_page)
+				# Loop continues; streamer-specific drops have priority when available
+				await asyncio.sleep(1)
+				continue
 
-			if completed:
-				logging.info("Streamer reward completed or claimable. Attempting to claim any available rewards and moving to next.")
-				await claim_available_rewards(inv_page)
-				completed_streamers.add((target_name or "").lower())
-			else:
-				logging.info("Max watch time reached without detecting completion for this streamer. Moving to next candidate.")
+			# No streamers and no general strategy applicable; wait briefly
+			logging.info("No live streamer drops and no general progress to track. Retrying shortly.")
+			await asyncio.sleep(10)
+			continue
 
-			# Refresh targets next loop to account for live/offline changes
-			await asyncio.sleep(1)
 	finally:
 		try:
 			await inv_page.close()
@@ -1052,6 +1272,54 @@ async def main():
 			logging.info("Closing browser.")
 			await context.close()
 	logging.info("--- Automator finished ---")
+
+async def is_streamer_online_on_facepunch(context, streamer_name: str) -> bool | None:
+	"""Return True if Facepunch page shows the given streamer online, False if found and offline,
+	None if not found on page (unknown)."""
+	if not streamer_name:
+		return None
+	page = await context.new_page()
+	try:
+		await goto_with_exit(page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
+		await asyncio.sleep(0.5)
+		box = await page.query_selector(f'.streamer-drops .drop-box:has(.streamer-name:has-text("{streamer_name}"))')
+		if not box:
+			return None
+		online_node = await box.query_selector('.online-status, div.online-status')
+		return True if online_node else False
+	except Exception:
+		return None
+	finally:
+		try:
+			await page.close()
+		except Exception:
+			pass
+
+async def are_all_general_drops_complete(inv_page, general_list) -> bool:
+	try:
+		if not general_list:
+			return True
+		progress_map = await get_inventory_progress_map(inv_page)
+		if not progress_map:
+			return False
+		def find_percent_for(item_name: str) -> int | None:
+			needle = (item_name or '').strip().lower()
+			for title, pct in progress_map.items():
+				t = (title or '').lower()
+				if needle and needle in t:
+					return pct if isinstance(pct, int) else None
+			return None
+		for g in general_list:
+			name = g.get('item') if isinstance(g, dict) else None
+			if not name:
+				continue
+			pct = find_percent_for(name)
+			if pct is None or pct < 100:
+				return False
+		return True
+	except Exception:
+		return False
+
 
 def _get_preferred_interpreter_for_visibility() -> tuple[str, int]:
 	try:
