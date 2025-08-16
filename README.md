@@ -8,8 +8,8 @@ Run this in PowerShell from the folder where you want everything stored. The ins
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-# Replace owner/repo and branch if needed
-.\install.ps1 -Repo "owner/repo" -Branch "main"
+# The installer defaults to this repo; -Repo is optional now
+.\install.ps1 -Branch "main"
 ```
 
 - You’ll be warned that all data (logs, user data) is stored in the install folder.
@@ -19,7 +19,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 If you prefer a direct zip URL instead of repo/branch:
 
 ```powershell
-.\install.ps1 -ZipUrl "https://github.com/owner/repo/archive/refs/heads/main.zip"
+.\install.ps1 -ZipUrl "https://github.com/Davidbkr03/twitch-drops/archive/refs/heads/main.zip"
 ```
 
 ## Tray Menu

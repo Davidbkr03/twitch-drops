@@ -1,5 +1,5 @@
 param(
-	[string]$Repo = "",            # e.g. "owner/repo"
+	[string]$Repo = "Davidbkr03/twitch-drops",            # default GitHub repo
 	[string]$Branch = "main",
 	[string]$ZipUrl = "",          # If provided, overrides Repo/Branch
 	[string]$InstallDir = "",      # If empty, a folder named 'TwitchDropAutomator' will be created under the current directory
