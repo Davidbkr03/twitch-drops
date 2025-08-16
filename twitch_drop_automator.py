@@ -473,8 +473,8 @@ async def fetch_facepunch_drops(context):
 			boxes = await page.query_selector_all('.streamer-drops .drop-box')
 			for box in boxes:
 				try:
-					classes = (await box.get_attribute('class')) or ''
-					is_live = 'is-live' in classes
+					online_node = await box.query_selector('.online-status, div.online-status')
+					is_live = bool(online_node)
 					streamer_el = await box.query_selector('.streamer-name')
 					streamer = (await streamer_el.inner_text()).strip() if streamer_el else None
 					url_el = await box.query_selector('.drop-box-header a.streamer-info')
