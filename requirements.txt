@@ -3,3 +3,5 @@ playwright-stealth>=1.0.6
 pystray>=0.19.5
 Pillow>=9.2.0
 win10toast>=0.9; sys_platform == "win32"
+pyobjc-core>=10.3; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.3; sys_platform == "darwin"

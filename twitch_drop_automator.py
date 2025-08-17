@@ -201,7 +201,7 @@ def _generate_tray_icon_image():
 		return None
 
 
-def start_system_tray():
+def start_system_tray(block: bool = False):
 	if pystray is None:
 		logging.info("pystray/Pillow not available; tray icon disabled.")
 		return None
@@ -274,9 +274,15 @@ def start_system_tray():
 	icon = pystray.Icon("TwitchDropAutomator", image, "Twitch Drop Automator", menu=menu)
 	global TRAY_IMAGE
 	TRAY_IMAGE = image
-	icon.run_detached()
-	atexit.register(lambda: icon.stop())
-	return icon
+	if block:
+		# On macOS, Cocoa requires the app loop on the main thread
+		atexit.register(lambda: icon.stop())
+		icon.run()
+		return icon
+	else:
+		icon.run_detached()
+		atexit.register(lambda: icon.stop())
+		return icon
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -339,12 +345,25 @@ async def launch_context(p, compat_mode: bool):
 		args.append("--disable-blink-features=AutomationControlled")
 		ignore_default_args = ["--enable-automation"]
 
-	# Attempt preferred browser channel first, then fall back to default if missing
-	try:
+	# macOS: strictly require Google Chrome, no Chromium fallback
+	if IS_MAC:
+		def _find_macos_chrome_executable():
+			candidates = [
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+				"/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+			]
+			for path in candidates:
+				if os.path.exists(path):
+					return path
+			return None
+		chrome_exec = _find_macos_chrome_executable()
+		if not chrome_exec:
+			raise RuntimeError("Google Chrome is required on macOS. Please install it from https://www.google.com/chrome/")
 		context = await p.chromium.launch_persistent_context(
 			USER_DATA_DIR,
 			headless=get_headless_preference(),
-			channel=BROWSER_CHANNEL,
+			executable_path=chrome_exec,
 			slow_mo=50,
 			ignore_default_args=ignore_default_args,
 			args=args,
@@ -352,18 +371,32 @@ async def launch_context(p, compat_mode: bool):
 			viewport={"width": 1366, "height": 768},
 			locale="en-US",
 		)
-	except Exception as e:
-		logging.warning(f"Primary browser channel '{BROWSER_CHANNEL}' failed ({e}). Falling back to default Chromium.")
-		context = await p.chromium.launch_persistent_context(
-			USER_DATA_DIR,
-			headless=get_headless_preference(),
-			slow_mo=50,
-			ignore_default_args=ignore_default_args,
-			args=args,
-			user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
-			viewport={"width": 1366, "height": 768},
-			locale="en-US",
-		)
+	else:
+		# Other platforms: try preferred channel, then fall back to default Chromium
+		try:
+			context = await p.chromium.launch_persistent_context(
+				USER_DATA_DIR,
+				headless=get_headless_preference(),
+				channel=BROWSER_CHANNEL,
+				slow_mo=50,
+				ignore_default_args=ignore_default_args,
+				args=args,
+				user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
+				viewport={"width": 1366, "height": 768},
+				locale="en-US",
+			)
+		except Exception as e:
+			logging.warning(f"Primary browser channel '{BROWSER_CHANNEL}' failed ({e}). Falling back to default Chromium.")
+			context = await p.chromium.launch_persistent_context(
+				USER_DATA_DIR,
+				headless=get_headless_preference(),
+				slow_mo=50,
+				ignore_default_args=ignore_default_args,
+				args=args,
+				user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
+				viewport={"width": 1366, "height": 768},
+				locale="en-US",
+			)
 
 	await apply_stealth_to_context(context, profile=("off" if compat_mode else STEALTH_PROFILE))
 
@@ -1438,12 +1471,13 @@ async def run_drops_workflow(context):
 		except Exception:
 			pass
 
-async def main():
+async def main(start_tray: bool = True):
 	logging.info("--- Starting Twitch Drop Automator ---")
-	# Start tray icon for quick toggles
+	# Start tray icon for quick toggles (optionally skipped on macOS; see __main__)
 	try:
 		global TRAY_ICON, ICON_PATH
-		TRAY_ICON = start_system_tray()
+		if start_tray:
+			TRAY_ICON = start_system_tray(block=False)
 		# Prepare .ico for notifications regardless of tray availability
 		ICON_PATH = ensure_icon_file(_generate_tray_icon_image())
 		logging.info(f"Notification icon: {ICON_PATH}")
@@ -1560,7 +1594,31 @@ if __name__ == "__main__":
 		ensure_process_visibility_matches_preference()
 	except Exception:
 		pass
-	try:
-		asyncio.run(main())
-	except KeyboardInterrupt:
-		pass
+	# On macOS, run tray in the main thread and the async app in a background thread
+	if IS_MAC and pystray is not None:
+		def _run_async_app():
+			try:
+				asyncio.run(main(start_tray=False))
+			except KeyboardInterrupt:
+				pass
+			except Exception:
+				# Ensure any exception doesn't kill the process silently
+				logging.exception("Async app crashed")
+		thread = threading.Thread(target=_run_async_app, daemon=True)
+		thread.start()
+		try:
+			# Block here to keep Cocoa on main thread
+			start_system_tray(block=True)
+		except Exception:
+			logging.debug("Tray main loop exited")
+		# Request shutdown and wait briefly
+		EXIT_EVENT.set()
+		try:
+			thread.join(timeout=5.0)
+		except Exception:
+			pass
+	else:
+		try:
+			asyncio.run(main(start_tray=True))
+		except KeyboardInterrupt:
+			pass

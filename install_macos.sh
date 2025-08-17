@@ -115,6 +115,37 @@ fi
 echo "[INFO] Installing Playwright browsers…"
 "${PY_BIN}" -m playwright install
 
+# Ensure Google Chrome exists (required on macOS). If missing, install via Homebrew.
+ensure_brew() {
+  if command -v brew >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "[INFO] Homebrew not found. Installing Homebrew…"
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  # Add brew to current shell session PATH
+  if [ -x "/opt/homebrew/bin/brew" ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [ -x "/usr/local/bin/brew" ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
+}
+
+has_chrome() {
+  [[ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]] || \
+  [[ -x "${HOME}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]] || \
+  [[ -x "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" ]]
+}
+
+if ! has_chrome; then
+  echo "[INFO] Google Chrome not found. Attempting to install via Homebrew…"
+  ensure_brew
+  brew install --cask google-chrome || true
+  if ! has_chrome; then
+    echo "[ERROR] Failed to detect Google Chrome after Homebrew install. Please install from https://www.google.com/chrome/ and re-run." >&2
+    exit 1
+  fi
+fi
+
 # Ensure runner script exists and is executable
 RUNNER="${INSTALL_DIR}/run_automator.sh"
 if [[ ! -f "${RUNNER}" ]]; then

@@ -35,6 +35,12 @@ Options:
 - `-q` to run quietly (no prompts)
 - `-l` to add a Login Item (LaunchAgent)
 
+The macOS installer will:
+- Create a venv, install requirements, and `playwright install`
+- Ensure Homebrew is installed
+- Install Google Chrome via Homebrew if not present
+- Optionally add a Login Item and then launch the app
+
 ```
 
 ## Tray Menu
@@ -98,6 +104,11 @@ Optional helper script:
 ```bash
 chmod +x ./run_automator.sh
 ./run_automator.sh
+
+Notes:
+- Notifications use native macOS notifications via `osascript`.
+- The tray icon requires `pystray` and `Pillow` (installed via `requirements.txt`).
+- Google Chrome is required on macOS (no Chromium fallback). Install from `https://www.google.com/chrome/`.
 ```
 
 ## Start on Login
