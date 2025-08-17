@@ -11,6 +11,10 @@ import signal
 import sys
 import subprocess
 
+# --- Platform detection ---
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+
 try:
 	import pystray
 	from PIL import Image, ImageDraw
@@ -104,20 +108,30 @@ def send_notification(title: str, message: str):
 	if not NOTIFICATIONS_ENABLED:
 		return
 	try:
-		icon_path = ICON_PATH if ICON_PATH and os.path.exists(ICON_PATH) else None
-		if not ToastNotifier:
-			logging.debug("win10toast not available; skipping notification.")
-			return
-		toaster = ToastNotifier()
-		try:
-			if icon_path:
-				toaster.show_toast(title, message, icon_path=icon_path, duration=3, threaded=False)
-			else:
+		if IS_WINDOWS and ToastNotifier:
+			icon_path = ICON_PATH if ICON_PATH and os.path.exists(ICON_PATH) else None
+			toaster = ToastNotifier()
+			try:
+				if icon_path:
+					toaster.show_toast(title, message, icon_path=icon_path, duration=3, threaded=False)
+				else:
+					toaster.show_toast(title, message, duration=3, threaded=False)
+			except TypeError:
 				toaster.show_toast(title, message, duration=3, threaded=False)
-		except TypeError:
-			# Retry without icon if the underlying WinAPI wrapper rejects None/handles
-			toaster.show_toast(title, message, duration=3, threaded=False)
-		logging.info("Notification queued via win10toast")
+			logging.info("Notification queued via win10toast")
+			return
+		if IS_MAC:
+			# Use AppleScript for native notifications without extra deps
+			try:
+				def _escape_applescript(s: str) -> str:
+					return (s or "").replace("\\", "\\\\").replace("\"", "\\\"")
+				script = f'display notification "{_escape_applescript(message)}" with title "{_escape_applescript(title)}"'
+				subprocess.run(["osascript", "-e", script], check=False)
+				logging.info("Notification sent via osascript")
+				return
+			except Exception as _:
+				pass
+		logging.debug("No compatible notifier available on this platform; skipping notification.")
 	except Exception as e:
 		logging.warning(f"Notification failed: {e}")
 
@@ -127,19 +141,23 @@ def restart_program():
 		with CONFIG_LOCK:
 			hide = bool(PREFERENCES.get("hide_console", True))
 		script_path = os.path.join(BASE_DIR, os.path.basename(__file__) if '__file__' in globals() else 'twitch_drop_automator.py')
-		venv_py = os.path.join(BASE_DIR, 'venv', 'Scripts', 'python.exe')
-		venv_pyw = os.path.join(BASE_DIR, 'venv', 'Scripts', 'pythonw.exe')
 		interpreter = None
-		if hide and os.path.exists(venv_pyw):
-			interpreter = venv_pyw
-		elif os.path.exists(venv_py):
-			interpreter = venv_py
-		else:
-			interpreter = sys.executable
 		creationflags = 0
-		if hide and interpreter.lower().endswith('python.exe'):
-			# If we had to fall back to python.exe, still try to launch without a console window
-			creationflags |= 0x08000000  # CREATE_NO_WINDOW
+		if IS_WINDOWS:
+			venv_py = os.path.join(BASE_DIR, 'venv', 'Scripts', 'python.exe')
+			venv_pyw = os.path.join(BASE_DIR, 'venv', 'Scripts', 'pythonw.exe')
+			if hide and os.path.exists(venv_pyw):
+				interpreter = venv_pyw
+			elif os.path.exists(venv_py):
+				interpreter = venv_py
+			else:
+				interpreter = sys.executable
+			if hide and interpreter.lower().endswith('python.exe'):
+				creationflags |= 0x08000000  # CREATE_NO_WINDOW
+		else:
+			# POSIX: prefer venv/bin/python if present; no hidden-console concept
+			venv_py = os.path.join(BASE_DIR, 'venv', 'bin', 'python')
+			interpreter = venv_py if os.path.exists(venv_py) else sys.executable
 		subprocess.Popen([interpreter, script_path], cwd=BASE_DIR, creationflags=creationflags)
 	except Exception as e:
 		logging.warning(f"Restart spawn failed: {e}")
@@ -321,17 +339,31 @@ async def launch_context(p, compat_mode: bool):
 		args.append("--disable-blink-features=AutomationControlled")
 		ignore_default_args = ["--enable-automation"]
 
-	context = await p.chromium.launch_persistent_context(
-		USER_DATA_DIR,
-		headless=get_headless_preference(),
-		channel=BROWSER_CHANNEL,
-		slow_mo=50,
-		ignore_default_args=ignore_default_args,
-		args=args,
-		user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
-		viewport={"width": 1366, "height": 768},
-		locale="en-US",
-	)
+	# Attempt preferred browser channel first, then fall back to default if missing
+	try:
+		context = await p.chromium.launch_persistent_context(
+			USER_DATA_DIR,
+			headless=get_headless_preference(),
+			channel=BROWSER_CHANNEL,
+			slow_mo=50,
+			ignore_default_args=ignore_default_args,
+			args=args,
+			user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
+			viewport={"width": 1366, "height": 768},
+			locale="en-US",
+		)
+	except Exception as e:
+		logging.warning(f"Primary browser channel '{BROWSER_CHANNEL}' failed ({e}). Falling back to default Chromium.")
+		context = await p.chromium.launch_persistent_context(
+			USER_DATA_DIR,
+			headless=get_headless_preference(),
+			slow_mo=50,
+			ignore_default_args=ignore_default_args,
+			args=args,
+			user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
+			viewport={"width": 1366, "height": 768},
+			locale="en-US",
+		)
 
 	await apply_stealth_to_context(context, profile=("off" if compat_mode else STEALTH_PROFILE))
 
@@ -1483,20 +1515,23 @@ async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 
 def _get_preferred_interpreter_for_visibility() -> tuple[str, int]:
 	try:
-		with CONFIG_LOCK:
-			hide = bool(PREFERENCES.get("hide_console", True))
-		venv_py = os.path.join(BASE_DIR, 'venv', 'Scripts', 'python.exe')
-		venv_pyw = os.path.join(BASE_DIR, 'venv', 'Scripts', 'pythonw.exe')
-		if hide and os.path.exists(venv_pyw):
-			return (venv_pyw, 0)
-		if (not hide) and os.path.exists(venv_py):
-			return (venv_py, 0)
-		# Fallback to current interpreter
-		interp = sys.executable
-		flags = 0
-		if hide and interp.lower().endswith('python.exe'):
-			flags = 0x08000000  # CREATE_NO_WINDOW
-		return (interp, flags)
+		if IS_WINDOWS:
+			with CONFIG_LOCK:
+				hide = bool(PREFERENCES.get("hide_console", True))
+			venv_py = os.path.join(BASE_DIR, 'venv', 'Scripts', 'python.exe')
+			venv_pyw = os.path.join(BASE_DIR, 'venv', 'Scripts', 'pythonw.exe')
+			if hide and os.path.exists(venv_pyw):
+				return (venv_pyw, 0)
+			if (not hide) and os.path.exists(venv_py):
+				return (venv_py, 0)
+			# Fallback to current interpreter
+			interp = sys.executable
+			flags = 0
+			if hide and interp.lower().endswith('python.exe'):
+				flags = 0x08000000  # CREATE_NO_WINDOW
+			return (interp, flags)
+		# Non-Windows: do not attempt to toggle visibility; just use current interpreter
+		return (sys.executable, 0)
 	except Exception:
 		return (sys.executable, 0)
 

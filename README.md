@@ -20,6 +20,21 @@ If you prefer a direct zip URL instead of repo/branch:
 
 ```powershell
 .\install.ps1 -ZipUrl "https://github.com/Davidbkr03/twitch-drops/archive/refs/heads/main.zip"
+## Quick Install (macOS)
+
+Run this in Terminal from the folder where you want everything stored. The installer will download the repo, set up a venv, install dependencies, install Playwright browsers, optionally add a Login Item, and launch the app.
+
+```bash
+curl -L -o install_macos.sh "https://raw.githubusercontent.com/Davidbkr03/twitch-drops/main/install_macos.sh" && \
+bash install_macos.sh -r "Davidbkr03/twitch-drops" -b "main"
+```
+
+Options:
+- `-d PATH` to choose install directory (default: `./TwitchDropAutomator`)
+- `-z URL` to use a direct .zip URL instead of repo/branch
+- `-q` to run quietly (no prompts)
+- `-l` to add a Login Item (LaunchAgent)
+
 ```
 
 ## Tray Menu
@@ -54,12 +69,45 @@ python twitch_drop_automator.py
 ```
 Log into Twitch in the opened browser once. Your session will persist.
 
+## macOS Setup
+
+1) Ensure `python3` is installed (from System or `https://www.python.org/`).
+
+2) Create and activate a virtual environment in the project folder:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+3) Install dependencies and Playwright browsers:
+
+```bash
+pip install -r requirements.txt
+playwright install
+```
+
+4) Run it:
+
+```bash
+python3 twitch_drop_automator.py
+```
+
+Optional helper script:
+
+```bash
+chmod +x ./run_automator.sh
+./run_automator.sh
+```
+
 ## Start on Login
 
 - Using the installer: answer Y when prompted, and it will add a Startup shortcut to run `run_automator.bat`.
 - Manual method:
   - Press Win+R, type `shell:startup`, and press Enter.
   - Create a shortcut in that folder pointing to `run_automator.bat` in your install directory.
+
+On macOS, add `run_automator.sh` to Login Items (System Settings → General → Login Items). Ensure it has execute permission and its working directory is this project folder.
 
 ## Data & Logs
 
