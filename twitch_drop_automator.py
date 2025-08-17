@@ -17,12 +17,9 @@ try:
 except Exception:
 	pystray = None
 
-try:
-	from winotify import Notification
-except Exception:
-	Notification = None
-
-# Optional fallback notifier
+# Notifications
+Notification = None
+# Optional notifier (single implementation: win10toast)
 try:
 	from win10toast import ToastNotifier  # type: ignore
 except Exception:
@@ -107,36 +104,20 @@ def send_notification(title: str, message: str):
 	if not NOTIFICATIONS_ENABLED:
 		return
 	try:
-		used = None
 		icon_path = ICON_PATH if ICON_PATH and os.path.exists(ICON_PATH) else None
-		if ToastNotifier:
-			# Prefer win10toast for reliability on some systems
-			toaster = ToastNotifier()
-			try:
-				if icon_path:
-					toaster.show_toast(title, message, icon_path=icon_path, duration=3, threaded=False)
-				else:
-					toaster.show_toast(title, message, duration=3, threaded=False)
-				used = f"win10toast(icon={'yes' if icon_path else 'no'})"
-			except TypeError:
-				# Retry without icon if the underlying WinAPI wrapper rejects None/handles
-				try:
-					toaster.show_toast(title, message, duration=3, threaded=False)
-					used = "win10toast(icon=no, retry)"
-				except Exception:
-					raise
-		elif Notification:
-			n = Notification(app_id="Twitch Drop Automator", title=title, msg=message, icon=icon_path, duration="short")
-			try:
-				n.set_audio(None, loop=False)
-			except Exception:
-				pass
-			n.show()
-			used = f"winotify(app_id='Twitch Drop Automator', icon={'yes' if icon_path else 'no'})"
-		else:
-			logging.debug("No notifier available; skipping notification.")
+		if not ToastNotifier:
+			logging.debug("win10toast not available; skipping notification.")
 			return
-		logging.info(f"Notification queued via {used}")
+		toaster = ToastNotifier()
+		try:
+			if icon_path:
+				toaster.show_toast(title, message, icon_path=icon_path, duration=3, threaded=False)
+			else:
+				toaster.show_toast(title, message, duration=3, threaded=False)
+		except TypeError:
+			# Retry without icon if the underlying WinAPI wrapper rejects None/handles
+			toaster.show_toast(title, message, duration=3, threaded=False)
+		logging.info("Notification queued via win10toast")
 	except Exception as e:
 		logging.warning(f"Notification failed: {e}")
 
@@ -526,19 +507,93 @@ async def fetch_facepunch_drops(context):
 					continue
 		except Exception:
 			pass
-		# Fallback regex for general drops
+		# General drops (DOM first, regex fallback)
 		general = []
+		# DOM approach
 		try:
-			body = await page.inner_text('body')
-			m = re.search(r"General Drops(.*?)(Streamer Drops|Drops Metrics|FAQ|Frequently Asked Questions|$)", body, flags=re.S)
-			if m:
-				general_section = m.group(1)
-				for gm in re.finditer(r"General Drop\s+([A-Za-z0-9 \-]+?)\s+(\d+)\s+Hour", general_section):
-					item = gm.group(1).strip()
-					hours = _safe_int(gm.group(2))
-					general.append({"item": item, "hours": hours})
+			# Wait for section container if possible
+			try:
+				await page.wait_for_selector('#drops .drops-container', timeout=6000)
+			except Exception:
+				pass
+			data = await page.evaluate(
+				r"""
+				() => {
+				  const res = [];
+				  const boxes = Array.from(document.querySelectorAll('#drops .drops-container .drop-box'));
+				  const allBoxes = boxes.length ? boxes : Array.from(document.querySelectorAll('.drop-box'));
+				  for (const box of allBoxes) {
+				    const headerEl = box.querySelector('.drop-box-header');
+				    let headerText = '';
+				    if (headerEl) {
+				      headerText = (headerEl.innerText || headerEl.textContent || '').trim();
+				    }
+				    const isGeneral = /\bgeneral\s+drop\b/i.test(headerText);
+				    let alias = null;
+				    try {
+				      const m = headerText.match(/([A-Za-z0-9]+)\s+GENERAL\s+DROP/i);
+				      if (m) alias = m[1];
+				    } catch (e) {}
+				    const itemEl = box.querySelector('.drop-box-footer .drop-type');
+				    const item = itemEl && itemEl.textContent ? itemEl.textContent.trim() : null;
+				    const timeEl = box.querySelector('.drop-box-footer .drop-time span');
+				    let hours = null;
+				    if (timeEl && timeEl.textContent) {
+				      const m = timeEl.textContent.match(/(\d+)/);
+				      if (m) hours = parseInt(m[1], 10);
+				    }
+				    res.push({ headerText, isGeneral, item, hours, alias });
+				  }
+				  return res;
+				}
+				"""
+			)
+			try:
+				gen_candidates = [d for d in (data or []) if d and d.get('isGeneral')]
+				headers_preview = ', '.join([(d.get('headerText') or '') for d in (data or [])][:5])
+				logging.debug(f"General scan: boxes={len(data or [])}, general_candidates={len(gen_candidates)}, sample_headers=[{headers_preview}]")
+			except Exception:
+				pass
+			for d in data or []:
+				try:
+					if d.get('isGeneral') and d.get('item'):
+						general.append({"item": d.get('item'), "hours": d.get('hours'), "alias": d.get('alias'), "header": d.get('headerText')})
+				except Exception:
+					continue
 		except Exception:
 			pass
+
+		# Regex fallback
+		if not general:
+			try:
+				body = await page.inner_text('body')
+				m = re.search(r"General Drops(.*?)(Streamer Drops|Drops Metrics|FAQ|Frequently Asked Questions|$)", body, flags=re.S)
+				if m:
+					general_section = m.group(1)
+					for gm in re.finditer(r"General Drop\s+([A-Za-z0-9 \-]+?)\s+(\d+)\s+Hour", general_section):
+						item = gm.group(1).strip()
+						hours = _safe_int(gm.group(2))
+						general.append({"item": item, "hours": hours})
+			except Exception:
+				pass
+
+		# Console dump of general drops and longest
+		try:
+			if general:
+				logging.info("General drops found:")
+				for g in general:
+					logging.info(f"- {g.get('item')} = {g.get('hours')} hours (alias={g.get('alias')})")
+				vals = [g for g in general if isinstance(g.get('hours'), int)]
+				if vals:
+					longest = max(vals, key=lambda g: g.get('hours') or 0)
+					logging.info(f"Longest general drop: {longest.get('item')} ({longest.get('hours')} hours)")
+				else:
+					logging.info("Could not determine longest general drop (missing hour values).")
+			else:
+				logging.info("No general drops parsed from Facepunch this cycle.")
+		except Exception:
+			pass
+
 		logging.info(f"Facepunch drops parsed. General: {len(general)}, Streamer: {len(streamer_specific)}")
 		return {"general": general, "streamer": streamer_specific}
 	except Exception as e:
@@ -567,9 +622,9 @@ async def get_inventory_progress_map(inv_page):
 				while (node) {
 				  let prev = node.previousElementSibling;
 				  while (prev) {
-					const p = prev.querySelector('p');
-					if (p && p.textContent && p.textContent.trim()) {
-					  return p.textContent.trim();
+					const titleEl = prev.querySelector('p.CoreText-sc-1txzju1-0, p');
+					if (titleEl && titleEl.textContent && titleEl.textContent.trim()) {
+					  return titleEl.textContent.trim();
 					}
 					prev = prev.previousElementSibling;
 				  }
@@ -896,7 +951,12 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
 			# ensure progressbars rendered
-			await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
+			# progressbars sometimes mount late; wait a bit and re-check
+			try:
+				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
+			except Exception:
+				await inv_page.wait_for_timeout(800)
+				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
 			await inv_page.wait_for_timeout(600)
 			data = await inv_page.evaluate(
 				r"""
@@ -963,20 +1023,24 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 		try:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
-			await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
+			try:
+				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
+			except Exception:
+				await inv_page.wait_for_timeout(800)
+				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
 			await inv_page.wait_for_timeout(600)
 			items = await inv_page.evaluate(
 				r"""
-				() => {
+				(titleNeedleLower) => {
 				  const out = [];
 				  const findTitleFrom = (container) => {
 					let node = container;
 					while (node) {
 					  let prev = node.previousElementSibling;
 					  while (prev) {
-						const p = prev.querySelector('p');
-						if (p && p.textContent && p.textContent.trim()) {
-						  return p.textContent.trim();
+						const el = prev.querySelector('p, h1, h2, h3, h4, h5, h6, span');
+						if (el && el.textContent && el.textContent.trim()) {
+						  return el.textContent.trim();
 						}
 						prev = prev.previousElementSibling;
 					  }
@@ -987,17 +1051,25 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 				  document.querySelectorAll('[role="progressbar"][aria-valuenow]').forEach(pb => {
 					const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
 					const container = pb.parentElement;
-					const title = findTitleFrom(container);
-					if (title) out.push({ title, percent });
+					let title = findTitleFrom(container) || '';
+					if (!title) {
+					  const card = pb.closest('[role="group"], [data-test-selector], .Layout-sc');
+					  if (card) {
+					    const t = card.querySelector('p, span, h3');
+					    if (t && t.textContent) title = t.textContent.trim();
+					  }
+					}
+					const tLower = (title || '').toLowerCase();
+					out.push({ title, percent, match: titleNeedleLower && tLower.includes(titleNeedleLower) });
 				  });
 				  return out;
 				}
-				"""
+				""",
+				target_lower
 			)
 			match = None
 			for it in items or []:
-				t = (it.get('title') or '').lower()
-				if target_lower and target_lower in t:
+				if it.get('match'):
 					match = it
 					break
 			if match and isinstance(match.get('percent'), int):
@@ -1014,6 +1086,110 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 			waited += INVENTORY_POLL_INTERVAL_SECONDS
 	return False
 
+
+async def poll_general_until_complete_or_streamer_available(context, inv_page, target_title_substr: str, completed_streamers) -> tuple[bool, bool]:
+	"""Poll the general drop progress by title substring. Return (completed, switch_to_streamer).
+
+	Switch to streamer when any live streamer-specific drop is detected as present in inventory and < 100%.
+	"""
+	total_wait_seconds = MAX_WATCH_HOURS_PER_REWARD * 3600
+	waited = 0
+	target_lower = (target_title_substr or '').strip().lower()
+	while waited < total_wait_seconds:
+		if EXIT_EVENT.is_set():
+			return (False, False)
+		try:
+			# Check general progress
+			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+			await maybe_accept_cookies(inv_page)
+			try:
+				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
+			except Exception:
+				await inv_page.wait_for_timeout(800)
+				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
+			await inv_page.wait_for_timeout(600)
+			items = await inv_page.evaluate(
+				r"""
+				(titleNeedleLower) => {
+				  const out = [];
+				  const findTitleFrom = (container) => {
+					let node = container;
+					while (node) {
+					  let prev = node.previousElementSibling;
+					  while (prev) {
+						const el = prev.querySelector('p, h1, h2, h3, h4, h5, h6, span');
+						if (el && el.textContent && el.textContent.trim()) {
+						  return el.textContent.trim();
+						}
+						prev = prev.previousElementSibling;
+					  }
+					  node = node.parentElement;
+					}
+					return null;
+				  };
+				  document.querySelectorAll('[role=\"progressbar\"][aria-valuenow]').forEach(pb => {
+					const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
+					const container = pb.parentElement;
+					let title = findTitleFrom(container) || '';
+					if (!title) {
+					  const card = pb.closest('[role=\"group\"], [data-test-selector], .Layout-sc');
+					  if (card) {
+					    const t = card.querySelector('p, span, h3');
+					    if (t && t.textContent) title = t.textContent.trim();
+					  }
+					}
+					const tLower = (title || '').toLowerCase();
+					out.push({ title, percent, match: titleNeedleLower && tLower.includes(titleNeedleLower) });
+				  });
+				  return out;
+				}
+				""",
+				target_lower
+			)
+			match = None
+			for it in items or []:
+				if it.get('match'):
+					match = it
+					break
+			if match and isinstance(match.get('percent'), int):
+				p = match['percent']
+				logging.info(f"[General] {match.get('title')} Progress: {p}%")
+				if p >= 100:
+					await claim_available_rewards(inv_page)
+					return (True, False)
+
+			# After logging progress, also check if any streamer-specific items need progress
+			fp = await fetch_facepunch_drops(context)
+			streamer_targets = fp.get('streamer', []) if fp else []
+			progress_map = await get_inventory_progress_map(inv_page)
+			in_progress_titles = { (t or '').lower() for t in (progress_map or {}).keys() }
+			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
+			for st in streamer_targets:
+				name = (st.get('streamer') or '').strip()
+				if not name or not bool(st.get('is_live')):
+					continue
+				name_lower = name.lower()
+				if name_lower in completed_streamers:
+					continue
+				match_pct = None
+				for t_lower, pct in inventory_entries:
+					if name_lower in t_lower and isinstance(pct, int):
+						match_pct = pct
+						break
+				if match_pct is None or match_pct >= 100:
+					continue
+				# Found a streamer-specific item that needs progress → switch
+				logging.info(f"Streamer-specific drop available again: {name} ({match_pct}%). Switching from general mode.")
+				return (False, True)
+
+			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
+			waited += INVENTORY_POLL_INTERVAL_SECONDS
+		except Exception as e:
+			logging.warning(f"Poll general/switch check issue: {e}")
+			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
+			waited += INVENTORY_POLL_INTERVAL_SECONDS
+	return (False, False)
+
 async def run_drops_workflow(context):
 	inv_page = await context.new_page()
 	completed_streamers = set()
@@ -1029,104 +1205,49 @@ async def run_drops_workflow(context):
 			progress_map = await get_inventory_progress_map(inv_page)
 			in_progress_titles = { (t or '').lower() for t in progress_map.keys() }
 
-			# If general drops exist, choose the one with the longest required hours
+			# Defer general drop decision until after streamer candidates are considered
 			longest_general = None
-			try:
-				if fp and fp.get('general'):
-					vals = [g for g in fp['general'] if isinstance(g.get('hours'), int)]
-					if vals:
-						longest_general = max(vals, key=lambda g: g.get('hours') or 0)
-			except Exception:
-				longest_general = None
 
+			# Build candidates only for streamer-specific items present in inventory (<100%)
 			candidates = []
+			live_any = []
+			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
 			for st in streamer_targets:
 				name = (st.get('streamer') or '').strip()
 				if not name:
 					continue
-				# Always ignore offline streamers
+				if bool(st.get('is_live')):
+					live_any.append(st)
+				# Only consider live streamers for watching
 				if not bool(st.get('is_live')):
 					continue
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
 					continue
-				# If in progress, keep and mark as priority
+				# Find matching inventory entry and its percent
+				match_pct = None
+				for t_lower, pct in inventory_entries:
+					if name_lower in t_lower and isinstance(pct, int):
+						match_pct = pct
+						break
+				# Skip if no streamer-specific entry exists in inventory or it's already 100%
+				if match_pct is None or match_pct >= 100:
+					continue
+				# Prioritize those already in progress (name present in any title)
 				priority = 0 if any(name_lower in t for t in in_progress_titles) else 1
 				if priority == 1:
-					# Not in progress; check recent claimed age
+					# Not in progress; check recent claimed age to avoid very recent repeats
 					days = await get_claimed_days_for_streamer(inv_page, name)
 					if days is not None and days < 20:
-						# Claimed too recently; skip
 						continue
-				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority})
+				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority, "pct": match_pct})
 
-			if longest_general:
-				# Watch any live streamer while tracking the general item with longest hours
-				if not candidates:
-					logging.info("No live streamer candidates found; skipping general tracking this cycle.")
-					return
-				candidates.sort(key=lambda s: (s.get('priority', 1)))
-				target_st = candidates[0]
-				target_name = target_st.get('streamer')
-				target_url = target_st.get('url')
-				logging.info(f"General drop mode: tracking '{longest_general.get('item')}' (hours={longest_general.get('hours')}) while watching {target_name}")
-				# Open stream for any live streamer
-				fp_page = await context.new_page()
-				stream_page = None
-				try:
-					try:
-						await goto_with_exit(fp_page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
-						await asyncio.sleep(0.5)
-						box = await fp_page.query_selector(f'.streamer-drops .drop-box:has(.streamer-name:has-text("{target_name}"))')
-						if box:
-							try:
-								async with context.expect_page() as p_info:
-									btn = await box.query_selector('a.drop-box-body, .drop-box-body')
-									if btn:
-										await btn.click()
-									else:
-										header_link = await box.query_selector('.drop-box-header a.streamer-info')
-										if header_link:
-											await header_link.click()
-								stream_page = await p_info.value
-							except Exception:
-								stream_page = None
-					except Exception:
-						stream_page = None
-					if not stream_page and target_url:
-						stream_page = await context.new_page()
-						await goto_with_exit(stream_page, target_url, timeout=120000, wait_until="domcontentloaded")
-				finally:
-					try:
-						await fp_page.close()
-					except Exception:
-						pass
-				if not stream_page:
-					logging.error("Could not open stream for chosen target in general mode. Will refresh and pick again.")
-					await asyncio.sleep(2)
-					continue
-				await maybe_accept_cookies(stream_page)
-				send_notification("Twitch Drops", f"Watching {target_name} for general drop '{longest_general.get('item')}'")
-				await ensure_stream_playing(stream_page)
-				await set_low_quality(stream_page)
-				completed = await poll_until_title_complete(context, inv_page, target_title_substr=longest_general.get('item'))
-				try:
-					await stream_page.close()
-				except Exception:
-					pass
-				if completed:
-					logging.info("General drop completed or claimable.")
-					await claim_available_rewards(inv_page)
-				else:
-					logging.info("Moving to next candidate for general drop tracking.")
-				# Refresh targets next loop
-				await asyncio.sleep(1)
-				continue
+			# Do not enter general mode here; prefer streamer-specific workflow below
 
-			# Prefer live streamer-specific drops first
+			# Prefer live streamer-specific drops first (only when we actually have streamer-specific items to progress)
 			if candidates:
 				# Prefer in-progress, then live (all are live already)
-				candidates.sort(key=lambda s: (s.get('priority', 1)))
+				candidates.sort(key=lambda s: (s.get('priority', 1), s.get('pct', 101)))
 				target_st = candidates[0]
 				target_name = target_st.get('streamer')
 				target_url = target_st.get('url')
@@ -1185,7 +1306,7 @@ async def run_drops_workflow(context):
 				await asyncio.sleep(1)
 				continue
 
-			# No live streamer candidates left; evaluate general drops
+			# If no streamer-specific items need progress, evaluate general drops
 			if await are_all_general_drops_complete(inv_page, fp.get('general') if fp else None):
 				logging.info("All general drops are complete. Exiting program.")
 				EXIT_EVENT.set()
@@ -1201,11 +1322,7 @@ async def run_drops_workflow(context):
 			except Exception:
 				longest_general = None
 			if longest_general:
-				# Fetch fresh list of live streamers for general mode
-				live_any = []
-				for st in streamer_targets:
-					if bool(st.get('is_live')) and (st.get('streamer') or '').strip():
-						live_any.append(st)
+				# Use any live streamer while tracking the general item
 				if not live_any:
 					logging.info("No live streamers available to track general drops right now. Retrying later.")
 					await asyncio.sleep(10)
@@ -1249,10 +1366,20 @@ async def run_drops_workflow(context):
 					await asyncio.sleep(2)
 					continue
 				await maybe_accept_cookies(stream_page)
-				send_notification("Twitch Drops", f"Watching {target_name} for general drop '{longest_general.get('item')}'")
+				alias_txt = (longest_general.get('alias') or '').strip()
+				item_txt = (longest_general.get('item') or '').strip()
+				desc = item_txt if item_txt else alias_txt
+				if item_txt and alias_txt:
+					desc = f"{item_txt} ({alias_txt})"
+				send_notification("Twitch Drops", f"Watching {target_name} for general drop '{desc}'")
 				await ensure_stream_playing(stream_page)
 				await set_low_quality(stream_page)
-				completed = await poll_until_title_complete(context, inv_page, target_title_substr=longest_general.get('item'))
+				completed, switch = await poll_general_until_complete_or_streamer_available(
+					context,
+					inv_page,
+					target_title_substr=((longest_general.get('alias') or longest_general.get('item') or '')),
+					completed_streamers=completed_streamers
+				)
 				try:
 					await stream_page.close()
 				except Exception:
@@ -1260,6 +1387,10 @@ async def run_drops_workflow(context):
 				if completed:
 					logging.info("General drop completed or claimable.")
 					await claim_available_rewards(inv_page)
+				elif switch:
+					logging.info("Switching to streamer-specific mode; a needed streamer drop is available again.")
+					await asyncio.sleep(1)
+					continue
 				# Loop continues; streamer-specific drops have priority when available
 				await asyncio.sleep(1)
 				continue
