@@ -540,6 +540,17 @@ async def fetch_facepunch_drops(context):
 	page = await context.new_page()
 	try:
 		await goto_with_exit(page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
+		# Hard refresh just for Facepunch: clear origin Cache Storage, then reload
+		try:
+			await page.evaluate("caches && caches.keys && caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k))))")
+		except Exception:
+			pass
+		try:
+			await page.reload(ignore_http_errors=True, timeout=120000)
+			await page.wait_for_load_state("domcontentloaded")
+		except Exception:
+			# Fallback: navigate again if reload fails
+			await goto_with_exit(page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
 		await asyncio.sleep(1)
 		# Prefer DOM parsing for streamer drops
 		streamer_specific = []
@@ -1226,25 +1237,26 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			# After logging progress, also check if any streamer-specific items need progress
 			fp = await fetch_facepunch_drops(context)
 			streamer_targets = fp.get('streamer', []) if fp else []
-			progress_map = await get_inventory_progress_map(inv_page)
-			in_progress_titles = { (t or '').lower() for t in (progress_map or {}).keys() }
-			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
 			for st in streamer_targets:
 				name = (st.get('streamer') or '').strip()
-				if not name or not bool(st.get('is_live')):
+				if not name:
+					continue
+				# Only use Facepunch for live status
+				if not bool(st.get('is_live')):
 					continue
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
 					continue
-				match_pct = None
-				for t_lower, pct in inventory_entries:
-					if name_lower in t_lower and isinstance(pct, int):
-						match_pct = pct
-						break
-				if match_pct is None or match_pct >= 100:
+				# If we haven't already completed this streamer drop historically, switch now
+				try:
+					days = await get_claimed_days_for_streamer(inv_page, name)
+				except Exception:
+					days = None
+				if days is not None:
+					# Already claimed previously; skip
 					continue
-				# Found a streamer-specific item that needs progress → switch
-				logging.info(f"Streamer-specific drop available again: {name} ({match_pct}%). Switching from general mode.")
+				# Found a live streamer whose drop has not been claimed yet → switch
+				logging.info(f"Streamer-specific drop available again: {name}. Switching from general mode.")
 				return (False, True)
 
 			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
