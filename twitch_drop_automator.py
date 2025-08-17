@@ -421,19 +421,30 @@ async def launch_context(p, compat_mode: bool):
 	return context, page
 
 async def wait_until_logged_in(context, page) -> None:
-	"""Keep the app open and poll Twitch inventory until the user is logged in (avatar present)."""
+	"""Keep the app open and poll Twitch inventory until the user is logged in (avatar present).
+
+	This uses a separate background tab so we don't interrupt whatever tab the user is using to log in.
+	"""
+	poll_page = None
 	try:
 		# One-time reminder toast
 		try:
 			send_notification("Twitch Drops", "Waiting for login… Right-click tray → untick 'Headless mode'")
 		except Exception:
 			pass
+		# Open a separate tab for polling login status
+		try:
+			poll_page = await context.new_page()
+		except Exception:
+			poll_page = None
 		while not EXIT_EVENT.is_set():
 			try:
-				await goto_with_exit(page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
-				await maybe_accept_cookies(page)
-				await page.wait_for_timeout(500)
-				avatar = await page.query_selector('img[alt="User Avatar"]')
+				if poll_page is None:
+					poll_page = await context.new_page()
+				await goto_with_exit(poll_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+				await maybe_accept_cookies(poll_page)
+				await poll_page.wait_for_timeout(500)
+				avatar = await poll_page.query_selector('img[alt="User Avatar"]')
 				if avatar:
 					logging.info("Detected user avatar; login complete.")
 					return
@@ -442,6 +453,11 @@ async def wait_until_logged_in(context, page) -> None:
 				pass
 			await asyncio.sleep(5)
 	finally:
+		try:
+			if poll_page:
+				await poll_page.close()
+		except Exception:
+			pass
 		return
 
 async def run_flow(p):

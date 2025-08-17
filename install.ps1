@@ -3,8 +3,68 @@ param(
 	[string]$Branch = "main",
 	[string]$ZipUrl = "",          # If provided, overrides Repo/Branch
 	[string]$InstallDir = "",      # If empty, a folder named 'TwitchDropAutomator' will be created under the current directory
-	[switch]$Quiet
+	[switch]$Quiet,
+	[switch]$SkipSelfUpdate         # internal use: prevents recursive self-update
 )
+
+# @installer_version: 1.0.0
+$LocalInstallerVersion = '1.0.0'
+
+function Compare-SemVer([string]$a, [string]$b) {
+	try { $va = [version]$a } catch { $va = [version]::new(0,0,0) }
+	try { $vb = [version]$b } catch { $vb = [version]::new(0,0,0) }
+	return $va.CompareTo($vb)
+}
+
+function Get-RemoteInstallerVersion([string]$content) {
+	if ([string]::IsNullOrWhiteSpace($content)) { return $null }
+	$match = [regex]::Match($content, '(?im)^\s*#\s*@installer_version:\s*([0-9]+(?:\.[0-9]+){0,3})\s*$')
+	if ($match.Success) { return $match.Groups[1].Value }
+	$match2 = [regex]::Match($content, "\$LocalInstallerVersion\s*=\s*'([^']+)'")
+	if ($match2.Success) { return $match2.Groups[1].Value }
+	return $null
+}
+
+# Self-update: fetch latest install.ps1 from the target repo and re-run it if newer
+if (-not $SkipSelfUpdate) {
+	try {
+		if (-not [string]::IsNullOrWhiteSpace($Repo) -and -not [string]::IsNullOrWhiteSpace($Branch)) {
+			# Ensure TLS1.2
+			try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+			$rawUrl = "https://raw.githubusercontent.com/$Repo/$Branch/install.ps1"
+			$remote = $null
+			try {
+				$remote = (Invoke-WebRequest -Uri $rawUrl -UseBasicParsing -TimeoutSec 20).Content
+			} catch {}
+			if ($remote) {
+				$remoteVer = Get-RemoteInstallerVersion $remote
+				if ($remoteVer) {
+					$cmp = Compare-SemVer $LocalInstallerVersion $remoteVer
+					if ($cmp -lt 0) {
+						Write-Host "[INFO] New installer available (local v$LocalInstallerVersion → remote v$remoteVer)." -ForegroundColor Cyan
+						$proceed = $true
+						if (-not $Quiet) {
+							$resp = Read-Host "Update installer and continue? (Y/N)"
+							if ($resp -notin @('y','Y')) { $proceed = $false }
+						}
+						if ($proceed) {
+							$tmpUpdate = Join-Path $env:TEMP ("install_new_" + [guid]::NewGuid().ToString() + ".ps1")
+							$remote | Set-Content -Path $tmpUpdate -Encoding UTF8
+							# Re-run the new installer with the same parameters, but skip self-update to avoid loops
+							$argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$tmpUpdate`"",'-Repo',"`"$Repo`"",'-Branch',"`"$Branch`"")
+							if ($ZipUrl) { $argList += @('-ZipUrl',"`"$ZipUrl`"") }
+							if ($InstallDir) { $argList += @('-InstallDir',"`"$InstallDir`"") }
+							if ($Quiet) { $argList += '-Quiet' }
+							$argList += '-SkipSelfUpdate'
+							Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden | Out-Null
+							exit 0
+						}
+					}
+				}
+			}
+		}
+	} catch {}
+}
 
 function Write-Info($msg) { Write-Host "[INFO] $msg" -ForegroundColor Cyan }
 function Write-Warn($msg) { Write-Host "[WARN] $msg" -ForegroundColor Yellow }
