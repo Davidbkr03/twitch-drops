@@ -1004,21 +1004,29 @@ async def set_low_quality(stream_page):
 	except Exception:
 		pass
 
-async def claim_available_rewards(inv_page):
+async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
+	"""Click all visible 'Claim' buttons on the inventory page.
+
+	Returns the number of claims clicked. When navigate=False, assumes caller is already on the inventory page.
+	"""
+	claimed = 0
 	try:
-		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
-		await maybe_accept_cookies(inv_page)
-		await inv_page.wait_for_timeout(500)
+		if navigate:
+			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+			await maybe_accept_cookies(inv_page)
+			await inv_page.wait_for_timeout(500)
 		claim_buttons = await inv_page.query_selector_all('button:has-text("Claim")')
 		for btn in claim_buttons:
 			try:
 				await btn.click()
+				claimed += 1
 				logging.info("Claimed a reward")
 				await asyncio.sleep(0.5)
 			except Exception:
 				continue
 	except Exception:
 		pass
+	return claimed
 
 async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 	total_wait_seconds = MAX_WATCH_HOURS_PER_REWARD * 3600
@@ -1042,13 +1050,24 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 		try:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
-			# ensure progressbars rendered
-			# progressbars sometimes mount late; wait a bit and re-check
+			# Early claim: if Claim button present, click and finish (progressbar may be gone at 100%)
+			await inv_page.wait_for_timeout(400)
+			try:
+				if await inv_page.query_selector('button:has-text("Claim")'):
+					c = await claim_available_rewards(inv_page, navigate=False)
+					if c > 0:
+						return True
+			except Exception:
+				pass
+			# ensure progressbars rendered (if present)
 			try:
 				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
 			except Exception:
 				await inv_page.wait_for_timeout(800)
-				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
+				try:
+					await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
+				except Exception:
+					pass
 			await inv_page.wait_for_timeout(600)
 			data = await inv_page.evaluate(
 				r"""
@@ -1115,11 +1134,24 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 		try:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
+			# Early claim if present
+			await inv_page.wait_for_timeout(400)
+			try:
+				if await inv_page.query_selector('button:has-text("Claim")'):
+					c = await claim_available_rewards(inv_page, navigate=False)
+					if c > 0:
+						return True
+			except Exception:
+				pass
+			# Progressbars may not exist when the item is claimable; do not treat as error
 			try:
 				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
 			except Exception:
 				await inv_page.wait_for_timeout(800)
-				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
+				try:
+					await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
+				except Exception:
+					pass
 			await inv_page.wait_for_timeout(600)
 			items = await inv_page.evaluate(
 				r"""
@@ -1194,11 +1226,24 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			# Check general progress
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
+			# Early claim if present
+			await inv_page.wait_for_timeout(400)
+			try:
+				if await inv_page.query_selector('button:has-text("Claim")'):
+					c = await claim_available_rewards(inv_page, navigate=False)
+					if c > 0:
+						return (True, False)
+			except Exception:
+				pass
+			# Progressbars may not exist when the item is claimable; do not treat as error
 			try:
 				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
 			except Exception:
 				await inv_page.wait_for_timeout(800)
-				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
+				try:
+					await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
+				except Exception:
+					pass
 			await inv_page.wait_for_timeout(600)
 			items = await inv_page.evaluate(
 				r"""
@@ -1400,6 +1445,11 @@ async def run_drops_workflow(context):
 				continue
 
 			# If no streamer-specific items need progress, evaluate general drops
+			# First, claim any available rewards to ensure we don't exit with pending claims
+			try:
+				await claim_available_rewards(inv_page)
+			except Exception:
+				pass
 			if await are_all_general_drops_complete(inv_page, fp.get('general') if fp else None):
 				logging.info("All general drops are complete. Exiting program.")
 				EXIT_EVENT.set()
@@ -1549,26 +1599,103 @@ async def is_streamer_online_on_facepunch(context, streamer_name: str) -> bool |
 		except Exception:
 			pass
 
+async def is_general_item_claimed_on_inventory(inv_page, item_name: str) -> bool | None:
+	"""Best-effort check if a general drop item appears claimed on the inventory page.
+
+	Looks for the item name nearby a time/claimed label like 'x days ago', 'yesterday', or text containing 'claimed'.
+	Assumes caller has already navigated to the inventory page.
+	"""
+	name_lower = (item_name or '').strip().lower()
+	if not name_lower:
+		return None
+	try:
+		await inv_page.wait_for_timeout(200)
+		return await inv_page.evaluate(
+			r"""
+			(args) => {
+			  const needle = (args && args.itemLower) || '';
+			  if (!needle) return null;
+			  const isTimeOrClaim = (s) => {
+			    if (!s) return false;
+			    const t = s.trim().toLowerCase();
+			    if (t.includes('claimed')) return true;
+			    if (t.includes('yesterday')) return true;
+			    if (t.includes('last month')) return true;
+			    if (/\bminutes?\s+ago\b/.test(t)) return true;
+			    if (/\bhours?\s+ago\b/.test(t)) return true;
+			    if (/\bdays?\s+ago\b/.test(t)) return true;
+			    if (/\bmonths?\s+ago\b/.test(t)) return true;
+			    if (/\byears?\s+ago\b/.test(t)) return true;
+			    return false;
+			  };
+			  const all = Array.from(document.querySelectorAll('p, span, div, a'));
+			  const nameEls = all.filter(el => {
+			    const txt = (el.textContent || '').toLowerCase();
+			    return txt && txt.includes(needle);
+			  }).slice(0, 40);
+			  const upDepth = 6;
+			  for (const el of nameEls) {
+			    let node = el;
+			    for (let d = 0; d < upDepth && node; d++, node = node.parentElement) {
+			      const timeEl = Array.from(node.querySelectorAll('p, span, div'))
+			        .find(e => isTimeOrClaim(e.textContent || ''));
+			      if (timeEl) return true;
+			      // Also detect disabled Awarded button within the same card
+			      const btn = Array.from(node.querySelectorAll('button[aria-label], button[disabled]'))
+			        .find(b => {
+			          const al = (b.getAttribute('aria-label') || '').toLowerCase();
+			          const tc = (b.textContent || '').toLowerCase();
+			          const disabled = b.hasAttribute('disabled');
+			          return disabled && (al.includes('awarded') || tc.includes('awarded'));
+			        });
+			      if (btn) return true;
+			    }
+			  }
+			  return null;
+			}
+			""",
+			{"itemLower": name_lower}
+		)
+	except Exception:
+		return None
+
 async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 	try:
 		if not general_list:
 			return True
+		# Ensure we are on inventory and scrape current progressbars once
 		progress_map = await get_inventory_progress_map(inv_page)
-		if not progress_map:
-			return False
-		def find_percent_for(item_name: str) -> int | None:
-			needle = (item_name or '').strip().lower()
+		if progress_map is None:
+			progress_map = {}
+		def find_percent_for_any(needles: list[str]) -> int | None:
+			cands = [n.strip().lower() for n in (needles or []) if n and n.strip()]
+			if not cands:
+				return None
 			for title, pct in progress_map.items():
 				t = (title or '').lower()
-				if needle and needle in t:
+				if any(n in t for n in cands):
 					return pct if isinstance(pct, int) else None
 			return None
 		for g in general_list:
-			name = g.get('item') if isinstance(g, dict) else None
-			if not name:
+			item_name = g.get('item') if isinstance(g, dict) else None
+			alias = g.get('alias') if isinstance(g, dict) else None
+			if not item_name and not alias:
 				continue
-			pct = find_percent_for(name)
-			if pct is None or pct < 100:
+			pct = find_percent_for_any([item_name or '', alias or ''])
+			if isinstance(pct, int):
+				if pct < 100:
+					return False
+				continue
+			# Not found in progress map; treat as claimed/not-present → probe for claimed label
+			# Try alias first as it usually appears in Twitch inventory titles (e.g., 'SPIICY' → 'Spicy AR')
+			claimed = False
+			if alias:
+				res = await is_general_item_claimed_on_inventory(inv_page, alias)
+				claimed = bool(res)
+			if not claimed and item_name:
+				res2 = await is_general_item_claimed_on_inventory(inv_page, item_name)
+				claimed = bool(res2)
+			if not claimed:
 				return False
 		return True
 	except Exception:
