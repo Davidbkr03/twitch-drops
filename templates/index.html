@@ -1044,6 +1044,19 @@
             addLogEntry('Drops data updated via WebSocket', 'info');
         });
 
+        // Backend debug logs
+        socket.on('debug_log', function(data) {
+            try {
+                if (!data) return;
+                const msg = data.message || JSON.stringify(data);
+                const level = (data.level || 'info').toLowerCase();
+                addLogEntry(msg, level);
+                console.log('[debug_log]', level, msg);
+            } catch (e) {
+                console.warn('Failed to render debug_log:', e);
+            }
+        });
+
         socket.on('drops_error', function(data) {
             addLogEntry('Drops update error: ' + data.error, 'error');
         });

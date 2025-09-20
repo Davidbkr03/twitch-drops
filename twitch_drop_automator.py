@@ -1992,6 +1992,25 @@ async def get_incomplete_rust_rewards(inv_page):
 	rewards.sort(key=lambda r: (r["percent"] if r["percent"] is not None else -1))
 	return rewards
 
+def emit_debug(message: str, level: str = "info"):
+	"""Emit a debug line to both logger and WebSocket (UI log)."""
+	try:
+		msg = f"{message}"
+		if level == "error":
+			logging.error(msg)
+		elif level == "warning":
+			logging.warning(msg)
+		else:
+			logging.info(msg)
+		global socketio
+		if socketio is not None:
+			try:
+				socketio.emit('debug_log', { 'message': msg, 'level': level })
+			except Exception:
+				pass
+	except Exception:
+		pass
+
 def generate_search_variations(base_name: str) -> list[str]:
 	"""Generate lowercase search variations for a given name.
 	Examples: "FOOLISH - VAGABOND JACKET" -> ["foolish - vagabond jacket", "foolish", "vagabond jacket"].
@@ -2048,6 +2067,7 @@ async def scrape_recent_claimed_items(inv_page):
 		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 		await maybe_accept_cookies(inv_page)
 		await inv_page.wait_for_timeout(400)
+		emit_debug("[claimed-sweep] Navigating inventory for sweep")
 		items = await inv_page.evaluate(
 			r"""
 			() => {
@@ -2127,19 +2147,22 @@ async def scrape_recent_claimed_items(inv_page):
 			}
 			"""
 		)
+		emit_debug(f"[claimed-sweep] Found {len(items or [])} claimed candidates (<=21d)")
 		return items or []
 	except Exception as e:
-		logging.debug(f"Failed to scrape recent claimed items: {e}")
+		emit_debug(f"[claimed-sweep] Failed: {e}", 'warning')
 		return []
 	
 	# Create multiple search variations for better matching
 	search_variations = generate_search_variations(target_lower)
+	emit_debug(f"[claimed-check] Variations for '{streamer_name}': {search_variations}")
 	
 	try:
 		# Ensure page is loaded
 		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 		await maybe_accept_cookies(inv_page)
 		await inv_page.wait_for_timeout(400)
+		emit_debug(f"[claimed-check] Navigating inventory for '{streamer_name}'")
 		days = await inv_page.evaluate(
 			r"""
 			(args) => {
@@ -2231,7 +2254,7 @@ async def scrape_recent_claimed_items(inv_page):
 		)
 		return days
 	except Exception as e:
-		logging.debug(f"Claimed days lookup failed for {streamer_name}: {e}")
+		emit_debug(f"[claimed-check] Failed for '{streamer_name}': {e}", 'warning')
 		return None
 
 async def pick_live_rust_stream_with_drops(context, preferred_streamers=None):
@@ -2797,6 +2820,7 @@ async def run_drops_workflow(context, test_mode=False):
 					if name_lower in t_lower and isinstance(pct, int):
 						match_pct = pct
 						break
+				emit_debug(f"[candidates] {name}: inventory match_pct={match_pct}")
 				
 				# If match_pct is None, it means the drop hasn't started yet (not on Twitch inventory)
 				# This is exactly what we want to work on!
@@ -2812,12 +2836,14 @@ async def run_drops_workflow(context, test_mode=False):
 					priority = 1
 					item_name = st.get('item', 'Unknown')
 					streamer_drops_with_progress.append(f"{name} ({match_pct}%) - {item_name}")
+					emit_debug(f"[candidates] {name}: set priority=1 (in-progress {match_pct}%)")
 				else:
 					# Not on Twitch inventory = unstarted drop
 					# Before considering, check if this was recently claimed (<= 21 days). If so, skip entirely.
 					priority = 2
 					# Check if we recently claimed this to avoid immediate repeats
 					days = await get_claimed_days_for_streamer(inv_page, name)
+					emit_debug(f"[candidates] {name}: claimed-days direct={days}")
 					if days is None:
 						# Fallback: sweep claimed items and match by name variations
 						try:
@@ -2828,16 +2854,19 @@ async def run_drops_workflow(context, test_mode=False):
 								for v in name_vars:
 									if v and v in n:
 										days = int(it.get('days')) if isinstance(it.get('days'), int) else 0
+										emit_debug(f"[candidates] {name}: sweep matched '{n}' via '{v}', days={days}")
 										break
 								if days is not None:
 									break
-						except Exception:
-							pass
+						except Exception as e:
+							emit_debug(f"[candidates] {name}: sweep error {e}", 'warning')
 					if days is not None and days <= 21:
+						emit_debug(f"[candidates] {name}: skip (claimed {days} day(s) ago)")
 						logging.info(f"Skipping streamer '{name}': claimed {days} day(s) ago.")
 						continue
 					item_name = st.get('item', 'Unknown')
 					streamer_drops_no_progress.append(f"{name} - {item_name}")
+					emit_debug(f"[candidates] {name}: set priority=2 (no progress)")
 				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority, "pct": match_pct, "item": st.get('item')})
 
 			# Populate general drops debug list
