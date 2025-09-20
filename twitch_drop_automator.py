@@ -2056,30 +2056,45 @@ async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | N
 				return null;
 			  };
 			  
-			  // First, try to find the claimed section specifically
-			  const claimedSection = document.querySelector('[data-a-target="claimed-section"], [data-testid="claimed-section"], .claimed-section, [aria-label*="claimed"], [aria-label*="Claimed"]') ||
-									Array.from(document.querySelectorAll('div, section')).find(el => {
-										const text = (el.textContent || '').toLowerCase();
-										return text.includes('claimed') && text.length < 100; // Short text likely to be a section header
-									});
+			  // Find the claimed section by looking for the "Claimed" header and its container
+			  const claimedHeader = Array.from(document.querySelectorAll('h5')).find(h5 => 
+				(h5.textContent || '').trim().toLowerCase() === 'claimed'
+			  );
+			  
+			  let claimedSection = null;
+			  if (claimedHeader) {
+				// Find the tower container that comes after the header
+				claimedSection = claimedHeader.closest('div').querySelector('.ScTower-sc-1sjzzes-0, .tw-tower');
+			  }
+			  
+			  // Fallback: try to find any element containing "claimed" text
+			  if (!claimedSection) {
+				claimedSection = Array.from(document.querySelectorAll('div, section')).find(el => {
+					const text = (el.textContent || '').toLowerCase();
+					return text.includes('claimed') && text.length < 100;
+				});
+			  }
 			  
 			  // Define search scope - prefer claimed section if found, otherwise search entire page
 			  const searchScope = claimedSection || document;
 			  
 			  // Try each search variation
 			  for (const targetLower of searchVariations) {
-				const all = Array.from(searchScope.querySelectorAll('p, span, div, a, h1, h2, h3, h4, h5, h6'));
-				const nameEls = all.filter(el => {
+				// Look specifically for drop name elements with class kGfRxP (the drop name class)
+				const nameEls = Array.from(searchScope.querySelectorAll('p.CoreText-sc-1txzju1-0.kGfRxP, p[class*="kGfRxP"]'));
+				
+				const matchingNameEl = nameEls.find(el => {
 					const txt = (el.textContent || '').toLowerCase();
 					return txt && txt.includes(targetLower);
-				}).slice(0, 30);
+				});
 				
-				const upDepth = 5;
-				for (const el of nameEls) {
-					let node = el;
-					for (let d = 0; d < upDepth && node; d++, node = node.parentElement) {
-						const timeEl = Array.from(node.querySelectorAll('p, span, div')).find(e => isTimeText(e.textContent || ''));
-						if (timeEl) {
+				if (matchingNameEl) {
+					// Find the timestamp element in the same drop container
+					// Look for the timestamp element with class jPfhdt
+					const dropContainer = matchingNameEl.closest('div.Layout-sc-1xcs6mc-0.fHdBNk');
+					if (dropContainer) {
+						const timeEl = dropContainer.querySelector('p.CoreText-sc-1txzju1-0.jPfhdt, p[class*="jPfhdt"]');
+						if (timeEl && isTimeText(timeEl.textContent || '')) {
 							const days = toDays(timeEl.textContent || '');
 							if (days !== null && days !== undefined) {
 								// Only return if the drop is not older than 3 weeks (21 days)
