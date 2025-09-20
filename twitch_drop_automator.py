@@ -1992,6 +1992,33 @@ async def get_incomplete_rust_rewards(inv_page):
 	rewards.sort(key=lambda r: (r["percent"] if r["percent"] is not None else -1))
 	return rewards
 
+def generate_search_variations(base_name: str) -> list[str]:
+	"""Generate lowercase search variations for a given name.
+	Examples: "FOOLISH - VAGABOND JACKET" -> ["foolish - vagabond jacket", "foolish", "vagabond jacket"].
+	"""
+	name = (base_name or "").strip().lower()
+	if not name:
+		return []
+	variations = [name]
+	if ' ' in name:
+		first_word = name.split()[0]
+		if len(first_word) > 3:
+			variations.append(first_word)
+	for sep in [' - ', ' + ', ' & ', ' and ']:
+		if sep in name:
+			for part in name.split(sep):
+				p = part.strip()
+				if len(p) > 3:
+					variations.append(p)
+	# Deduplicate
+	seen = set()
+	out = []
+	for v in variations:
+		if v and v not in seen:
+			seen.add(v)
+			out.append(v)
+	return out
+
 async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | None:
 	"""Return approximate days since this streamer's drop was claimed, or None if not found.
 	We look for elements containing the streamer name (with flexible matching), then within the same card search for a time label like
@@ -2005,28 +2032,108 @@ async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | N
 	target_lower = ((streamer_name or "").strip().lower())
 	if not target_lower:
 		return None
+
+async def scrape_recent_claimed_items(inv_page):
+	"""Scrape the Twitch inventory page for claimed items within the last 21 days.
+
+	Returns a list of dicts: [{"name": str, "days": int}].
+	An item is considered claimed if either:
+	- It appears under the Claimed section, or
+	- Its card contains the checkmark/tick icon SVG.
+	Only items with a recognizable timestamp <= 21 days are returned.
+	Assumes caller may reuse the same page; this function ensures navigation.
+	"""
+	try:
+		# Ensure page is loaded
+		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+		await maybe_accept_cookies(inv_page)
+		await inv_page.wait_for_timeout(400)
+		items = await inv_page.evaluate(
+			r"""
+			() => {
+			  const isTimeText = (s) => {
+				if (!s) return false;
+				const t = s.trim().toLowerCase();
+				return t.includes('yesterday') || t.includes('ago') || t.includes('last month') || t.includes('months ago') || t.includes('month ago');
+			  };
+			  const toDays = (s) => {
+				if (!s) return null;
+				const t = s.trim().toLowerCase();
+				if (t.includes('yesterday')) return 1;
+				let m;
+				if ((m = t.match(/(\d+)\s*minutes?/))) return 0;
+				if ((m = t.match(/(\d+)\s*hours?/))) return 0;
+				if ((m = t.match(/(\d+)\s*days?/))) return parseInt(m[1], 10);
+				if (t.includes('last month')) return 30;
+				if ((m = t.match(/(\d+)\s*months?/))) return parseInt(m[1], 10) * 30;
+				if ((m = t.match(/(\d+)\s*years?/))) return parseInt(m[1], 10) * 365;
+				return null;
+			  };
+
+			  // Find Claimed section container
+			  const claimedHeader = Array.from(document.querySelectorAll('h5')).find(h5 => (h5.textContent || '').trim().toLowerCase() === 'claimed');
+			  let claimedSection = null;
+			  if (claimedHeader) {
+				claimedSection = claimedHeader.closest('div')?.querySelector('.ScTower-sc-1sjzzes-0, .tw-tower') || null;
+			  }
+			  if (!claimedSection) {
+				claimedSection = Array.from(document.querySelectorAll('div, section')).find(el => {
+				  const text = (el.textContent || '').toLowerCase();
+				  return text.includes('claimed') && text.length < 100;
+				}) || null;
+			  }
+
+			  const searchScopes = [];
+			  if (claimedSection) searchScopes.push(claimedSection);
+			  searchScopes.push(document);
+
+			  const results = [];
+			  const seenKeys = new Set();
+			  const isCheckmarkPath = (d) => {
+				if (!d) return false;
+				return d.includes('m4 10 5 5 8-8-1.5-1.5L9 12 5.5 8.5 4 10z') || d.includes('m4 10 5 5 8-8') || (d.includes('4 10') && d.includes('5 5') && d.includes('8-8'));
+			  };
+
+			  for (const scope of searchScopes) {
+				const cards = Array.from(scope.querySelectorAll('div.Layout-sc-1xcs6mc-0.fHdBNk'));
+				for (const card of cards) {
+				  // Identify name and time within the card
+				  const nameEl = card.querySelector('p.CoreText-sc-1txzju1-0.kGfRxP, p[class*="kGfRxP"]');
+				  const timeEl = card.querySelector('p.CoreText-sc-1txzju1-0.jPfhdt, p[class*="jPfhdt"]');
+				  const name = (nameEl?.textContent || '').trim();
+				  const timeText = (timeEl?.textContent || '').trim();
+				  if (!name) continue;
+				  // Treat as claimed if inside Claimed section OR contains a checkmark icon
+				  const inClaimed = !!claimedSection && claimedSection.contains(card);
+				  let hasTick = false;
+				  const path = card.querySelector('svg path');
+				  if (path) {
+					const d = path.getAttribute('d') || '';
+					hasTick = isCheckmarkPath(d);
+				  }
+				  if (!inClaimed && !hasTick) continue;
+
+				  if (!isTimeText(timeText)) continue;
+				  const days = toDays(timeText);
+				  if (days === null || days === undefined) continue;
+				  if (days > 21) continue;
+				  const key = name.toLowerCase();
+				  if (seenKeys.has(key)) continue;
+				  seenKeys.add(key);
+				  results.push({ name, days });
+				}
+			  }
+			  return results;
+			}
+			"""
+		)
+		return items or []
+	except Exception as e:
+		logging.debug(f"Failed to scrape recent claimed items: {e}")
+		return []
 	
 	# Create multiple search variations for better matching
-	search_variations = [target_lower]
-	
-	# Add variations for common name patterns
-	if ' ' in target_lower:
-		# For names like "FOOLISH - VAGABOND JACKET", also search for just "foolish"
-		first_word = target_lower.split()[0]
-		if len(first_word) > 3:  # Only add if it's a meaningful word
-			search_variations.append(first_word)
-	
-	# Add variations for common separators
-	for sep in [' - ', ' + ', ' & ', ' and ']:
-		if sep in target_lower:
-			parts = target_lower.split(sep)
-			for part in parts:
-				part = part.strip()
-				if len(part) > 3:  # Only add meaningful parts
-					search_variations.append(part)
-	
-	# Remove duplicates and empty strings
-	search_variations = list(set([v for v in search_variations if v]))
+	search_variations = generate_search_variations(target_lower)
 	
 	try:
 		# Ensure page is loaded
@@ -2698,8 +2805,8 @@ async def run_drops_workflow(context, test_mode=False):
 					continue
 				# Prioritize drops based on their state:
 				# Priority 1: Streamers with progress (1-99% on Twitch) - highest priority
-				# Priority 2: Streamers with no progress (not on Twitch inventory) - medium priority
-				# Priority 3: Recently claimed (avoid repeats) - lowest priority
+			# Priority 2: Streamers with no progress (not on Twitch inventory) - medium priority
+			# Priority 3: Recently claimed (avoid repeats) - lowest priority
 				if match_pct is not None:
 					# Already in progress on Twitch
 					priority = 1
@@ -2707,11 +2814,28 @@ async def run_drops_workflow(context, test_mode=False):
 					streamer_drops_with_progress.append(f"{name} ({match_pct}%) - {item_name}")
 				else:
 					# Not on Twitch inventory = unstarted drop
+					# Before considering, check if this was recently claimed (<= 21 days). If so, skip entirely.
 					priority = 2
 					# Check if we recently claimed this to avoid immediate repeats
 					days = await get_claimed_days_for_streamer(inv_page, name)
-					if days is not None and days < 20:
-						priority = 3  # Lower priority for recently claimed
+					if days is None:
+						# Fallback: sweep claimed items and match by name variations
+						try:
+							claimed_list = await scrape_recent_claimed_items(inv_page)
+							name_vars = generate_search_variations(name)
+							for it in claimed_list:
+								n = (it.get('name') or '').lower()
+								for v in name_vars:
+									if v and v in n:
+										days = int(it.get('days')) if isinstance(it.get('days'), int) else 0
+										break
+								if days is not None:
+									break
+						except Exception:
+							pass
+					if days is not None and days <= 21:
+						logging.info(f"Skipping streamer '{name}': claimed {days} day(s) ago.")
+						continue
 					item_name = st.get('item', 'Unknown')
 					streamer_drops_no_progress.append(f"{name} - {item_name}")
 				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority, "pct": match_pct, "item": st.get('item')})
