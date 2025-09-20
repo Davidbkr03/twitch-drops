@@ -226,7 +226,7 @@ def update_cached_drops_data(facepunch_data, inventory_progress):
 					logging.debug(f"Failed to emit partial drops update via WebSocket: {e}")
 			return
 		
-        # Full update with Facepunch data
+		# Full update with Facepunch data
 		drops_data = {
 			"in_progress": [],
 			"not_started": [],
@@ -234,29 +234,29 @@ def update_cached_drops_data(facepunch_data, inventory_progress):
 			"last_updated": datetime.now().isoformat()
 		}
 		
-        # Include recently-claimed (<=21 days) list for the web UI to mark as complete
-        try:
-            # We'll store names as seen on Twitch inventory
-            recent = []
-            try:
-                # Use a transient page for sweep to avoid interfering with outer flow
-                # Note: this function may be called from different contexts; best effort only
-                if current_browser_context:
-                    sweep_page = await current_browser_context.new_page()
-                    try:
-                        recent = await scrape_recent_claimed_items(sweep_page)
-                    finally:
-                        try:
-                            await sweep_page.close()
-                        except Exception:
-                            pass
-            except Exception:
-                recent = []
-            drops_data["recently_claimed_streamers"] = [it.get('name') for it in (recent or [])]
-        except Exception:
-            drops_data["recently_claimed_streamers"] = []
+		# Include recently-claimed (<=21 days) list for the web UI to mark as complete
+		try:
+			# We'll store names as seen on Twitch inventory
+			recent = []
+			try:
+				# Use a transient page for sweep to avoid interfering with outer flow
+				# Note: this function may be called from different contexts; best effort only
+				if current_browser_context:
+					sweep_page = await current_browser_context.new_page()
+					try:
+						recent = await scrape_recent_claimed_items(sweep_page)
+					finally:
+						try:
+							await sweep_page.close()
+						except Exception:
+							pass
+			except Exception:
+				recent = []
+			drops_data["recently_claimed_streamers"] = [it.get('name') for it in (recent or [])]
+		except Exception:
+			drops_data["recently_claimed_streamers"] = []
 
-        # Process streamer-specific drops
+		# Process streamer-specific drops
 		streamer_drops = facepunch_data.get('streamer', []) if facepunch_data else []
 		for drop in streamer_drops:
 			streamer_name = drop.get('streamer', '')
