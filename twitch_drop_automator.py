@@ -917,17 +917,43 @@ def create_web_app():
 				except Exception as e:
 					logging.warning(f"Failed to clean up temporary directory: {e}")
 			
-			# Return success first, then restart in a separate thread
+			# Return success first, then restart properly like settings do
 			# This ensures the HTTP response is sent before restarting
 			def delayed_restart():
 				time.sleep(2)  # Give time for HTTP response to be sent
 				logging.info("Restarting application after update...")
-				os._exit(0)
+				try:
+					import subprocess
+					import sys
+					
+					# Get the current script path
+					script_path = os.path.abspath(__file__)
+					
+					# Get current arguments (preserve test mode, etc.)
+					args = [sys.executable, script_path]
+					if PREFERENCES.get('test_mode', False):
+						args.append('--test')
+					if not PREFERENCES.get('enable_web_interface', True):
+						args.append('--no-web')
+					if not PREFERENCES.get('show_tray', True):
+						args.append('--no-tray')
+					
+					# Start the new process
+					subprocess.Popen(args, cwd=os.path.dirname(script_path))
+					
+					# Give it a moment to start
+					time.sleep(1)
+					
+					# Exit current process
+					os._exit(0)
+				except Exception as e:
+					logging.error(f"Failed to restart after update: {e}")
+					os._exit(1)
 			
 			restart_thread = threading.Thread(target=delayed_restart, daemon=True)
 			restart_thread.start()
 			
-			return jsonify({'success': True, 'message': 'Update completed successfully. Restarting...'})
+			return jsonify({'success': True, 'message': 'Update completed successfully. Restarting...', 'restart': True})
 			
 		except Exception as e:
 			logging.error(f"Update failed: {e}")

@@ -1675,8 +1675,17 @@
                 const result = await response.json();
                 
                 if (result.success) {
-                    alert('Update completed successfully!\n\n✅ Files updated\n✅ Dependencies installed/updated\n✅ Playwright browsers updated\n\nThe application will restart in a few seconds.');
-                    // The server will restart automatically
+                    if (result.restart) {
+                        alert('Update completed successfully!\n\n✅ Files updated\n✅ Dependencies installed/updated\n✅ Playwright browsers updated\n\nThe application will restart in a few seconds.');
+                        
+                        // Wait a moment for the server to restart, then refresh the page
+                        setTimeout(() => {
+                            console.log('Refreshing page after update...');
+                            window.location.reload();
+                        }, 5000); // Wait 5 seconds for restart
+                    } else {
+                        alert('Update completed successfully!\n\n✅ Files updated\n✅ Dependencies installed/updated\n✅ Playwright browsers updated');
+                    }
                 } else {
                     alert(`Update failed: ${result.message}`);
                 }
