@@ -2883,7 +2883,7 @@ async def main(start_tray: bool = True, test_mode: bool = False, enable_web: boo
 		ICON_PATH = ensure_icon_file(_generate_tray_icon_image())
 		logging.info(f"Notification icon: {ICON_PATH}")
 		# One-time startup notification to verify toasts
-		send_notification("Twitch Drops", "Automator started")
+		send_notification("Twitch Drops", "Yippeee")
 	except Exception as e:
 		logging.debug(f"Tray start failed: {e}")
 	_install_signal_handlers()
