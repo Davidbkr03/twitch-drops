@@ -226,7 +226,7 @@ def update_cached_drops_data(facepunch_data, inventory_progress):
 					logging.debug(f"Failed to emit partial drops update via WebSocket: {e}")
 			return
 		
-		# Full update with Facepunch data
+        # Full update with Facepunch data
 		drops_data = {
 			"in_progress": [],
 			"not_started": [],
@@ -234,7 +234,29 @@ def update_cached_drops_data(facepunch_data, inventory_progress):
 			"last_updated": datetime.now().isoformat()
 		}
 		
-		# Process streamer-specific drops
+        # Include recently-claimed (<=21 days) list for the web UI to mark as complete
+        try:
+            # We'll store names as seen on Twitch inventory
+            recent = []
+            try:
+                # Use a transient page for sweep to avoid interfering with outer flow
+                # Note: this function may be called from different contexts; best effort only
+                if current_browser_context:
+                    sweep_page = await current_browser_context.new_page()
+                    try:
+                        recent = await scrape_recent_claimed_items(sweep_page)
+                    finally:
+                        try:
+                            await sweep_page.close()
+                        except Exception:
+                            pass
+            except Exception:
+                recent = []
+            drops_data["recently_claimed_streamers"] = [it.get('name') for it in (recent or [])]
+        except Exception:
+            drops_data["recently_claimed_streamers"] = []
+
+        # Process streamer-specific drops
 		streamer_drops = facepunch_data.get('streamer', []) if facepunch_data else []
 		for drop in streamer_drops:
 			streamer_name = drop.get('streamer', '')
@@ -1993,23 +2015,8 @@ async def get_incomplete_rust_rewards(inv_page):
 	return rewards
 
 def emit_debug(message: str, level: str = "info"):
-	"""Emit a debug line to both logger and WebSocket (UI log)."""
-	try:
-		msg = f"{message}"
-		if level == "error":
-			logging.error(msg)
-		elif level == "warning":
-			logging.warning(msg)
-		else:
-			logging.info(msg)
-		global socketio
-		if socketio is not None:
-			try:
-				socketio.emit('debug_log', { 'message': msg, 'level': level })
-			except Exception:
-				pass
-	except Exception:
-		pass
+	# Debug emitter disabled per request; keep as no-op to avoid refactor churn.
+	return
 
 def generate_search_variations(base_name: str) -> list[str]:
 	"""Generate lowercase search variations for a given name.
@@ -2792,8 +2799,25 @@ async def run_drops_workflow(context, test_mode=False):
 			# Defer general drop decision until after streamer candidates are considered
 			longest_general = None
 
-			# Build candidates only for streamer-specific items present in inventory (<100%)
-			candidates = []
+            # One-time sweep of recently claimed items (<= 21 days)
+            recently_claimed = []
+            try:
+                recently_claimed = await scrape_recent_claimed_items(inv_page)
+            except Exception:
+                recently_claimed = []
+
+            # Helper to check if a streamer appears in recently_claimed
+            def is_streamer_recently_claimed(streamer: str) -> int | None:
+                name_vars = generate_search_variations(streamer)
+                for it in (recently_claimed or []):
+                    n = (it.get('name') or '').lower()
+                    for v in name_vars:
+                        if v and v in n:
+                            return int(it.get('days')) if isinstance(it.get('days'), int) else 0
+                return None
+
+            # Build candidates only for streamer-specific items present in inventory (<100%)
+            candidates = []
 			live_any = []
 			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
 			
@@ -2837,36 +2861,23 @@ async def run_drops_workflow(context, test_mode=False):
 					item_name = st.get('item', 'Unknown')
 					streamer_drops_with_progress.append(f"{name} ({match_pct}%) - {item_name}")
 					emit_debug(f"[candidates] {name}: set priority=1 (in-progress {match_pct}%)")
-				else:
+                else:
 					# Not on Twitch inventory = unstarted drop
 					# Before considering, check if this was recently claimed (<= 21 days). If so, skip entirely.
 					priority = 2
-					# Check if we recently claimed this to avoid immediate repeats
-					days = await get_claimed_days_for_streamer(inv_page, name)
-					emit_debug(f"[candidates] {name}: claimed-days direct={days}")
-					if days is None:
-						# Fallback: sweep claimed items and match by name variations
-						try:
-							claimed_list = await scrape_recent_claimed_items(inv_page)
-							name_vars = generate_search_variations(name)
-							for it in claimed_list:
-								n = (it.get('name') or '').lower()
-								for v in name_vars:
-									if v and v in n:
-										days = int(it.get('days')) if isinstance(it.get('days'), int) else 0
-										emit_debug(f"[candidates] {name}: sweep matched '{n}' via '{v}', days={days}")
-										break
-								if days is not None:
-									break
-						except Exception as e:
-							emit_debug(f"[candidates] {name}: sweep error {e}", 'warning')
+                    # Use one-time sweep to avoid repeated page work
+                    days = is_streamer_recently_claimed(name)
+                    if days is None:
+                        # Fallback direct check if needed
+                        try:
+                            days = await get_claimed_days_for_streamer(inv_page, name)
+                        except Exception:
+                            days = None
 					if days is not None and days <= 21:
-						emit_debug(f"[candidates] {name}: skip (claimed {days} day(s) ago)")
 						logging.info(f"Skipping streamer '{name}': claimed {days} day(s) ago.")
 						continue
 					item_name = st.get('item', 'Unknown')
 					streamer_drops_no_progress.append(f"{name} - {item_name}")
-					emit_debug(f"[candidates] {name}: set priority=2 (no progress)")
 				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority, "pct": match_pct, "item": st.get('item')})
 
 			# Populate general drops debug list
