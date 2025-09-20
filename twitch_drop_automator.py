@@ -1994,12 +1994,40 @@ async def get_incomplete_rust_rewards(inv_page):
 
 async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | None:
 	"""Return approximate days since this streamer's drop was claimed, or None if not found.
-	We look for elements containing the streamer name, then within the same card search for a time label like
+	We look for elements containing the streamer name (with flexible matching), then within the same card search for a time label like
 	'23 minutes ago', 'yesterday', '9 days ago', '2 months ago', 'last month'.
+	
+	Uses multiple search variations to handle name differences between Facepunch and Twitch:
+	- For "FOOLISH - VAGABOND JACKET" also searches for "foolish"
+	- Handles separators like " - ", " + ", " & ", " and "
+	- Only returns drops claimed within the last 3 weeks (21 days)
 	"""
 	target_lower = ((streamer_name or "").strip().lower())
 	if not target_lower:
 		return None
+	
+	# Create multiple search variations for better matching
+	search_variations = [target_lower]
+	
+	# Add variations for common name patterns
+	if ' ' in target_lower:
+		# For names like "FOOLISH - VAGABOND JACKET", also search for just "foolish"
+		first_word = target_lower.split()[0]
+		if len(first_word) > 3:  # Only add if it's a meaningful word
+			search_variations.append(first_word)
+	
+	# Add variations for common separators
+	for sep in [' - ', ' + ', ' & ', ' and ']:
+		if sep in target_lower:
+			parts = target_lower.split(sep)
+			for part in parts:
+				part = part.strip()
+				if len(part) > 3:  # Only add meaningful parts
+					search_variations.append(part)
+	
+	# Remove duplicates and empty strings
+	search_variations = list(set([v for v in search_variations if v]))
+	
 	try:
 		# Ensure page is loaded
 		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
@@ -2008,7 +2036,7 @@ async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | N
 		days = await inv_page.evaluate(
 			r"""
 			(args) => {
-			  const targetLower = (args && args.targetLower) || '';
+			  const searchVariations = (args && args.searchVariations) || [];
 			  const isTimeText = (s) => {
 				if (!s) return false;
 				const t = s.trim().toLowerCase();
@@ -2027,26 +2055,36 @@ async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | N
 				if ((m = t.match(/(\d+)\s*years?/))) return parseInt(m[1], 10) * 365;
 				return null;
 			  };
-			  const all = Array.from(document.querySelectorAll('p, span, div, a'));
-			  const nameEls = all.filter(el => {
-				const txt = (el.textContent || '').toLowerCase();
-				return txt && txt.includes(targetLower);
-			  }).slice(0, 30);
-			  const upDepth = 5;
-			  for (const el of nameEls) {
-				let node = el;
-				for (let d = 0; d < upDepth && node; d++, node = node.parentElement) {
-				  const timeEl = Array.from(node.querySelectorAll('p, span, div')).find(e => isTimeText(e.textContent || ''));
-				  if (timeEl) {
-					const days = toDays(timeEl.textContent || '');
-					if (days !== null && days !== undefined) return days;
-				  }
+			  
+			  // Try each search variation
+			  for (const targetLower of searchVariations) {
+				const all = Array.from(document.querySelectorAll('p, span, div, a'));
+				const nameEls = all.filter(el => {
+					const txt = (el.textContent || '').toLowerCase();
+					return txt && txt.includes(targetLower);
+				}).slice(0, 30);
+				
+				const upDepth = 5;
+				for (const el of nameEls) {
+					let node = el;
+					for (let d = 0; d < upDepth && node; d++, node = node.parentElement) {
+						const timeEl = Array.from(node.querySelectorAll('p, span, div')).find(e => isTimeText(e.textContent || ''));
+						if (timeEl) {
+							const days = toDays(timeEl.textContent || '');
+							if (days !== null && days !== undefined) {
+								// Only return if the drop is not older than 3 weeks (21 days)
+								if (days <= 21) {
+									return days;
+								}
+							}
+						}
+					}
 				}
 			  }
 			  return null;
 			}
 			""",
-			{"targetLower": target_lower}
+			{"searchVariations": search_variations}
 		)
 		return days
 	except Exception as e:
