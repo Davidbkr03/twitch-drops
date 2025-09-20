@@ -182,7 +182,50 @@ def update_current_working_item(item_info):
 		logging.debug(f"Updated current working item: {item_info}")
 
 
-def update_cached_drops_data(facepunch_data, inventory_progress):
+def intelligent_item_matching(item_name, inventory_progress):
+	"""
+	Intelligent matching for items where facepunch names differ from inventory names.
+	Uses keyword matching to find similar items.
+	"""
+	# Define keyword mappings for common item types
+	keyword_mappings = {
+		'chestplate': ['chestplate', 'chest'],
+		'facemask': ['facemask', 'mask'],
+		'kilt': ['kilt'],
+		'fridge': ['fridge'],
+		'locker': ['locker'],
+		'bag': ['bag'],
+		'helmet': ['helmet'],
+		'pants': ['pants'],
+		'shirt': ['shirt'],
+		'jacket': ['jacket'],
+		'gloves': ['gloves'],
+		'boots': ['boots'],
+		'shoes': ['shoes']
+	}
+	
+	item_lower = item_name.lower()
+	
+	# Find matching keywords
+	matching_keywords = []
+	for keyword, variations in keyword_mappings.items():
+		for variation in variations:
+			if variation in item_lower:
+				matching_keywords.extend(variations)
+				break
+	
+	# If we found keywords, try to match against inventory titles
+	if matching_keywords:
+		for title, percent in inventory_progress.items():
+			title_lower = title.lower()
+			for keyword in matching_keywords:
+				if keyword in title_lower:
+					logging.info(f"Intelligent match: '{item_name}' -> '{title}' (keyword: '{keyword}')")
+					return percent, title
+	
+	return None, None
+
+def update_cached_drops_data(facepunch_data, inventory_progress, recently_claimed_streamers=None):
 	"""Update the cached drops data for the web interface."""
 	global cached_drops_data
 	
@@ -235,26 +278,7 @@ def update_cached_drops_data(facepunch_data, inventory_progress):
 		}
 		
 		# Include recently-claimed (<=21 days) list for the web UI to mark as complete
-		try:
-			# We'll store names as seen on Twitch inventory
-			recent = []
-			try:
-				# Use a transient page for sweep to avoid interfering with outer flow
-				# Note: this function may be called from different contexts; best effort only
-				if current_browser_context:
-					sweep_page = await current_browser_context.new_page()
-					try:
-						recent = await scrape_recent_claimed_items(sweep_page)
-					finally:
-						try:
-							await sweep_page.close()
-						except Exception:
-							pass
-			except Exception:
-				recent = []
-			drops_data["recently_claimed_streamers"] = [it.get('name') for it in (recent or [])]
-		except Exception:
-			drops_data["recently_claimed_streamers"] = []
+		drops_data["recently_claimed_streamers"] = recently_claimed_streamers or []
 
 		# Process streamer-specific drops
 		streamer_drops = facepunch_data.get('streamer', []) if facepunch_data else []
@@ -319,6 +343,30 @@ def update_cached_drops_data(facepunch_data, inventory_progress):
 				if progress is not None:
 					break
 			
+			# If no exact match found, try a more flexible search
+			if progress is None:
+				for title, percent in inventory_progress.items():
+					for term in search_terms:
+						# Try partial matching for common words like "Chestplate", "Kilt", etc.
+						if term.lower() in title.lower() and len(term) > 3:
+							progress = percent
+							progress_title = title
+							break
+					if progress is not None:
+						break
+			
+			# If still no match, try intelligent keyword matching
+			if progress is None:
+				progress, progress_title = intelligent_item_matching(item_name, inventory_progress)
+				if progress is not None:
+					logging.info(f"Successfully matched '{item_name}' to '{progress_title}' with {progress}% progress")
+			
+			# Debug logging for unmatched items
+			if progress is None and item_name:
+				logging.info(f"Could not find progress for general drop: '{item_name}' (alias: '{alias}')")
+				logging.info(f"Available inventory titles: {list(inventory_progress.keys())}")
+				logging.info(f"Searched terms: {search_terms}")
+			
 			drop_info = {
 				"type": "general",
 				"item": item_name,
@@ -331,7 +379,9 @@ def update_cached_drops_data(facepunch_data, inventory_progress):
 			}
 			
 			if progress is None:
-				drops_data["not_started"].append(drop_info)
+				# For general drops, no progress bar means completed (not not_started)
+				# General drops should always show a progress bar when active
+				drops_data["completed"].append(drop_info)
 			elif progress >= 100:
 				drops_data["completed"].append(drop_info)
 			else:
@@ -2793,7 +2843,7 @@ async def run_drops_workflow(context, test_mode=False):
 			progress_map = await get_inventory_progress_map(inv_page)
 			in_progress_titles = { (t or '').lower() for t in progress_map.keys() }
 			
-			# Update cached drops data for web interface
+			# Update cached drops data for web interface (will be updated again with claimed list below)
 			update_cached_drops_data(fp, progress_map)
 
 			# Defer general drop decision until after streamer candidates are considered
@@ -2861,18 +2911,18 @@ async def run_drops_workflow(context, test_mode=False):
 					item_name = st.get('item', 'Unknown')
 					streamer_drops_with_progress.append(f"{name} ({match_pct}%) - {item_name}")
 					emit_debug(f"[candidates] {name}: set priority=1 (in-progress {match_pct}%)")
-                else:
+				else:
 					# Not on Twitch inventory = unstarted drop
 					# Before considering, check if this was recently claimed (<= 21 days). If so, skip entirely.
 					priority = 2
-                    # Use one-time sweep to avoid repeated page work
-                    days = is_streamer_recently_claimed(name)
-                    if days is None:
-                        # Fallback direct check if needed
-                        try:
-                            days = await get_claimed_days_for_streamer(inv_page, name)
-                        except Exception:
-                            days = None
+					# Use one-time sweep to avoid repeated page work
+					days = is_streamer_recently_claimed(name)
+					if days is None:
+						# Fallback direct check if needed
+						try:
+							days = await get_claimed_days_for_streamer(inv_page, name)
+						except Exception:
+							days = None
 					if days is not None and days <= 21:
 						logging.info(f"Skipping streamer '{name}': claimed {days} day(s) ago.")
 						continue
@@ -2894,6 +2944,10 @@ async def run_drops_workflow(context, test_mode=False):
 			logging.info(f"General drops available: {general_drops_available}")
 			logging.info(f"Total candidates: {len(candidates)}")
 			logging.info(f"========================")
+
+			# Update cache with recently claimed list for web UI
+			recently_claimed_names = [it.get('name') for it in (recently_claimed or [])]
+			update_cached_drops_data(fp, progress_map, recently_claimed_names)
 
 			# Do not enter general mode here; prefer streamer-specific workflow below
 
@@ -3338,17 +3392,11 @@ async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 				if pct < 100:
 					return False
 				continue
-			# Not found in progress map; treat as claimed/not-present → probe for claimed label
-			# Try alias first as it usually appears in Twitch inventory titles (e.g., 'SPIICY' → 'Spicy AR')
-			claimed = False
-			if alias:
-				res = await is_general_item_claimed_on_inventory(inv_page, alias)
-				claimed = bool(res)
-			if not claimed and item_name:
-				res2 = await is_general_item_claimed_on_inventory(inv_page, item_name)
-				claimed = bool(res2)
-			if not claimed:
-				return False
+			# Not found in progress map = no progress bar = completed
+			# This means the item is either completed or not started yet
+			# For general drops, if there's no progress bar, we consider it completed
+			# (since general drops should always show a progress bar when active)
+			continue
 		return True
 	except Exception:
 		return False

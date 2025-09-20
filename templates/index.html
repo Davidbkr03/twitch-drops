@@ -1323,18 +1323,63 @@
         function updateDropsDisplay() {
             if (!dropsData) return;
 
+            // Create enhanced data that includes recently claimed items as completed
+            const enhancedData = {
+                ...dropsData,
+                in_progress: [...dropsData.in_progress],
+                not_started: [...dropsData.not_started],
+                completed: [...dropsData.completed]
+            };
+
+            // Move recently claimed streamers to completed section
+            if (dropsData.recently_claimed_streamers && dropsData.recently_claimed_streamers.length > 0) {
+                const claimedNames = dropsData.recently_claimed_streamers.map(name => name.toLowerCase());
+                
+                // Check in_progress items
+                for (let i = enhancedData.in_progress.length - 1; i >= 0; i--) {
+                    const drop = enhancedData.in_progress[i];
+                    if (drop.type === 'streamer' && drop.streamer) {
+                        const streamerLower = drop.streamer.toLowerCase();
+                        if (claimedNames.some(claimed => 
+                            streamerLower.includes(claimed) || claimed.includes(streamerLower) ||
+                            streamerLower.split(' ')[0] === claimed.split(' ')[0] // Match first word
+                        )) {
+                            // Move to completed
+                            enhancedData.completed.push(drop);
+                            enhancedData.in_progress.splice(i, 1);
+                        }
+                    }
+                }
+                
+                // Check not_started items
+                for (let i = enhancedData.not_started.length - 1; i >= 0; i--) {
+                    const drop = enhancedData.not_started[i];
+                    if (drop.type === 'streamer' && drop.streamer) {
+                        const streamerLower = drop.streamer.toLowerCase();
+                        if (claimedNames.some(claimed => 
+                            streamerLower.includes(claimed) || claimed.includes(streamerLower) ||
+                            streamerLower.split(' ')[0] === claimed.split(' ')[0] // Match first word
+                        )) {
+                            // Move to completed
+                            enhancedData.completed.push(drop);
+                            enhancedData.not_started.splice(i, 1);
+                        }
+                    }
+                }
+            }
+
             // Update counts
-            document.getElementById('inProgressCount').textContent = dropsData.in_progress.length;
-            document.getElementById('notStartedCount').textContent = dropsData.not_started.length;
-            document.getElementById('completedCount').textContent = dropsData.completed.length;
+            document.getElementById('inProgressCount').textContent = enhancedData.in_progress.length;
+            document.getElementById('notStartedCount').textContent = enhancedData.not_started.length;
+            document.getElementById('completedCount').textContent = enhancedData.completed.length;
 
             // Update current working item
-            updateCurrentWorkingItem(dropsData.current_working);
+            updateCurrentWorkingItem(enhancedData.current_working);
 
             // Update each section
-            updateDropsSection('inProgressDrops', dropsData.in_progress, 'in-progress');
-            updateDropsSection('notStartedDrops', dropsData.not_started, 'not-started');
-            updateDropsSection('completedDrops', dropsData.completed, 'completed');
+            updateDropsSection('inProgressDrops', enhancedData.in_progress, 'in-progress');
+            updateDropsSection('notStartedDrops', enhancedData.not_started, 'not-started');
+            updateDropsSection('completedDrops', enhancedData.completed, 'completed');
         }
 
         // Update current working item display
