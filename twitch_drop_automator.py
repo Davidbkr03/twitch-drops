@@ -2078,34 +2078,45 @@ async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | N
 			  // Define search scope - prefer claimed section if found, otherwise search entire page
 			  const searchScope = claimedSection || document;
 			  
-			  // Try each search variation
-			  for (const targetLower of searchVariations) {
-				// Look specifically for drop name elements with class kGfRxP (the drop name class)
-				const nameEls = Array.from(searchScope.querySelectorAll('p.CoreText-sc-1txzju1-0.kGfRxP, p[class*="kGfRxP"]'));
-				
-				const matchingNameEl = nameEls.find(el => {
-					const txt = (el.textContent || '').toLowerCase();
-					return txt && txt.includes(targetLower);
-				});
-				
-				if (matchingNameEl) {
-					// Find the timestamp element in the same drop container
-					// Look for the timestamp element with class jPfhdt
-					const dropContainer = matchingNameEl.closest('div.Layout-sc-1xcs6mc-0.fHdBNk');
-					if (dropContainer) {
+			  // Look for checkmark/tick icons in the claimed section
+			  // The checkmark SVG has a specific path: "m4 10 5 5 8-8-1.5-1.5L9 12 5.5 8.5 4 10z"
+			  const checkmarkSvgs = Array.from(searchScope.querySelectorAll('svg path')).filter(svg => {
+				const path = svg.getAttribute('d') || '';
+				return path.includes('m4 10 5 5 8-8-1.5-1.5L9 12 5.5 8.5 4 10z') || 
+					   path.includes('m4 10 5 5 8-8') || // Partial match for the checkmark path
+					   (path.includes('4 10') && path.includes('5 5') && path.includes('8-8')); // Key parts of checkmark
+			  });
+			  
+			  // For each checkmark found, try to match it with our search variations
+			  for (const checkmarkSvg of checkmarkSvgs) {
+				// Find the drop container that contains this checkmark
+				const dropContainer = checkmarkSvg.closest('div.Layout-sc-1xcs6mc-0.fHdBNk');
+				if (dropContainer) {
+				  // Look for the drop name in this container
+				  const nameEl = dropContainer.querySelector('p.CoreText-sc-1txzju1-0.kGfRxP, p[class*="kGfRxP"]');
+				  if (nameEl) {
+					const dropName = (nameEl.textContent || '').toLowerCase();
+					
+					// Check if this drop name matches any of our search variations
+					for (const targetLower of searchVariations) {
+					  if (dropName.includes(targetLower)) {
+						// Found a match! Now get the timestamp
 						const timeEl = dropContainer.querySelector('p.CoreText-sc-1txzju1-0.jPfhdt, p[class*="jPfhdt"]');
 						if (timeEl && isTimeText(timeEl.textContent || '')) {
-							const days = toDays(timeEl.textContent || '');
-							if (days !== null && days !== undefined) {
-								// Only return if the drop is not older than 3 weeks (21 days)
-								if (days <= 21) {
-									return days;
-								}
+						  const days = toDays(timeEl.textContent || '');
+						  if (days !== null && days !== undefined) {
+							// Only return if the drop is not older than 3 weeks (21 days)
+							if (days <= 21) {
+							  return days;
 							}
+						  }
 						}
+					  }
 					}
+				  }
 				}
 			  }
+			  
 			  return null;
 			}
 			""",
