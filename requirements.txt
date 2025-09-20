@@ -5,3 +5,6 @@ Pillow>=9.2.0
 win10toast>=0.9; sys_platform == "win32"
 pyobjc-core>=10.3; sys_platform == "darwin"
 pyobjc-framework-Cocoa>=10.3; sys_platform == "darwin"
+flask>=2.3.0
+flask-socketio>=5.3.0
+python-socketio>=5.8.0

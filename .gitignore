@@ -35,3 +35,7 @@ python_installer.exe
 
 # Generated icons
 tray.ico
+
+# Other
+example_site/
+example_twitch/

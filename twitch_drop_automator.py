@@ -10,6 +10,12 @@ import atexit
 import signal
 import sys
 import subprocess
+from datetime import datetime, timezone, timedelta
+import base64
+import io
+import argparse
+from flask import Flask, render_template, jsonify, request
+from flask_socketio import SocketIO, emit
 
 # --- Platform detection ---
 IS_WINDOWS = sys.platform.startswith("win")
@@ -46,6 +52,14 @@ PASSPORT_429_THRESHOLD = 3
 INVENTORY_POLL_INTERVAL_SECONDS = 60
 MAX_WATCH_HOURS_PER_REWARD = 8
 
+# Web interface configuration
+WEB_PORT = 5000
+WEB_HOST = '127.0.0.1'
+SCREENSHOT_INTERVAL = 2  # seconds between screenshots
+
+# Testing configuration
+TEST_MODE = False  # Set to True to keep browser open for testing
+
 # Persisted preferences/config
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
 CONFIG_LOCK = threading.RLock()
@@ -57,9 +71,196 @@ ICON_PATH = None
 NOTIFICATIONS_ENABLED = True
 TRAY_IMAGE = None
 
+# Web server globals
+app = None
+socketio = None
+current_browser_context = None
+current_working_page = None  # Track the page currently being worked on
+screenshot_thread = None
+web_server_thread = None
+
+# Drops data cache for web interface
+cached_drops_data = {
+	"in_progress": [],
+	"not_started": [],
+	"completed": [],
+	"last_updated": None
+}
+drops_data_lock = threading.RLock()
+
+# Track current working item
+current_working_item = None
+current_working_lock = threading.RLock()
+
+
+def update_current_working_item(item_info):
+	"""Update the current working item for the web interface."""
+	global current_working_item
+	
+	with current_working_lock:
+		current_working_item = item_info
+		logging.debug(f"Updated current working item: {item_info}")
+
+
+def update_cached_drops_data(facepunch_data, inventory_progress):
+	"""Update the cached drops data for the web interface."""
+	global cached_drops_data
+	
+	with drops_data_lock:
+		# If this is a partial update (only progress data), merge with existing cache
+		if facepunch_data is None and inventory_progress:
+			# Update existing cache with new progress data
+			if cached_drops_data and cached_drops_data.get("in_progress"):
+				for drop in cached_drops_data["in_progress"]:
+					# Update progress for matching items
+					for title, percent in inventory_progress.items():
+						# For streamer drops, match by streamer name in title
+						if drop.get("type") == "streamer" and drop.get("streamer") and drop["streamer"].lower() in title.lower():
+							drop["progress"] = percent
+							drop["progress_title"] = title
+							break
+						# For general drops, match by exact item name (not partial match)
+						elif drop.get("type") == "general" and drop.get("item"):
+							# Check if the title contains the exact item name as a standalone word
+							item_lower = drop["item"].lower()
+							title_lower = title.lower()
+							# Use word boundaries to avoid partial matches
+							import re
+							if re.search(r'\b' + re.escape(item_lower) + r'\b', title_lower):
+								drop["progress"] = percent
+								drop["progress_title"] = title
+								break
+			
+			cached_drops_data["last_updated"] = datetime.now().isoformat()
+			
+			# Add current working item to the data
+			with current_working_lock:
+				cached_drops_data["current_working"] = current_working_item
+			
+			# Emit update via WebSocket if available
+			if socketio:
+				try:
+					socketio.emit('drops_update', cached_drops_data)
+					logging.debug("Emitted partial drops update via WebSocket")
+				except Exception as e:
+					logging.debug(f"Failed to emit partial drops update via WebSocket: {e}")
+			return
+		
+		# Full update with Facepunch data
+		drops_data = {
+			"in_progress": [],
+			"not_started": [],
+			"completed": [],
+			"last_updated": datetime.now().isoformat()
+		}
+		
+		# Process streamer-specific drops
+		streamer_drops = facepunch_data.get('streamer', []) if facepunch_data else []
+		for drop in streamer_drops:
+			streamer_name = drop.get('streamer', '')
+			item_name = drop.get('item', '')
+			hours = drop.get('hours', 0)
+			is_live = drop.get('is_live', False)
+			url = drop.get('url', '')
+			
+			# Find matching inventory progress
+			progress = None
+			progress_title = None
+			for title, percent in inventory_progress.items():
+				if streamer_name.lower() in title.lower():
+					progress = percent
+					progress_title = title
+					break
+			
+			drop_info = {
+				"type": "streamer",
+				"streamer": streamer_name,
+				"item": item_name,
+				"hours": hours,
+				"is_live": is_live,
+				"url": url,
+				"progress": progress,
+				"progress_title": progress_title,  # The actual title from Twitch inventory
+				"video": drop.get('video'),
+				"streamer_avatar": drop.get('streamer_avatar')
+			}
+			
+			if progress is None:
+				drops_data["not_started"].append(drop_info)
+			elif progress >= 100:
+				drops_data["completed"].append(drop_info)
+			else:
+				drops_data["in_progress"].append(drop_info)
+		
+		# Process general drops
+		general_drops = facepunch_data.get('general', []) if facepunch_data else []
+		for drop in general_drops:
+			item_name = drop.get('item', '')
+			hours = drop.get('hours', 0)
+			alias = drop.get('alias', '')
+			
+			# Find matching inventory progress
+			progress = None
+			progress_title = None
+			search_terms = [item_name]
+			if alias:
+				search_terms.append(alias)
+			
+			for title, percent in inventory_progress.items():
+				for term in search_terms:
+					# Use word boundaries to avoid partial matches (e.g., "fridge" shouldn't match "Abe Fridge")
+					import re
+					if re.search(r'\b' + re.escape(term.lower()) + r'\b', title.lower()):
+						progress = percent
+						progress_title = title
+						break
+				if progress is not None:
+					break
+			
+			drop_info = {
+				"type": "general",
+				"item": item_name,
+				"hours": hours,
+				"alias": alias,
+				"progress": progress,
+				"progress_title": progress_title,  # The actual title from Twitch inventory
+				"video": drop.get('video'),
+				"streamer_avatar": None  # General drops don't have streamer avatars
+			}
+			
+			if progress is None:
+				drops_data["not_started"].append(drop_info)
+			elif progress >= 100:
+				drops_data["completed"].append(drop_info)
+			else:
+				drops_data["in_progress"].append(drop_info)
+		
+		cached_drops_data = drops_data
+		
+		# Add current working item to the data
+		with current_working_lock:
+			drops_data["current_working"] = current_working_item
+		
+		# Log the update for debugging
+		logging.info(f"Updated drops cache: {len(drops_data['in_progress'])} in progress, {len(drops_data['not_started'])} not started, {len(drops_data['completed'])} completed")
+		
+		# Emit update via WebSocket if available
+		if socketio:
+			try:
+				socketio.emit('drops_update', drops_data)
+				logging.debug("Emitted drops update via WebSocket")
+			except Exception as e:
+				logging.debug(f"Failed to emit drops update via WebSocket: {e}")
+
 
 def load_preferences():
-	default_prefs = {"headless": DEFAULT_HEADLESS, "hide_console": True}
+	default_prefs = {
+		"headless": DEFAULT_HEADLESS, 
+		"hide_console": True,
+		"test_mode": False,
+		"debug_mode": False,
+		"enable_web_interface": True
+	}
 	try:
 		if os.path.exists(CONFIG_PATH):
 			with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -199,6 +400,49 @@ def _generate_tray_icon_image():
 		return img
 	except Exception:
 		return None
+# --- Time helpers ---
+
+def _format_start_time_uk(epoch_ms: int) -> tuple[str, int, int]:
+    """Return (formatted_time_str, days_until, hours_until) in UK time.
+    - Formats using Europe/London; if unavailable, computes GMT/BST manually.
+    - hours_until is ceil of remaining hours.
+    """
+    try:
+        dt_utc = datetime.fromtimestamp(max(0, (epoch_ms or 0)) / 1000.0, tz=timezone.utc)
+
+        def _uk_is_bst(dt_utc_in: datetime) -> bool:
+            y = dt_utc_in.year
+            # Last Sunday of March
+            march_last = datetime(y, 3, 31, 1, 0, tzinfo=timezone.utc)
+            while march_last.weekday() != 6:
+                march_last -= timedelta(days=1)
+            # Last Sunday of October
+            oct_last = datetime(y, 10, 31, 1, 0, tzinfo=timezone.utc)
+            while oct_last.weekday() != 6:
+                oct_last -= timedelta(days=1)
+            return march_last <= dt_utc_in < oct_last
+
+        label = "unknown"
+        try:
+            from zoneinfo import ZoneInfo  # type: ignore
+            uk_tz = ZoneInfo("Europe/London")
+            dt_local = dt_utc.astimezone(uk_tz)
+            label = dt_local.strftime("%d %B %Y at %H:%M %Z")
+        except Exception:
+            is_bst = _uk_is_bst(dt_utc)
+            dt_local = dt_utc + (timedelta(hours=1) if is_bst else timedelta(0))
+            tz_abbr = "BST" if is_bst else "GMT"
+            label = dt_local.strftime(f"%d %B %Y at %H:%M {tz_abbr}")
+
+        now_utc = datetime.now(timezone.utc)
+        delta = dt_utc - now_utc
+        total_seconds = max(0, int(delta.total_seconds()))
+        hours_until = (total_seconds + 3599) // 3600
+        days_until = total_seconds // 86400
+        return (label, days_until, hours_until)
+    except Exception:
+        return ("unknown", 0, 0)
+
 
 
 def start_system_tray(block: bool = False):
@@ -267,8 +511,7 @@ def start_system_tray(block: bool = False):
 
 	image = _generate_tray_icon_image()
 	menu = pystray.Menu(
-		pystray.MenuItem("Headless mode", on_toggle_headless, checked=is_headless_checked),
-		pystray.MenuItem("Hide console on startup", on_toggle_hide_console, checked=is_hide_console_checked),
+		pystray.MenuItem("Open Web Interface", lambda icon, item: open_web_interface()),
 		pystray.MenuItem("Quit", on_quit)
 	)
 	icon = pystray.Icon("TwitchDropAutomator", image, "Twitch Drop Automator", menu=menu)
@@ -284,9 +527,352 @@ def start_system_tray(block: bool = False):
 		atexit.register(lambda: icon.stop())
 		return icon
 
+# --- Web Server Functions ---
+def create_web_app():
+	"""Create and configure the Flask web application"""
+	global app, socketio
+	
+	app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'), static_folder=os.path.join(BASE_DIR, 'static'))
+	app.config['SECRET_KEY'] = 'twitch_drops_secret_key'
+	socketio = SocketIO(app, cors_allowed_origins="*")
+	
+	@app.route('/')
+	def index():
+		return render_template('index.html')
+	
+	@app.route('/api/status')
+	def api_status():
+		"""API endpoint to get current status"""
+		return jsonify({
+			'status': 'running',
+			'headless': PREFERENCES.get('headless', DEFAULT_HEADLESS) if PREFERENCES else DEFAULT_HEADLESS,
+			'test_mode': PREFERENCES.get('test_mode', False) if PREFERENCES else False,
+			'debug_mode': PREFERENCES.get('debug_mode', False) if PREFERENCES else False,
+			'enable_web_interface': PREFERENCES.get('enable_web_interface', True) if PREFERENCES else True,
+			'timestamp': datetime.now().isoformat()
+		})
+	
+	@app.route('/api/settings', methods=['GET', 'POST'])
+	def api_settings():
+		"""API endpoint to get and update settings"""
+		if request.method == 'GET':
+			return jsonify({
+				'headless': PREFERENCES.get('headless', DEFAULT_HEADLESS) if PREFERENCES else DEFAULT_HEADLESS,
+				'hide_console': PREFERENCES.get('hide_console', True) if PREFERENCES else True,
+				'test_mode': PREFERENCES.get('test_mode', False) if PREFERENCES else False,
+				'debug_mode': PREFERENCES.get('debug_mode', False) if PREFERENCES else False,
+				'enable_web_interface': PREFERENCES.get('enable_web_interface', True) if PREFERENCES else True,
+			})
+		elif request.method == 'POST':
+			try:
+				data = request.get_json()
+				with CONFIG_LOCK:
+					if 'headless' in data:
+						PREFERENCES['headless'] = bool(data['headless'])
+					if 'hide_console' in data:
+						PREFERENCES['hide_console'] = bool(data['hide_console'])
+					if 'test_mode' in data:
+						PREFERENCES['test_mode'] = bool(data['test_mode'])
+					if 'debug_mode' in data:
+						PREFERENCES['debug_mode'] = bool(data['debug_mode'])
+					if 'enable_web_interface' in data:
+						PREFERENCES['enable_web_interface'] = bool(data['enable_web_interface'])
+					
+					# Save preferences
+					save_preferences(PREFERENCES)
+					
+				return jsonify({'success': True, 'message': 'Settings updated successfully'})
+			except Exception as e:
+				return jsonify({'success': False, 'message': f'Error updating settings: {str(e)}'}), 500
+	
+	@app.route('/api/drops', methods=['GET'])
+	def api_drops():
+		"""Get all drops data from cache."""
+		try:
+			with drops_data_lock:
+				logging.info(f"API request for drops data: {len(cached_drops_data.get('in_progress', []))} in progress, {len(cached_drops_data.get('not_started', []))} not started, {len(cached_drops_data.get('completed', []))} completed")
+				return jsonify(cached_drops_data)
+		except Exception as e:
+			logging.error(f"Error fetching drops data: {e}")
+			return jsonify({'error': str(e)}), 500
+
+	@app.route('/api/restart', methods=['POST'])
+	def api_restart():
+		"""API endpoint to restart the application"""
+		try:
+			import subprocess
+			import sys
+			import os
+			
+			# Get the current script path
+			script_path = os.path.abspath(__file__)
+			
+			# Get current arguments (preserve test mode, etc.)
+			args = [sys.executable, script_path]
+			if PREFERENCES.get('test_mode', False):
+				args.append('--test')
+			if not PREFERENCES.get('enable_web_interface', True):
+				args.append('--no-web')
+			if not PREFERENCES.get('show_tray', True):
+				args.append('--no-tray')
+			
+			# Start the new process
+			subprocess.Popen(args, cwd=os.path.dirname(script_path))
+			
+			# Give it a moment to start
+			import time
+			time.sleep(1)
+			
+			# Exit current process
+			os._exit(0)
+			
+		except Exception as e:
+			return jsonify({'success': False, 'message': f'Error initiating restart: {str(e)}'}), 500
+	
+	@socketio.on('connect')
+	def handle_connect():
+		logging.info('Web client connected')
+		emit('status', {'message': 'Connected to Twitch Drop Automator'})
+	
+	@socketio.on('disconnect')
+	def handle_disconnect():
+		logging.info('Web client disconnected')
+
+	@socketio.on('request_drops_update')
+	def handle_drops_update_request():
+		"""Handle client request for drops data update - return cached data"""
+		try:
+			with drops_data_lock:
+				emit('drops_update', cached_drops_data)
+		except Exception as e:
+			logging.error(f"Error handling drops update request: {e}")
+			emit('drops_error', {'error': str(e)})
+	
+	return app, socketio
+
+def start_web_server():
+	"""Start the web server in a separate thread"""
+	global web_server_thread, app, socketio
+	
+	if app is None or socketio is None:
+		app, socketio = create_web_app()
+	
+	def run_server():
+		try:
+			logging.info(f"Starting web server on http://{WEB_HOST}:{WEB_PORT}")
+			socketio.run(app, host=WEB_HOST, port=WEB_PORT, debug=False, allow_unsafe_werkzeug=True)
+		except Exception as e:
+			logging.error(f"Web server error: {e}")
+	
+	web_server_thread = threading.Thread(target=run_server, daemon=True)
+	web_server_thread.start()
+	return web_server_thread
+
+async def capture_screenshot_async():
+	"""Async version of screenshot capture for use in async context"""
+	global current_browser_context, current_working_page, socketio
+	
+	if current_browser_context is None or socketio is None:
+		logging.debug("Screenshot capture skipped: context or socketio not available")
+		return False
+	
+	try:
+		# Get all pages from the context
+		pages = current_browser_context.pages
+		if not pages:
+			logging.debug("Screenshot capture skipped: no pages available")
+			return False
+		
+		# First, try to use the tracked working page if it's still valid
+		active_page = None
+		if current_working_page is not None and not current_working_page.is_closed():
+			try:
+				# Verify the page is still accessible
+				url = current_working_page.url
+				if url and url != 'about:blank':
+					active_page = current_working_page
+					logging.debug(f"Using tracked working page: {url}")
+			except Exception:
+				# Page is no longer valid, reset it
+				current_working_page = None
+		
+		# If no tracked page, find the best available page
+		if active_page is None:
+			best_page = None
+			
+			for page in pages:
+				if not page.is_closed():
+					try:
+						url = page.url
+						if url and url != 'about:blank':
+							# Prefer pages that are likely to be the main working page
+							# Priority: Twitch streams > Facepunch > other pages
+							if 'twitch.tv' in url and ('/streams/' in url or '/videos/' in url):
+								active_page = page
+								break  # This is definitely the active stream page
+							elif 'facepunch.com' in url:
+								best_page = page  # Good fallback
+							elif best_page is None:
+								best_page = page  # Any valid page as last resort
+					except Exception:
+						continue
+			
+			# Use the best page we found
+			if active_page is None:
+				active_page = best_page
+			
+			# If still no page found, use the first available page
+			if active_page is None and pages:
+				active_page = pages[0]
+				if active_page.is_closed():
+					logging.debug("Screenshot capture skipped: all pages are closed")
+					return False
+		
+		# Check if page is still valid
+		if active_page.is_closed():
+			logging.debug("Screenshot capture skipped: active page is closed")
+			return False
+		
+		# Try to get the current URL for debugging
+		try:
+			current_url = active_page.url
+			logging.debug(f"Taking screenshot of active page: {current_url}")
+		except Exception:
+			current_url = "unknown"
+		
+		# Wait for page to be loaded and visible
+		try:
+			# Wait for the page to have some content
+			await active_page.wait_for_load_state('domcontentloaded', timeout=3000)
+			# Wait a bit more for any dynamic content
+			await asyncio.sleep(0.5)
+		except Exception as e:
+			logging.debug(f"Page load wait failed: {e}")
+		
+		# Check if we're in headless mode
+		is_headless = get_headless_preference()
+		
+		# Take screenshot with different options based on mode
+		if is_headless:
+			# In headless mode, take a full page screenshot
+			screenshot_bytes = await active_page.screenshot(
+				type='png', 
+				full_page=True,  # Full page in headless
+				animations='disabled'  # Disable animations for cleaner screenshots
+			)
+		else:
+			# In non-headless mode, try to take viewport screenshot
+			try:
+				screenshot_bytes = await active_page.screenshot(
+					type='png', 
+					full_page=False,  # Just the visible viewport
+					animations='disabled'
+				)
+			except Exception as e:
+				logging.debug(f"Viewport screenshot failed, trying full page: {e}")
+				# Fallback to full page if viewport fails
+				screenshot_bytes = await active_page.screenshot(
+					type='png', 
+					full_page=True,
+					animations='disabled'
+				)
+		
+		if not screenshot_bytes:
+			logging.debug("Screenshot capture failed: no data returned")
+			return False
+		
+		# Check if screenshot is mostly white/blank
+		if len(screenshot_bytes) < 1000:  # Very small file might be blank
+			logging.debug("Screenshot appears to be blank (very small file)")
+			return False
+		
+		# Convert to base64
+		screenshot_b64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+		
+		# Send via WebSocket
+		socketio.emit('screenshot', {
+			'image': f'data:image/png;base64,{screenshot_b64}',
+			'timestamp': datetime.now().isoformat(),
+			'url': current_url
+		})
+		
+		logging.debug("Screenshot captured and sent successfully")
+		return True
+		
+	except Exception as e:
+		logging.debug(f"Screenshot capture failed: {e}")
+		return False
+
+async def start_screenshot_capture_async(test_mode=False):
+	"""Start async screenshot capture task"""
+	global current_browser_context, socketio
+	
+	if current_browser_context is None or socketio is None:
+		logging.debug("Screenshot capture skipped: context or socketio not available")
+		return
+	
+	logging.info("Async screenshot capture started")
+	screenshot_count = 0
+	consecutive_failures = 0
+	max_failures = 5
+	
+	# In test mode, run indefinitely until Ctrl+C. In normal mode, respect EXIT_EVENT
+	while True:
+		if not test_mode and EXIT_EVENT.is_set():
+			break
+		
+		try:
+			success = await capture_screenshot_async()
+			if success:
+				screenshot_count += 1
+				consecutive_failures = 0
+				if screenshot_count % 10 == 0:  # Log every 10 screenshots
+					logging.info(f"Captured {screenshot_count} screenshots")
+			else:
+				consecutive_failures += 1
+				if consecutive_failures >= max_failures:
+					logging.warning(f"Screenshot capture failed {consecutive_failures} times in a row")
+					# Reset failure counter to avoid spam
+					consecutive_failures = 0
+		except Exception as e:
+			logging.debug(f"Screenshot error: {e}")
+			consecutive_failures += 1
+		
+		# In test mode, check for Ctrl+C more frequently
+		if test_mode:
+			try:
+				await asyncio.sleep(SCREENSHOT_INTERVAL)
+			except asyncio.CancelledError:
+				logging.info("Screenshot capture cancelled by user")
+				break
+		else:
+			await asyncio.sleep(SCREENSHOT_INTERVAL)
+	
+	logging.info("Async screenshot capture stopped")
+
+def open_web_interface():
+	"""Open the web interface in the default browser"""
+	try:
+		import webbrowser
+		webbrowser.open(f'http://{WEB_HOST}:{WEB_PORT}')
+		logging.info(f"Opened web interface: http://{WEB_HOST}:{WEB_PORT}")
+	except Exception as e:
+		logging.error(f"Failed to open web interface: {e}")
+
+def parse_arguments():
+	"""Parse command-line arguments"""
+	parser = argparse.ArgumentParser(description='Twitch Drop Automator with Web Interface')
+	parser.add_argument('--test', action='store_true', 
+						help='Enable test mode - keeps browser open for screenshot testing')
+	parser.add_argument('--no-tray', action='store_true',
+						help='Disable system tray icon')
+	parser.add_argument('--no-web', action='store_true',
+						help='Disable web interface')
+	return parser.parse_args()
+
 # --- Logger Setup ---
 logging.basicConfig(
-	level=logging.INFO,
+	level=logging.DEBUG,
 	format='%(asctime)s - %(levelname)s - %(message)s',
 	handlers=[
 		logging.FileHandler(LOG_FILE),
@@ -339,6 +925,27 @@ async def launch_context(p, compat_mode: bool):
 	args = [
 		"--disable-extensions",
 		"--disable-features=BlockThirdPartyCookies,CookieDeprecationMessages",
+		"--disable-background-timer-throttling",
+		"--disable-backgrounding-occluded-windows",
+		"--disable-renderer-backgrounding",
+		"--disable-background-networking",
+		"--force-device-scale-factor=1",
+		"--disable-gpu-sandbox",
+		"--disable-features=VizDisplayCompositor",
+		"--run-all-compositor-stages-before-draw",
+		"--disable-ipc-flooding-protection",
+		"--disable-hang-monitor",
+		"--disable-prompt-on-repost",
+		"--disable-sync",
+		"--disable-translate",
+		"--disable-web-security",
+		"--disable-features=TranslateUI",
+		"--disable-component-extensions-with-background-pages",
+		# Cache-busting arguments
+		"--disable-http-cache",
+		"--aggressive-cache-discard",
+		"--disable-background-timer-throttling",
+		"--disable-renderer-backgrounding",
 	]
 	ignore_default_args = None
 	if not compat_mode:
@@ -402,7 +1009,8 @@ async def launch_context(p, compat_mode: bool):
 
 	page = await context.new_page()
 
-	page.on("console", lambda msg: logging.debug(f"Console[{msg.type}]: {msg.text}"))
+	# Disable console logging to avoid Unicode encoding issues
+	# page.on("console", lambda msg: logging.debug(f"Console[{msg.type}]: {msg.text.encode('utf-8', errors='replace').decode('utf-8')}"))
 	page.on("pageerror", lambda err: logging.error(f"PageError: {err}"))
 	page.on("framenavigated", lambda frame: logging.info(f"Navigated: {frame.url}"))
 
@@ -555,10 +1163,33 @@ def _safe_int(val):
 async def fetch_facepunch_drops(context):
 	page = await context.new_page()
 	try:
-		await goto_with_exit(page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
-		# Hard refresh just for Facepunch: clear origin Cache Storage, then reload
+		# Add cache-busting headers specifically for Facepunch
+		await page.set_extra_http_headers({
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+			'Pragma': 'no-cache',
+			'Expires': '0'
+		})
+		
+		# Add timestamp to URL to prevent caching
+		import time
+		cache_bust_url = f"{FACEPUNCH_DROPS_URL}?t={int(time.time() * 1000)}"
+		
+		await goto_with_exit(page, cache_bust_url, timeout=120000, wait_until="domcontentloaded")
+		
+		# Clear Facepunch-specific cache storage
 		try:
-			await page.evaluate("caches && caches.keys && caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k))))")
+			await page.evaluate("""
+				// Clear only Facepunch-related cache
+				if (caches && caches.keys) {
+					caches.keys().then(keys => {
+						keys.forEach(key => {
+							if (key.includes('facepunch') || key.includes('twitch.facepunch')) {
+								caches.delete(key);
+							}
+						});
+					});
+				}
+			""")
 		except Exception:
 			pass
 		try:
@@ -568,6 +1199,41 @@ async def fetch_facepunch_drops(context):
 			# Fallback: navigate again if reload fails
 			await goto_with_exit(page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
 		await asyncio.sleep(1)
+		# Detect campaign not-started state and event start time
+		not_started = False
+		start_epoch_ms = None
+		try:
+			not_started = await page.evaluate(
+				r"""
+				() => !!document.querySelector('.campaign.not-started, .drops.not-started, .streamer-drops.not-started')
+				"""
+			)
+			start_epoch_ms = await page.evaluate(
+				r"""
+				() => {
+				  const scripts = Array.from(document.querySelectorAll('script'));
+				  for (const s of scripts) {
+				    const txt = s.textContent || '';
+				    let m = txt.match(/setupCountdown\([^,]*,[^,]*,\s*(\d{10,})\s*\)/);
+				    if (m) return parseInt(m[1], 10);
+				    m = txt.match(/new\s+Date\(\s*(\d{10,})\s*\)/);
+				    if (m) return parseInt(m[1], 10);
+				  }
+				  const dateEl = document.querySelector('.event-date .date[data-date-id]');
+				  if (dateEl) {
+				    const id = dateEl.getAttribute('data-date-id') || '';
+				    const seg = id.split('-').pop();
+				    if (seg && /\d+/.test(seg)) {
+				      const n = parseInt(seg, 10);
+				      return n < 2e12 ? n * 1000 : n;
+				    }
+				  }
+				  return null;
+				}
+				"""
+			)
+		except Exception:
+			pass
 		# Prefer DOM parsing for streamer drops
 		streamer_specific = []
 		try:
@@ -588,12 +1254,97 @@ async def fetch_facepunch_drops(context):
 					hours_m = re.search(r'(\d+)', hours_text)
 					hours = _safe_int(hours_m.group(1)) if hours_m else None
 					if streamer and item:
+						# Try to get item video/image and streamer profile picture
+						video_url = None
+						streamer_avatar = None
+						try:
+							# Try multiple selectors for item media
+							media_selectors = [
+								'.drop-box-body video',
+								'.drop-box video', 
+								'video',
+								'.drop-box-body img[src*="item"]',
+								'.drop-box-body img[src*="drop"]',
+								'.drop-box img[src*="item"]',
+								'.drop-box img[src*="drop"]',
+								'.drop-box-body img',
+								'.drop-box img',
+								'img'
+							]
+							
+							for selector in media_selectors:
+								media_el = await box.query_selector(selector)
+								if media_el:
+									# Check if it's a video element
+									tag_name = await media_el.evaluate('el => el.tagName.toLowerCase()')
+									if selector.startswith('video') or tag_name == 'video':
+										# Try to get video source from <source> tag
+										source_el = await media_el.query_selector('source')
+										if source_el:
+											media_src = await source_el.get_attribute('src')
+											if media_src:
+												# Convert relative URLs to absolute
+												if media_src.startswith('/'):
+													media_src = f"https://twitch.facepunch.com{media_src}"
+												video_url = media_src
+												logging.debug(f"Found video source for {streamer} - {item}: {video_url}")
+												break
+										else:
+											# Fallback to video element's src attribute
+											media_src = await media_el.get_attribute('src')
+											if media_src:
+												if media_src.startswith('/'):
+													media_src = f"https://twitch.facepunch.com{media_src}"
+												video_url = media_src
+												logging.debug(f"Found video src for {streamer} - {item}: {video_url}")
+												break
+									else:
+										# It's an image element
+										media_src = await media_el.get_attribute('src')
+										if media_src:
+											# Convert relative URLs to absolute
+											if media_src.startswith('/'):
+												media_src = f"https://twitch.facepunch.com{media_src}"
+											video_url = media_src
+											logging.debug(f"Found image for {streamer} - {item}: {video_url}")
+											break
+							
+							# Try to get streamer profile picture
+							avatar_selectors = [
+								'.streamer-avatar img',
+								'.streamer-info img',
+								'.drop-box-header img[src*="profile"]',
+								'.drop-box-header img[src*="avatar"]',
+								'.streamer-name + img',
+								'.drop-box-header img'
+							]
+							
+							for selector in avatar_selectors:
+								avatar_el = await box.query_selector(selector)
+								if avatar_el:
+									avatar_src = await avatar_el.get_attribute('src')
+									if avatar_src:
+										# Convert relative URLs to absolute
+										if avatar_src.startswith('/'):
+											avatar_src = f"https://twitch.facepunch.com{avatar_src}"
+										streamer_avatar = avatar_src
+										logging.debug(f"Found streamer avatar for {streamer}: {streamer_avatar}")
+										break
+							
+							if not video_url:
+								logging.debug(f"No media found for {streamer} - {item}")
+								
+						except Exception as e:
+							logging.debug(f"Error getting media for {streamer} - {item}: {e}")
+						
 						streamer_specific.append({
 							"streamer": streamer,
 							"item": item,
 							"hours": hours,
 							"url": twitch_url,
 							"is_live": is_live,
+							"video": video_url,
+							"streamer_avatar": streamer_avatar,
 						})
 				except Exception:
 					continue
@@ -620,7 +1371,8 @@ async def fetch_facepunch_drops(context):
 				    if (headerEl) {
 				      headerText = (headerEl.innerText || headerEl.textContent || '').trim();
 				    }
-				    const isGeneral = /\bgeneral\s+drop\b/i.test(headerText);
+				    const inGeneralSection = !!box.closest('#drops');
+				    const isGeneral = inGeneralSection || /\bgeneral\s+drop\b/i.test(headerText);
 				    let alias = null;
 				    try {
 				      const m = headerText.match(/([A-Za-z0-9]+)\s+GENERAL\s+DROP/i);
@@ -634,7 +1386,39 @@ async def fetch_facepunch_drops(context):
 				      const m = timeEl.textContent.match(/(\d+)/);
 				      if (m) hours = parseInt(m[1], 10);
 				    }
-				    res.push({ headerText, isGeneral, item, hours, alias });
+				    const isLocked = !!box.querySelector('.drop-lock');
+				    
+				    // Try to get item video
+				    let video = null;
+				    try {
+				      // First try to get video element
+				      const videoEl = box.querySelector('.drop-box-body video, .drop-box video, video');
+				      if (videoEl && videoEl.src) {
+				        video = videoEl.src;
+				        // Convert relative URLs to absolute
+				        if (video.startsWith('/')) {
+				          video = 'https://twitch.facepunch.com' + video;
+				        }
+				        console.log('Found general drop video:', video);
+				      } else {
+				        // Fallback to image if no video
+				        const imgEl = box.querySelector('.drop-box-body img, .drop-box img, img');
+				        if (imgEl && imgEl.src) {
+				          video = imgEl.src;
+				          // Convert relative URLs to absolute
+				          if (video.startsWith('/')) {
+				            video = 'https://twitch.facepunch.com' + video;
+				          }
+				          console.log('Found general drop image (fallback):', video);
+				        } else {
+				          console.log('No video or image found for general drop');
+				        }
+				      }
+				    } catch (e) {
+				      console.log('Error getting general drop video:', e);
+				    }
+				    
+				    res.push({ headerText, isGeneral, item, hours, alias, isLocked, video });
 				  }
 				  return res;
 				}
@@ -649,7 +1433,14 @@ async def fetch_facepunch_drops(context):
 			for d in data or []:
 				try:
 					if d.get('isGeneral') and d.get('item'):
-						general.append({"item": d.get('item'), "hours": d.get('hours'), "alias": d.get('alias'), "header": d.get('headerText')})
+						general.append({
+							"item": d.get('item'), 
+							"hours": d.get('hours'), 
+							"alias": d.get('alias'), 
+							"header": d.get('headerText'), 
+							"is_locked": d.get('isLocked'),
+							"video": d.get('video')  # Will be populated by the evaluate function
+						})
 				except Exception:
 					continue
 		except Exception:
@@ -687,10 +1478,10 @@ async def fetch_facepunch_drops(context):
 			pass
 
 		logging.info(f"Facepunch drops parsed. General: {len(general)}, Streamer: {len(streamer_specific)}")
-		return {"general": general, "streamer": streamer_specific}
+		return {"general": general, "streamer": streamer_specific, "not_started": bool(not_started), "start_epoch_ms": start_epoch_ms}
 	except Exception as e:
 		logging.warning(f"Facepunch parsing failed: {e}")
-		return {"general": [], "streamer": []}
+		return {"general": [], "streamer": [], "not_started": False, "start_epoch_ms": None}
 	finally:
 		try:
 			await page.close()
@@ -767,6 +1558,7 @@ async def get_incomplete_rust_rewards(inv_page):
 				}
 				return null;
 			  };
+			  
 			  document.querySelectorAll('[role="progressbar"][aria-valuenow]').forEach(pb => {
 				const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
 				const container = pb.parentElement; // wraps progressbar and text
@@ -778,6 +1570,7 @@ async def get_incomplete_rust_rewards(inv_page):
 				if (m) hours = parseInt(m[1], 10);
 				if (title) out.push({ title, percent, hours });
 			  });
+			  
 			  return out;
 			}
 			"""
@@ -1109,6 +1902,14 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 				title = best.get('title') or streamer_name
 				logging.info(f"[{title}] Progress: {percent}%")
 				last_percent = percent if isinstance(percent, int) else last_percent
+				
+				# Update cache with current progress
+				try:
+					progress_map = {title: percent}
+					update_cached_drops_data(None, progress_map)
+				except Exception as e:
+					logging.debug(f"Failed to update cache during progress tracking: {e}")
+				
 				if isinstance(percent, int) and percent >= 100:
 					await claim_available_rewards(inv_page)
 					return True
@@ -1199,6 +2000,14 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 			if match and isinstance(match.get('percent'), int):
 				p = match['percent']
 				logging.info(f"[General] {match.get('title')} Progress: {p}%")
+				
+				# Update cache with current progress
+				try:
+					progress_map = {match.get('title'): p}
+					update_cached_drops_data(None, progress_map)
+				except Exception as e:
+					logging.debug(f"Failed to update cache during general progress tracking: {e}")
+				
 				if p >= 100:
 					await claim_available_rewards(inv_page)
 					return True
@@ -1291,6 +2100,14 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			if match and isinstance(match.get('percent'), int):
 				p = match['percent']
 				logging.info(f"[General] {match.get('title')} Progress: {p}%")
+				
+				# Update cache with current progress
+				try:
+					progress_map = {match.get('title'): p}
+					update_cached_drops_data(None, progress_map)
+				except Exception as e:
+					logging.debug(f"Failed to update cache during general progress tracking: {e}")
+				
 				if p >= 100:
 					await claim_available_rewards(inv_page)
 					return (True, False)
@@ -1328,7 +2145,8 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			waited += INVENTORY_POLL_INTERVAL_SECONDS
 	return (False, False)
 
-async def run_drops_workflow(context):
+async def run_drops_workflow(context, test_mode=False):
+	global current_working_page
 	inv_page = await context.new_page()
 	completed_streamers = set()
 	try:
@@ -1337,11 +2155,37 @@ async def run_drops_workflow(context):
 				logging.info("Exit requested; stopping workflow loop.")
 				return
 			fp = await fetch_facepunch_drops(context)
+			# If the campaign hasn't started yet, notify and exit early (unless in test mode)
+			try:
+				if fp and bool(fp.get('not_started')):
+					start_ms = fp.get('start_epoch_ms')
+					label, days_until, hours_until = _format_start_time_uk(start_ms if isinstance(start_ms, int) else 0)
+					msg = f"Twitch drop event hasn't started yet. Starts {label}."
+					logging.info(msg)
+					try:
+						when = f"{days_until} days" if days_until >= 1 else f"{hours_until} hours"
+						send_notification("Twitch Drops", f"Twitch drop starting in {when} ({label})")
+					except Exception:
+						pass
+					if test_mode:
+						logging.info("Test mode: Continuing despite event not started yet.")
+						# In test mode, just wait a bit and continue
+						await asyncio.sleep(10)
+						continue
+					else:
+						logging.info("Cannot continue; exiting until event begins.")
+						EXIT_EVENT.set()
+						return
+			except Exception:
+				pass
 			streamer_targets = fp.get('streamer', [])
 
 			# Gather in-progress titles to prioritize watching those
 			progress_map = await get_inventory_progress_map(inv_page)
 			in_progress_titles = { (t or '').lower() for t in progress_map.keys() }
+			
+			# Update cached drops data for web interface
+			update_cached_drops_data(fp, progress_map)
 
 			# Defer general drop decision until after streamer candidates are considered
 			longest_general = None
@@ -1350,6 +2194,12 @@ async def run_drops_workflow(context):
 			candidates = []
 			live_any = []
 			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
+			
+			# Debug lists for better visibility
+			streamer_drops_with_progress = []
+			streamer_drops_no_progress = []
+			general_drops_available = []
+			
 			for st in streamer_targets:
 				name = (st.get('streamer') or '').strip()
 				if not name:
@@ -1368,28 +2218,77 @@ async def run_drops_workflow(context):
 					if name_lower in t_lower and isinstance(pct, int):
 						match_pct = pct
 						break
-				# Skip if no streamer-specific entry exists in inventory or it's already 100%
-				if match_pct is None or match_pct >= 100:
+				
+				# If match_pct is None, it means the drop hasn't started yet (not on Twitch inventory)
+				# This is exactly what we want to work on!
+				# Only skip if it's already 100% complete on Twitch
+				if match_pct is not None and match_pct >= 100:
 					continue
-				# Prioritize those already in progress (name present in any title)
-				priority = 0 if any(name_lower in t for t in in_progress_titles) else 1
-				if priority == 1:
-					# Not in progress; check recent claimed age to avoid very recent repeats
+				# Prioritize drops based on their state:
+				# Priority 1: Streamers with progress (1-99% on Twitch) - highest priority
+				# Priority 2: Streamers with no progress (not on Twitch inventory) - medium priority
+				# Priority 3: Recently claimed (avoid repeats) - lowest priority
+				if match_pct is not None:
+					# Already in progress on Twitch
+					priority = 1
+					item_name = st.get('item', 'Unknown')
+					streamer_drops_with_progress.append(f"{name} ({match_pct}%) - {item_name}")
+				else:
+					# Not on Twitch inventory = unstarted drop
+					priority = 2
+					# Check if we recently claimed this to avoid immediate repeats
 					days = await get_claimed_days_for_streamer(inv_page, name)
 					if days is not None and days < 20:
-						continue
-				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority, "pct": match_pct})
+						priority = 3  # Lower priority for recently claimed
+					item_name = st.get('item', 'Unknown')
+					streamer_drops_no_progress.append(f"{name} - {item_name}")
+				candidates.append({"streamer": name, "url": st.get('url'), "is_live": st.get('is_live'), "priority": priority, "pct": match_pct, "item": st.get('item')})
+
+			# Populate general drops debug list
+			if fp and fp.get('general'):
+				for g in fp['general']:
+					item_name = g.get('item', 'Unknown')
+					hours = g.get('hours', 0)
+					general_drops_available.append(f"{item_name} ({hours}h)")
+			
+			# Log debug information
+			logging.info(f"=== DROP DEBUG INFO ===")
+			logging.info(f"Streamer drops with progress: {streamer_drops_with_progress}")
+			logging.info(f"Streamer drops with no progress: {streamer_drops_no_progress}")
+			logging.info(f"General drops available: {general_drops_available}")
+			logging.info(f"Total candidates: {len(candidates)}")
+			logging.info(f"========================")
 
 			# Do not enter general mode here; prefer streamer-specific workflow below
 
 			# Prefer live streamer-specific drops first (only when we actually have streamer-specific items to progress)
 			if candidates:
-				# Prefer in-progress, then live (all are live already)
-				candidates.sort(key=lambda s: (s.get('priority', 1), s.get('pct', 101)))
+				# Sort by priority: 1=streamers with progress, 2=streamers with no progress, 3=recently claimed
+				# Within same priority, prefer lower progress percentages
+				candidates.sort(key=lambda s: (s.get('priority', 2), s.get('pct', 0) if s.get('pct') is not None else 0))
 				target_st = candidates[0]
 				target_name = target_st.get('streamer')
 				target_url = target_st.get('url')
-				logging.info(f"Chosen streamer: {target_name} (live={bool(target_st.get('is_live'))}, priority={target_st.get('priority')})")
+				target_item = target_st.get('item', 'Unknown Item')
+				priority = target_st.get('priority', 2)
+				progress_pct = target_st.get('pct')
+				if priority == 1:
+					status = f"streamer with progress ({progress_pct}%)"
+				elif priority == 2:
+					status = "streamer with no progress (not on Twitch inventory)"
+				else:
+					status = "recently claimed"
+				logging.info(f"Chosen streamer: {target_name} (live={bool(target_st.get('is_live'))}, status={status})")
+				
+				# Update current working item
+				update_current_working_item({
+					"type": "streamer",
+					"streamer": target_name,
+					"item": target_item,
+					"status": status,
+					"progress": progress_pct
+				})
+				
 				# Open streamer and run per-streamer completion tracking
 				fp_page = await context.new_page()
 				stream_page = None
@@ -1409,6 +2308,8 @@ async def run_drops_workflow(context):
 										if header_link:
 											await header_link.click()
 								stream_page = await p_info.value
+								# Update the current working page for screenshots
+								current_working_page = stream_page
 							except Exception:
 								stream_page = None
 					except Exception:
@@ -1416,6 +2317,8 @@ async def run_drops_workflow(context):
 					if not stream_page and target_url:
 						stream_page = await context.new_page()
 						await goto_with_exit(stream_page, target_url, timeout=120000, wait_until="domcontentloaded")
+						# Update the current working page for screenshots
+						current_working_page = stream_page
 				finally:
 					try:
 						await fp_page.close()
@@ -1426,7 +2329,7 @@ async def run_drops_workflow(context):
 					await asyncio.sleep(2)
 					continue
 				await maybe_accept_cookies(stream_page)
-				send_notification("Twitch Drops", f"Now watching {target_name}")
+				send_notification("Twitch Drops", f"Now watching {target_name} for '{target_item}'")
 				await ensure_stream_playing(stream_page)
 				await set_low_quality(stream_page)
 				completed = await poll_until_reward_complete(context, inv_page, streamer_name=target_name)
@@ -1438,6 +2341,8 @@ async def run_drops_workflow(context):
 					logging.info("Streamer reward completed or claimable. Attempting to claim any available rewards and moving to next.")
 					await claim_available_rewards(inv_page)
 					completed_streamers.add((target_name or "").lower())
+					# Clear current working item
+					update_current_working_item(None)
 				else:
 					logging.info("Moving to next candidate.")
 				# Refresh and next loop
@@ -1445,6 +2350,7 @@ async def run_drops_workflow(context):
 				continue
 
 			# If no streamer-specific items need progress, evaluate general drops
+			logging.info("No streamer drops available, falling back to general drops")
 			# First, claim any available rewards to ensure we don't exit with pending claims
 			try:
 				await claim_available_rewards(inv_page)
@@ -1454,6 +2360,21 @@ async def run_drops_workflow(context):
 				logging.info("All general drops are complete. Exiting program.")
 				EXIT_EVENT.set()
 				return
+			# Additional guard: if Facepunch general list is empty but site shows not-started or locked items, handle gracefully
+			try:
+				if fp and (not fp.get('general')) and (fp.get('not_started') or True in [bool((g or {}).get('is_locked')) for g in fp.get('general') or []]):
+					start_ms = fp.get('start_epoch_ms')
+					label, days_until, hours_until = _format_start_time_uk(start_ms if isinstance(start_ms, int) else 0)
+					logging.info(f"No general drops available yet; event may be locked or upcoming. Starts {label}.")
+					try:
+						when = f"{days_until} days" if days_until >= 1 else f"{hours_until} hours"
+						send_notification("Twitch Drops", f"Twitch drop starting in {when} ({label})")
+					except Exception:
+						pass
+					EXIT_EVENT.set()
+					return
+			except Exception:
+				pass
 
 			# If general drops remain and any live streamer exists, watch any live streamer while tracking the longest general drop
 			longest_general = None
@@ -1474,6 +2395,16 @@ async def run_drops_workflow(context):
 				target_name = (live_any[0].get('streamer') or '').strip()
 				target_url = live_any[0].get('url')
 				logging.info(f"General drop mode: tracking '{longest_general.get('item')}' (hours={longest_general.get('hours')}) while watching {target_name}")
+				
+				# Update current working item
+				update_current_working_item({
+					"type": "general",
+					"item": longest_general.get('item'),
+					"hours": longest_general.get('hours'),
+					"streamer": target_name,
+					"status": "general drop tracking"
+				})
+				
 				fp_page = await context.new_page()
 				stream_page = None
 				try:
@@ -1492,6 +2423,8 @@ async def run_drops_workflow(context):
 										if header_link:
 											await header_link.click()
 								stream_page = await p_info.value
+								# Update the current working page for screenshots
+								current_working_page = stream_page
 							except Exception:
 								stream_page = None
 					except Exception:
@@ -1499,6 +2432,8 @@ async def run_drops_workflow(context):
 					if not stream_page and target_url:
 						stream_page = await context.new_page()
 						await goto_with_exit(stream_page, target_url, timeout=120000, wait_until="domcontentloaded")
+						# Update the current working page for screenshots
+						current_working_page = stream_page
 				finally:
 					try:
 						await fp_page.close()
@@ -1530,8 +2465,12 @@ async def run_drops_workflow(context):
 				if completed:
 					logging.info("General drop completed or claimable.")
 					await claim_available_rewards(inv_page)
+					# Clear current working item
+					update_current_working_item(None)
 				elif switch:
 					logging.info("Switching to streamer-specific mode; a needed streamer drop is available again.")
+					# Clear current working item when switching
+					update_current_working_item(None)
 					await asyncio.sleep(1)
 					continue
 				# Loop continues; streamer-specific drops have priority when available
@@ -1549,8 +2488,25 @@ async def run_drops_workflow(context):
 		except Exception:
 			pass
 
-async def main(start_tray: bool = True):
+async def main(start_tray: bool = True, test_mode: bool = False, enable_web: bool = True):
 	logging.info("--- Starting Twitch Drop Automator ---")
+	
+	# Check if test mode is enabled in config (overrides command line)
+	config_test_mode = PREFERENCES.get('test_mode', False) if PREFERENCES else False
+	if config_test_mode:
+		test_mode = True
+		logging.info("TEST MODE ENABLED (from config) - Browser will stay open for screenshot testing")
+	elif test_mode:
+		logging.info("TEST MODE ENABLED (from command line) - Browser will stay open for screenshot testing")
+	
+	# Start web server
+	if enable_web:
+		try:
+			start_web_server()
+			logging.info("Web server started")
+		except Exception as e:
+			logging.error(f"Failed to start web server: {e}")
+	
 	# Start tray icon for quick toggles (optionally skipped on macOS; see __main__)
 	try:
 		global TRAY_ICON, ICON_PATH
@@ -1567,14 +2523,40 @@ async def main(start_tray: bool = True):
 	async with async_playwright() as p:
 		try:
 			context = await run_flow(p)
+			# Set global browser context for screenshot capture
+			global current_browser_context
+			current_browser_context = context
 		except asyncio.CancelledError:
 			logging.info("Startup cancelled.")
 			return
 		try:
-			await run_drops_workflow(context)
+			if test_mode:
+				# In test mode, just keep the browser open and let screenshots run
+				logging.info("Test mode: Keeping browser open. Check web interface for screenshots.")
+				logging.info("Press Ctrl+C to exit test mode.")
+				# Open web interface automatically in test mode
+				if enable_web:
+					open_web_interface()
+				# Start async screenshot capture - this will run indefinitely until Ctrl+C
+				await start_screenshot_capture_async(test_mode=True)
+			else:
+				# For normal mode, start screenshot capture as background task
+				screenshot_task = asyncio.create_task(start_screenshot_capture_async(test_mode=False))
+				try:
+					await run_drops_workflow(context, test_mode=False)
+				finally:
+					screenshot_task.cancel()
+					try:
+						await screenshot_task
+					except asyncio.CancelledError:
+						pass
 		finally:
-			logging.info("Closing browser.")
-			await context.close()
+			if not test_mode:
+				logging.info("Closing browser.")
+				current_browser_context = None
+				await context.close()
+			else:
+				logging.info("Test mode: Browser kept open for testing")
 	logging.info("--- Automator finished ---")
 
 async def is_streamer_online_on_facepunch(context, streamer_name: str) -> bool | None:
@@ -1584,7 +2566,35 @@ async def is_streamer_online_on_facepunch(context, streamer_name: str) -> bool |
 		return None
 	page = await context.new_page()
 	try:
-		await goto_with_exit(page, FACEPUNCH_DROPS_URL, timeout=120000, wait_until="domcontentloaded")
+		# Add cache-busting headers specifically for Facepunch
+		await page.set_extra_http_headers({
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+			'Pragma': 'no-cache',
+			'Expires': '0'
+		})
+		
+		# Add timestamp to URL to prevent caching
+		import time
+		cache_bust_url = f"{FACEPUNCH_DROPS_URL}?t={int(time.time() * 1000)}"
+		
+		await goto_with_exit(page, cache_bust_url, timeout=120000, wait_until="domcontentloaded")
+		
+		# Clear Facepunch-specific cache storage
+		try:
+			await page.evaluate("""
+				// Clear only Facepunch-related cache
+				if (caches && caches.keys) {
+					caches.keys().then(keys => {
+						keys.forEach(key => {
+							if (key.includes('facepunch') || key.includes('twitch.facepunch')) {
+								caches.delete(key);
+							}
+						});
+					});
+				}
+			""")
+		except Exception:
+			pass
 		await asyncio.sleep(0.5)
 		box = await page.query_selector(f'.streamer-drops .drop-box:has(.streamer-name:has-text("{streamer_name}"))')
 		if not box:
@@ -1744,16 +2754,20 @@ def ensure_process_visibility_matches_preference():
 
 
 if __name__ == "__main__":
+	# Parse command-line arguments
+	args = parse_arguments()
+	
 	# Ensure process matches the user's console visibility preference before running
 	try:
 		ensure_process_visibility_matches_preference()
 	except Exception:
 		pass
+	
 	# On macOS, run tray in the main thread and the async app in a background thread
-	if IS_MAC and pystray is not None:
+	if IS_MAC and pystray is not None and not args.no_tray:
 		def _run_async_app():
 			try:
-				asyncio.run(main(start_tray=False))
+				asyncio.run(main(start_tray=False, test_mode=args.test, enable_web=not args.no_web))
 			except KeyboardInterrupt:
 				pass
 			except Exception:
@@ -1774,6 +2788,6 @@ if __name__ == "__main__":
 			pass
 	else:
 		try:
-			asyncio.run(main(start_tray=True))
+			asyncio.run(main(start_tray=not args.no_tray, test_mode=args.test, enable_web=not args.no_web))
 		except KeyboardInterrupt:
 			pass
