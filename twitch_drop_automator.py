@@ -1082,30 +1082,61 @@ async def capture_screenshot_async():
 		# Check if we're in headless mode
 		is_headless = get_headless_preference()
 		
-		# Take screenshot with different options based on mode
+		# Take screenshot with different options based on mode and timeout handling
 		if is_headless:
-			# In headless mode, take a full page screenshot
-			screenshot_bytes = await active_page.screenshot(
-				type='png', 
-				full_page=True,  # Full page in headless
-				animations='disabled'  # Disable animations for cleaner screenshots
-			)
-		else:
-			# In non-headless mode, try to take viewport screenshot
+			# In headless mode, take a full page screenshot with timeout
 			try:
-				screenshot_bytes = await active_page.screenshot(
-					type='png', 
-					full_page=False,  # Just the visible viewport
-					animations='disabled'
+				screenshot_bytes = await asyncio.wait_for(
+					active_page.screenshot(
+						type='png', 
+						full_page=True,  # Full page in headless
+						animations='disabled'  # Disable animations for cleaner screenshots
+					),
+					timeout=10.0  # 10 second timeout
 				)
+			except asyncio.TimeoutError:
+				logging.debug("Screenshot timeout in headless mode")
+				return False
+		else:
+			# In non-headless mode, try to take viewport screenshot with timeout
+			try:
+				screenshot_bytes = await asyncio.wait_for(
+					active_page.screenshot(
+						type='png', 
+						full_page=False,  # Just the visible viewport
+						animations='disabled'
+					),
+					timeout=10.0  # 10 second timeout
+				)
+			except asyncio.TimeoutError:
+				logging.debug("Viewport screenshot timeout, trying full page")
+				try:
+					screenshot_bytes = await asyncio.wait_for(
+						active_page.screenshot(
+							type='png', 
+							full_page=True,
+							animations='disabled'
+						),
+						timeout=10.0  # 10 second timeout
+					)
+				except asyncio.TimeoutError:
+					logging.debug("Full page screenshot timeout")
+					return False
 			except Exception as e:
 				logging.debug(f"Viewport screenshot failed, trying full page: {e}")
 				# Fallback to full page if viewport fails
-				screenshot_bytes = await active_page.screenshot(
-					type='png', 
-					full_page=True,
-					animations='disabled'
-				)
+				try:
+					screenshot_bytes = await asyncio.wait_for(
+						active_page.screenshot(
+							type='png', 
+							full_page=True,
+							animations='disabled'
+						),
+						timeout=10.0  # 10 second timeout
+					)
+				except asyncio.TimeoutError:
+					logging.debug("Fallback screenshot timeout")
+					return False
 		
 		if not screenshot_bytes:
 			logging.debug("Screenshot capture failed: no data returned")
@@ -1162,6 +1193,12 @@ async def start_screenshot_capture_async(test_mode=False):
 				consecutive_failures += 1
 				if consecutive_failures >= max_failures:
 					logging.warning(f"Screenshot capture failed {consecutive_failures} times in a row")
+					# Emit a special event to trigger page reload
+					if socketio:
+						socketio.emit('screenshot_failed', {
+							'message': 'Screenshot capture failed multiple times. Page may be frozen.',
+							'consecutive_failures': consecutive_failures
+						})
 					# Reset failure counter to avoid spam
 					consecutive_failures = 0
 		except Exception as e:
@@ -2883,7 +2920,7 @@ async def main(start_tray: bool = True, test_mode: bool = False, enable_web: boo
 		ICON_PATH = ensure_icon_file(_generate_tray_icon_image())
 		logging.info(f"Notification icon: {ICON_PATH}")
 		# One-time startup notification to verify toasts
-		send_notification("Twitch Drops", "Yippeee")
+		send_notification("Twitch Drops", "Automator started")
 	except Exception as e:
 		logging.debug(f"Tray start failed: {e}")
 	_install_signal_handlers()

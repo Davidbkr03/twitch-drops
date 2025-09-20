@@ -1022,6 +1022,15 @@
             updateConnectionStatus('Disconnected', 'status-offline');
             addLogEntry('Disconnected from server', 'warning');
         });
+        
+        socket.on('screenshot_failed', function(data) {
+            console.log('Screenshot failed multiple times:', data.message);
+            addLogEntry('Screenshot failures detected - reloading page', 'warning');
+            // Immediate reload when screenshots fail
+            setTimeout(() => {
+                window.location.reload();
+            }, 1000);
+        });
 
         // Status updates
         socket.on('status', function(data) {
@@ -1595,12 +1604,12 @@
             if (reloadTimeout) return; // Already scheduled
             
             const timeSinceLastHeartbeat = Date.now() - lastHeartbeat;
-            if (timeSinceLastHeartbeat > 30000) { // 30 seconds without heartbeat
-                console.log('No heartbeat for 30+ seconds, scheduling reload...');
+            if (timeSinceLastHeartbeat > 15000) { // 15 seconds without heartbeat (reduced from 30)
+                console.log('No heartbeat for 15+ seconds, scheduling reload...');
                 reloadTimeout = setTimeout(() => {
                     console.log('Reloading page due to connection issues...');
                     window.location.reload();
-                }, 5000); // Wait 5 more seconds before reloading
+                }, 3000); // Wait 3 more seconds before reloading (reduced from 5)
             }
         }
 
