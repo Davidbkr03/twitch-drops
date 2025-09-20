@@ -1658,14 +1658,14 @@
             const updateBtn = document.getElementById('updateBtn');
             
             try {
-                updateBtn.textContent = '⬇️ Updating...';
+                updateBtn.textContent = '⬇️ Downloading...';
                 
                 const response = await fetch('/api/update', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    signal: AbortSignal.timeout(120000) // 2 minute timeout for update
+                    signal: AbortSignal.timeout(300000) // 5 minute timeout for update (includes dependency installation)
                 });
                 
                 if (!response.ok) {
@@ -1675,14 +1675,14 @@
                 const result = await response.json();
                 
                 if (result.success) {
-                    alert('Update completed successfully! The application will restart in a few seconds.');
+                    alert('Update completed successfully!\n\n✅ Files updated\n✅ Dependencies installed/updated\n✅ Playwright browsers updated\n\nThe application will restart in a few seconds.');
                     // The server will restart automatically
                 } else {
                     alert(`Update failed: ${result.message}`);
                 }
             } catch (error) {
                 if (error.name === 'AbortError') {
-                    alert('Update timed out. Please try again or restart the application manually.');
+                    alert('Update timed out. This might be due to slow internet or dependency installation. Please try again or restart the application manually.');
                 } else {
                     alert(`Update failed: ${error.message}`);
                 }

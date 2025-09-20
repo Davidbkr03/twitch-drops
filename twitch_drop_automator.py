@@ -539,8 +539,8 @@ def start_system_tray(block: bool = False):
 			logging.info(f"Tray: headless set to {new_val}. Restarting to apply…")
 			try:
 				icon.update_menu()
-			except Exception:
-				pass
+			except Exception as menu_err:
+				logging.debug(f"Menu update failed: {menu_err}")
 			threading.Thread(target=lambda: (send_notification("Twitch Drops", "Applying headless change…"), restart_program()), daemon=True).start()
 		except Exception as e:
 			logging.warning(f"Tray toggle failed: {e}")
@@ -597,15 +597,28 @@ def start_system_tray(block: bool = False):
 	icon = pystray.Icon("TwitchDropAutomator", image, "Twitch Drop Automator", menu=menu)
 	global TRAY_IMAGE
 	TRAY_IMAGE = image
-	if block:
-		# On macOS, Cocoa requires the app loop on the main thread
-		atexit.register(lambda: icon.stop())
-		icon.run()
-		return icon
-	else:
-		icon.run_detached()
-		atexit.register(lambda: icon.stop())
-		return icon
+	
+	try:
+		if block:
+			# On macOS, Cocoa requires the app loop on the main thread
+			atexit.register(lambda: safe_icon_stop(icon))
+			icon.run()
+			return icon
+		else:
+			icon.run_detached()
+			atexit.register(lambda: safe_icon_stop(icon))
+			return icon
+	except Exception as e:
+		logging.error(f"Failed to start system tray: {e}")
+		return None
+
+def safe_icon_stop(icon):
+	"""Safely stop the tray icon with error handling."""
+	try:
+		if icon:
+			icon.stop()
+	except Exception as e:
+		logging.debug(f"Error stopping tray icon: {e}")
 
 # --- Web Server Functions ---
 def create_web_app():
@@ -793,7 +806,8 @@ def create_web_app():
 				return jsonify({'success': False, 'message': f'Failed to download update. Status: {download_response.status_code}'}), 500
 			
 			# Create temporary directory for extraction
-			with tempfile.TemporaryDirectory() as temp_dir:
+			temp_dir = tempfile.mkdtemp()
+			try:
 				zip_path = os.path.join(temp_dir, 'update.zip')
 				
 				# Save zip file
@@ -857,11 +871,57 @@ def create_web_app():
 					
 					logging.info(f"Updated: {item}")
 				
+				# Install/update dependencies if requirements.txt was updated
+				requirements_path = os.path.join(BASE_DIR, 'requirements.txt')
+				if os.path.exists(requirements_path):
+					logging.info("Installing/updating dependencies...")
+					try:
+						import subprocess
+						venv_python = os.path.join(BASE_DIR, 'venv', 'Scripts', 'python.exe')
+						venv_pip = os.path.join(BASE_DIR, 'venv', 'Scripts', 'pip.exe')
+						
+						# Check if virtual environment exists
+						if os.path.exists(venv_python) and os.path.exists(venv_pip):
+							# Upgrade pip first
+							logging.info("Upgrading pip...")
+							subprocess.run([venv_python, '-m', 'pip', 'install', '--upgrade', 'pip'], 
+										  cwd=BASE_DIR, timeout=60, check=True)
+							
+							# Install/update requirements
+							logging.info("Installing requirements...")
+							subprocess.run([venv_pip, 'install', '-r', requirements_path], 
+										  cwd=BASE_DIR, timeout=300, check=True)
+							
+							# Install Playwright browsers if needed
+							logging.info("Installing Playwright browsers...")
+							subprocess.run([venv_python, '-m', 'playwright', 'install'], 
+										  cwd=BASE_DIR, timeout=300, check=True)
+							
+							logging.info("Dependencies updated successfully")
+						else:
+							logging.warning("Virtual environment not found, skipping dependency installation")
+					except subprocess.TimeoutExpired:
+						logging.error("Dependency installation timed out")
+					except subprocess.CalledProcessError as e:
+						logging.error(f"Dependency installation failed: {e}")
+					except Exception as e:
+						logging.error(f"Error installing dependencies: {e}")
+				
 				logging.info("Update completed successfully")
+				
+			finally:
+				# Clean up temporary directory
+				try:
+					shutil.rmtree(temp_dir)
+					logging.info("Cleaned up temporary files")
+				except Exception as e:
+					logging.warning(f"Failed to clean up temporary directory: {e}")
 			
-			# Schedule restart after a short delay
+			# Return success first, then restart in a separate thread
+			# This ensures the HTTP response is sent before restarting
 			def delayed_restart():
-				time.sleep(3)
+				time.sleep(2)  # Give time for HTTP response to be sent
+				logging.info("Restarting application after update...")
 				os._exit(0)
 			
 			restart_thread = threading.Thread(target=delayed_restart, daemon=True)
@@ -1362,21 +1422,52 @@ async def run_flow(p):
 						warm_done = True
 
 			try:
-				await wait_with_exit(asyncio.create_task(page.wait_for_selector('img[alt="User Avatar"]', timeout=45000)))
-				logging.info("User appears to be logged in.")
-				success = True
-				return context
+				# Try multiple selectors for user avatar/login detection
+				avatar_selectors = [
+					'img[alt="User Avatar"]',
+					'[data-a-target="user-avatar"]',
+					'[data-testid="user-avatar"]',
+					'.user-avatar',
+					'[aria-label*="avatar"]',
+					'[alt*="avatar"]'
+				]
+				
+				avatar_found = False
+				for selector in avatar_selectors:
+					try:
+						await wait_with_exit(asyncio.create_task(page.wait_for_selector(selector, timeout=10000)))
+						logging.info(f"User appears to be logged in (found selector: {selector}).")
+						avatar_found = True
+						break
+					except Exception:
+						continue
+				
+				if avatar_found:
+					success = True
+					return context
+				else:
+					logging.warning("Could not find user avatar with any selector. User may not be logged in.")
+					raise Exception("No avatar selectors found")
+					
 			except Exception:
 				logging.warning("Could not find user avatar. User may not be logged in. Waiting for user to complete login.")
 				await wait_until_logged_in(context, page)
-				# After wait, verify again
-				try:
-					await page.wait_for_selector('img[alt="User Avatar"]', timeout=20000)
-					logging.info("Login detected after waiting.")
+				# After wait, verify again with multiple selectors
+				avatar_found = False
+				for selector in avatar_selectors:
+					try:
+						await page.wait_for_selector(selector, timeout=5000)
+						logging.info(f"Login detected after waiting (found selector: {selector}).")
+						avatar_found = True
+						break
+					except Exception:
+						continue
+				
+				if avatar_found:
 					success = True
 					return context
-				except Exception:
-					raise
+				else:
+					raise Exception("Login verification failed - no avatar found after waiting")
 		except Exception as e:
 			if passport_429_count["count"] >= PASSPORT_429_THRESHOLD and not tried_compat:
 				tried_compat = True
@@ -2755,7 +2846,13 @@ async def main(start_tray: bool = True, test_mode: bool = False, enable_web: boo
 	try:
 		global TRAY_ICON, ICON_PATH
 		if start_tray:
-			TRAY_ICON = start_system_tray(block=False)
+			try:
+				TRAY_ICON = start_system_tray(block=False)
+				if TRAY_ICON is None:
+					logging.warning("System tray failed to start, continuing without tray icon")
+			except Exception as tray_err:
+				logging.error(f"Failed to start system tray: {tray_err}")
+				TRAY_ICON = None
 		# Prepare .ico for notifications regardless of tray availability
 		ICON_PATH = ensure_icon_file(_generate_tray_icon_image())
 		logging.info(f"Notification icon: {ICON_PATH}")
@@ -3022,8 +3119,8 @@ if __name__ == "__main__":
 		try:
 			# Block here to keep Cocoa on main thread
 			start_system_tray(block=True)
-		except Exception:
-			logging.debug("Tray main loop exited")
+		except Exception as e:
+			logging.debug(f"Tray main loop exited: {e}")
 		# Request shutdown and wait briefly
 		EXIT_EVENT.set()
 		try:
