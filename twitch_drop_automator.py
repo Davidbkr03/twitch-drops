@@ -2056,9 +2056,19 @@ async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | N
 				return null;
 			  };
 			  
+			  // First, try to find the claimed section specifically
+			  const claimedSection = document.querySelector('[data-a-target="claimed-section"], [data-testid="claimed-section"], .claimed-section, [aria-label*="claimed"], [aria-label*="Claimed"]') ||
+									Array.from(document.querySelectorAll('div, section')).find(el => {
+										const text = (el.textContent || '').toLowerCase();
+										return text.includes('claimed') && text.length < 100; // Short text likely to be a section header
+									});
+			  
+			  // Define search scope - prefer claimed section if found, otherwise search entire page
+			  const searchScope = claimedSection || document;
+			  
 			  // Try each search variation
 			  for (const targetLower of searchVariations) {
-				const all = Array.from(document.querySelectorAll('p, span, div, a'));
+				const all = Array.from(searchScope.querySelectorAll('p, span, div, a, h1, h2, h3, h4, h5, h6'));
 				const nameEls = all.filter(el => {
 					const txt = (el.textContent || '').toLowerCase();
 					return txt && txt.includes(targetLower);
