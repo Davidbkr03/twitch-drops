@@ -93,6 +93,62 @@ current_working_item = None
 current_working_lock = threading.RLock()
 
 
+def get_current_version():
+	"""Get the current version of the application."""
+	try:
+		# Try to read version from a version file first
+		version_file = os.path.join(BASE_DIR, 'version.txt')
+		if os.path.exists(version_file):
+			with open(version_file, 'r') as f:
+				return f.read().strip()
+		
+		# Fallback: try to extract from git or use a default
+		try:
+			import subprocess
+			result = subprocess.run(['git', 'describe', '--tags', '--always'], 
+								  capture_output=True, text=True, cwd=BASE_DIR, timeout=5)
+			if result.returncode == 0:
+				return result.stdout.strip().lstrip('v')
+		except:
+			pass
+		
+		# Default version if nothing else works
+		return "1.0.0"
+	except:
+		return "1.0.0"
+
+def compare_versions(version1, version2):
+	"""Compare two version strings. Returns 1 if version1 > version2, -1 if version1 < version2, 0 if equal."""
+	try:
+		from packaging import version
+		v1 = version.parse(version1)
+		v2 = version.parse(version2)
+		if v1 > v2:
+			return 1
+		elif v1 < v2:
+			return -1
+		else:
+			return 0
+	except:
+		# Fallback simple comparison
+		try:
+			v1_parts = [int(x) for x in version1.split('.')]
+			v2_parts = [int(x) for x in version2.split('.')]
+			
+			# Pad with zeros to make same length
+			max_len = max(len(v1_parts), len(v2_parts))
+			v1_parts.extend([0] * (max_len - len(v1_parts)))
+			v2_parts.extend([0] * (max_len - len(v2_parts)))
+			
+			for i in range(max_len):
+				if v1_parts[i] > v2_parts[i]:
+					return 1
+				elif v1_parts[i] < v2_parts[i]:
+					return -1
+			return 0
+		except:
+			return 0
+
 def update_current_working_item(item_info):
 	"""Update the current working item for the web interface."""
 	global current_working_item
@@ -549,6 +605,7 @@ def create_web_app():
 			'test_mode': PREFERENCES.get('test_mode', False) if PREFERENCES else False,
 			'debug_mode': PREFERENCES.get('debug_mode', False) if PREFERENCES else False,
 			'enable_web_interface': PREFERENCES.get('enable_web_interface', True) if PREFERENCES else True,
+			'version': get_current_version(),
 			'timestamp': datetime.now().isoformat()
 		})
 	
@@ -628,6 +685,166 @@ def create_web_app():
 			
 		except Exception as e:
 			return jsonify({'success': False, 'message': f'Error initiating restart: {str(e)}'}), 500
+
+	@app.route('/api/check-updates', methods=['POST'])
+	def api_check_updates():
+		"""API endpoint to check for updates"""
+		try:
+			import requests
+			import re
+			
+			# Get current version from the script
+			current_version = get_current_version()
+			logging.info(f"Checking for updates. Current version: {current_version}")
+			
+			# Get latest version from GitHub
+			repo_url = "https://api.github.com/repos/Davidbkr03/twitch-drops/releases/latest"
+			logging.info(f"Fetching release info from: {repo_url}")
+			
+			response = requests.get(repo_url, timeout=10)
+			logging.info(f"GitHub API response status: {response.status_code}")
+			
+			if response.status_code == 200:
+				release_data = response.json()
+				latest_version = release_data.get('tag_name', '').lstrip('v')
+				logging.info(f"Latest version from GitHub: {latest_version}")
+				
+				# Compare versions
+				version_comparison = compare_versions(current_version, latest_version)
+				update_available = version_comparison < 0  # current < latest means update available
+				logging.info(f"Version comparison result: {version_comparison}, update_available: {update_available}")
+				
+				return jsonify({
+					'success': True,
+					'update_available': update_available,
+					'current_version': current_version,
+					'latest_version': latest_version,
+					'release_notes': release_data.get('body', '')[:500] + '...' if len(release_data.get('body', '')) > 500 else release_data.get('body', '')
+				})
+			else:
+				error_msg = f'Failed to fetch release information. Status: {response.status_code}'
+				logging.error(error_msg)
+				return jsonify({'success': False, 'message': error_msg}), 500
+				
+		except requests.exceptions.RequestException as e:
+			error_msg = f'Network error checking for updates: {str(e)}'
+			logging.error(error_msg)
+			return jsonify({'success': False, 'message': error_msg}), 500
+		except Exception as e:
+			error_msg = f'Error checking for updates: {str(e)}'
+			logging.error(error_msg)
+			return jsonify({'success': False, 'message': error_msg}), 500
+
+	@app.route('/api/update', methods=['POST'])
+	def api_update():
+		"""API endpoint to perform the update"""
+		try:
+			import requests
+			import zipfile
+			import shutil
+			import tempfile
+			import threading
+			import time
+			
+			# Get latest release download URL
+			repo_url = "https://api.github.com/repos/Davidbkr03/twitch-drops/releases/latest"
+			response = requests.get(repo_url, timeout=10)
+			
+			if response.status_code != 200:
+				return jsonify({'success': False, 'message': 'Failed to fetch release information'}), 500
+			
+			release_data = response.json()
+			download_url = None
+			
+			# Find the zip download URL
+			for asset in release_data.get('assets', []):
+				if asset['name'].endswith('.zip'):
+					download_url = asset['browser_download_url']
+					break
+			
+			if not download_url:
+				return jsonify({'success': False, 'message': 'No zip file found in release'}), 500
+			
+			# Download the update
+			logging.info(f"Downloading update from {download_url}")
+			download_response = requests.get(download_url, timeout=60)
+			
+			if download_response.status_code != 200:
+				return jsonify({'success': False, 'message': 'Failed to download update'}), 500
+			
+			# Create temporary directory for extraction
+			with tempfile.TemporaryDirectory() as temp_dir:
+				zip_path = os.path.join(temp_dir, 'update.zip')
+				
+				# Save zip file
+				with open(zip_path, 'wb') as f:
+					f.write(download_response.content)
+				
+				# Extract zip file
+				extract_dir = os.path.join(temp_dir, 'extracted')
+				with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+					zip_ref.extractall(extract_dir)
+				
+				# Find the extracted folder (usually has the repo name)
+				extracted_folders = [f for f in os.listdir(extract_dir) if os.path.isdir(os.path.join(extract_dir, f))]
+				if not extracted_folders:
+					return jsonify({'success': False, 'message': 'Invalid zip file structure'}), 500
+				
+				source_dir = os.path.join(extract_dir, extracted_folders[0])
+				
+				# Backup current files (except user data and config)
+				backup_dir = os.path.join(BASE_DIR, 'backup_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
+				os.makedirs(backup_dir, exist_ok=True)
+				
+				# Files to backup
+				files_to_backup = [
+					'twitch_drop_automator.py',
+					'templates',
+					'static',
+					'requirements.txt',
+					'README.md'
+				]
+				
+				for item in files_to_backup:
+					src = os.path.join(BASE_DIR, item)
+					if os.path.exists(src):
+						dst = os.path.join(backup_dir, item)
+						if os.path.isdir(src):
+							shutil.copytree(src, dst)
+						else:
+							shutil.copy2(src, dst)
+				
+				# Copy new files
+				for item in os.listdir(source_dir):
+					src = os.path.join(source_dir, item)
+					dst = os.path.join(BASE_DIR, item)
+					
+					# Skip user data and config files
+					if item in ['user_data_stealth', 'config.json', 'drops_log.txt', 'venv', '__pycache__']:
+						continue
+					
+					if os.path.isdir(src):
+						if os.path.exists(dst):
+							shutil.rmtree(dst)
+						shutil.copytree(src, dst)
+					else:
+						shutil.copy2(src, dst)
+				
+				logging.info("Update completed successfully")
+			
+			# Schedule restart after a short delay
+			def delayed_restart():
+				time.sleep(3)
+				os._exit(0)
+			
+			restart_thread = threading.Thread(target=delayed_restart, daemon=True)
+			restart_thread.start()
+			
+			return jsonify({'success': True, 'message': 'Update completed successfully. Restarting...'})
+			
+		except Exception as e:
+			logging.error(f"Update failed: {e}")
+			return jsonify({'success': False, 'message': f'Update failed: {str(e)}'}), 500
 	
 	@socketio.on('connect')
 	def handle_connect():

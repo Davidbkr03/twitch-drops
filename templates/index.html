@@ -127,6 +127,33 @@
             border-bottom: none;
         }
 
+        .dropdown-btn {
+            width: 100%;
+            padding: 10px 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            text-align: left;
+        }
+
+        .dropdown-btn:hover {
+            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+        }
+
+        .dropdown-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
         .dropdown-label {
             display: flex;
             align-items: center;
@@ -802,6 +829,11 @@
                         </button>
                         <div class="dropdown-content" id="dropdownContent">
                             <div class="dropdown-item">
+                                <button class="dropdown-btn" onclick="checkForUpdates()" id="updateBtn">
+                                    🔄 Check for Updates
+                                </button>
+                            </div>
+                            <div class="dropdown-item">
                                 <label class="dropdown-label">
                                     <input type="checkbox" id="showDevOptionsToggle" onchange="toggleDevOptions()">
                                     Show Developer Options
@@ -828,6 +860,10 @@
                     <div class="info-item">
                         <div class="info-label">Last Update</div>
                         <div class="info-value" id="lastUpdate">Never</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Version</div>
+                        <div class="info-value" id="appVersion">Loading...</div>
                     </div>
                 </div>
             </div>
@@ -958,6 +994,7 @@
 
         <div class="controls">
             <button class="btn btn-primary" onclick="refreshStatus()">🔄 Refresh Status</button>
+            <button class="btn btn-secondary" onclick="window.location.reload()">🔄 Reload Page</button>
             <a href="/api/status" class="btn btn-secondary" target="_blank">📋 API Status</a>
         </div>
 
@@ -1063,6 +1100,9 @@
                 .then(data => {
                     document.getElementById('headlessStatus').textContent = data.headless ? 'Enabled' : 'Disabled';
                     document.getElementById('lastUpdate').textContent = new Date(data.timestamp).toLocaleTimeString();
+                    if (data.version) {
+                        document.getElementById('appVersion').textContent = data.version;
+                    }
                     addLogEntry('Status refreshed', 'info');
                 })
                 .catch(error => {
@@ -1520,10 +1560,142 @@
             }
         }
 
+        // Auto-reload functionality
+        let lastHeartbeat = Date.now();
+        let heartbeatInterval;
+        let reloadTimeout;
+
+        function startHeartbeat() {
+            heartbeatInterval = setInterval(async () => {
+                try {
+                    const response = await fetch('/api/status', { 
+                        method: 'GET',
+                        signal: AbortSignal.timeout(5000) // 5 second timeout
+                    });
+                    
+                    if (response.ok) {
+                        lastHeartbeat = Date.now();
+                        // Clear any pending reload
+                        if (reloadTimeout) {
+                            clearTimeout(reloadTimeout);
+                            reloadTimeout = null;
+                        }
+                    } else {
+                        console.warn('Heartbeat failed, response not ok');
+                        scheduleReload();
+                    }
+                } catch (error) {
+                    console.warn('Heartbeat failed:', error);
+                    scheduleReload();
+                }
+            }, 10000); // Check every 10 seconds
+        }
+
+        function scheduleReload() {
+            if (reloadTimeout) return; // Already scheduled
+            
+            const timeSinceLastHeartbeat = Date.now() - lastHeartbeat;
+            if (timeSinceLastHeartbeat > 30000) { // 30 seconds without heartbeat
+                console.log('No heartbeat for 30+ seconds, scheduling reload...');
+                reloadTimeout = setTimeout(() => {
+                    console.log('Reloading page due to connection issues...');
+                    window.location.reload();
+                }, 5000); // Wait 5 more seconds before reloading
+            }
+        }
+
+        // Update functionality
+        async function checkForUpdates() {
+            const updateBtn = document.getElementById('updateBtn');
+            const originalText = updateBtn.textContent;
+            
+            try {
+                updateBtn.disabled = true;
+                updateBtn.textContent = '🔄 Checking...';
+                
+                const response = await fetch('/api/check-updates', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    signal: AbortSignal.timeout(15000) // 15 second timeout
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    if (result.update_available) {
+                        const shouldUpdate = confirm(`Update available!\n\nCurrent version: ${result.current_version}\nLatest version: ${result.latest_version}\n\nWould you like to update now?`);
+                        
+                        if (shouldUpdate) {
+                            updateBtn.textContent = '⬇️ Downloading...';
+                            await performUpdate();
+                        }
+                    } else {
+                        alert('You are already running the latest version!');
+                    }
+                } else {
+                    alert(`Error checking for updates: ${result.message}`);
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    alert('Update check timed out. Please try again.');
+                } else {
+                    alert(`Error checking for updates: ${error.message}`);
+                }
+            } finally {
+                updateBtn.disabled = false;
+                updateBtn.textContent = originalText;
+            }
+        }
+
+        async function performUpdate() {
+            const updateBtn = document.getElementById('updateBtn');
+            
+            try {
+                updateBtn.textContent = '⬇️ Updating...';
+                
+                const response = await fetch('/api/update', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    signal: AbortSignal.timeout(120000) // 2 minute timeout for update
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Update completed successfully! The application will restart in a few seconds.');
+                    // The server will restart automatically
+                } else {
+                    alert(`Update failed: ${result.message}`);
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    alert('Update timed out. Please try again or restart the application manually.');
+                } else {
+                    alert(`Update failed: ${error.message}`);
+                }
+            } finally {
+                updateBtn.disabled = false;
+                updateBtn.textContent = '🔄 Check for Updates';
+            }
+        }
+
         // Initial status fetch and settings load
         refreshStatus();
         loadSettings();
         startDropsUpdates();
+        startHeartbeat();
     </script>
 </body>
 </html>
