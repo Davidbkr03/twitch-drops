@@ -2799,25 +2799,25 @@ async def run_drops_workflow(context, test_mode=False):
 			# Defer general drop decision until after streamer candidates are considered
 			longest_general = None
 
-            # One-time sweep of recently claimed items (<= 21 days)
-            recently_claimed = []
-            try:
-                recently_claimed = await scrape_recent_claimed_items(inv_page)
-            except Exception:
-                recently_claimed = []
+			# One-time sweep of recently claimed items (<= 21 days)
+			recently_claimed = []
+			try:
+				recently_claimed = await scrape_recent_claimed_items(inv_page)
+			except Exception:
+				recently_claimed = []
 
-            # Helper to check if a streamer appears in recently_claimed
-            def is_streamer_recently_claimed(streamer: str) -> int | None:
-                name_vars = generate_search_variations(streamer)
-                for it in (recently_claimed or []):
-                    n = (it.get('name') or '').lower()
-                    for v in name_vars:
-                        if v and v in n:
-                            return int(it.get('days')) if isinstance(it.get('days'), int) else 0
-                return None
+			# Helper to check if a streamer appears in recently_claimed
+			def is_streamer_recently_claimed(streamer: str) -> int | None:
+				name_vars = generate_search_variations(streamer)
+				for it in (recently_claimed or []):
+					n = (it.get('name') or '').lower()
+					for v in name_vars:
+						if v and v in n:
+							return int(it.get('days')) if isinstance(it.get('days'), int) else 0
+				return None
 
-            # Build candidates only for streamer-specific items present in inventory (<100%)
-            candidates = []
+			# Build candidates only for streamer-specific items present in inventory (<100%)
+			candidates = []
 			live_any = []
 			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
 			
