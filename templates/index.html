@@ -1629,7 +1629,8 @@
                 
                 if (result.success) {
                     if (result.update_available) {
-                        const shouldUpdate = confirm(`Update available!\n\nCurrent version: ${result.current_version}\nLatest version: ${result.latest_version}\n\nWould you like to update now?`);
+                        const updateMessage = `Update available!\n\nCurrent commit: ${result.current_commit}\nLatest commit: ${result.latest_commit}\n\nLatest changes:\n${result.release_notes}\n\nWould you like to update now?`;
+                        const shouldUpdate = confirm(updateMessage);
                         
                         if (shouldUpdate) {
                             updateBtn.textContent = '⬇️ Downloading...';

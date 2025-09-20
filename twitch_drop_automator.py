@@ -117,6 +117,30 @@ def get_current_version():
 	except:
 		return "1.0.0"
 
+def get_current_commit_hash():
+	"""Get the current git commit hash."""
+	try:
+		import subprocess
+		result = subprocess.run(['git', 'rev-parse', 'HEAD'], 
+							  capture_output=True, text=True, cwd=BASE_DIR, timeout=5)
+		if result.returncode == 0:
+			return result.stdout.strip()[:8]  # Return short hash
+	except:
+		pass
+	
+	# Fallback: try to get from git log
+	try:
+		import subprocess
+		result = subprocess.run(['git', 'log', '-1', '--format=%H'], 
+							  capture_output=True, text=True, cwd=BASE_DIR, timeout=5)
+		if result.returncode == 0:
+			return result.stdout.strip()[:8]
+	except:
+		pass
+	
+	# If no git info available, return a placeholder
+	return "unknown"
+
 def compare_versions(version1, version2):
 	"""Compare two version strings. Returns 1 if version1 > version2, -1 if version1 < version2, 0 if equal."""
 	try:
@@ -692,37 +716,48 @@ def create_web_app():
 		try:
 			import requests
 			import re
+			import hashlib
 			
 			# Get current version from the script
 			current_version = get_current_version()
 			logging.info(f"Checking for updates. Current version: {current_version}")
 			
-			# Get latest version from GitHub
-			repo_url = "https://api.github.com/repos/Davidbkr03/twitch-drops/releases/latest"
-			logging.info(f"Fetching release info from: {repo_url}")
+			# Get current commit hash from git if available
+			current_commit = get_current_commit_hash()
+			logging.info(f"Current commit hash: {current_commit}")
+			
+			# Get latest commit info from GitHub API
+			repo_url = "https://api.github.com/repos/Davidbkr03/twitch-drops/commits/main"
+			logging.info(f"Fetching commit info from: {repo_url}")
 			
 			response = requests.get(repo_url, timeout=10)
 			logging.info(f"GitHub API response status: {response.status_code}")
 			
 			if response.status_code == 200:
-				release_data = response.json()
-				latest_version = release_data.get('tag_name', '').lstrip('v')
-				logging.info(f"Latest version from GitHub: {latest_version}")
+				commit_data = response.json()
+				latest_commit = commit_data.get('sha', '')[:8]  # Short hash
+				latest_date = commit_data.get('commit', {}).get('author', {}).get('date', '')
+				commit_message = commit_data.get('commit', {}).get('message', '')
 				
-				# Compare versions
-				version_comparison = compare_versions(current_version, latest_version)
-				update_available = version_comparison < 0  # current < latest means update available
-				logging.info(f"Version comparison result: {version_comparison}, update_available: {update_available}")
+				logging.info(f"Latest commit from GitHub: {latest_commit}")
+				logging.info(f"Latest commit date: {latest_date}")
+				
+				# Compare commits
+				update_available = current_commit != latest_commit
+				logging.info(f"Update available: {update_available}")
 				
 				return jsonify({
 					'success': True,
 					'update_available': update_available,
 					'current_version': current_version,
-					'latest_version': latest_version,
-					'release_notes': release_data.get('body', '')[:500] + '...' if len(release_data.get('body', '')) > 500 else release_data.get('body', '')
+					'current_commit': current_commit,
+					'latest_version': latest_commit,
+					'latest_commit': latest_commit,
+					'latest_date': latest_date,
+					'release_notes': commit_message[:200] + '...' if len(commit_message) > 200 else commit_message
 				})
 			else:
-				error_msg = f'Failed to fetch release information. Status: {response.status_code}'
+				error_msg = f'Failed to fetch commit information. Status: {response.status_code}'
 				logging.error(error_msg)
 				return jsonify({'success': False, 'message': error_msg}), 500
 				
@@ -746,31 +781,16 @@ def create_web_app():
 			import threading
 			import time
 			
-			# Get latest release download URL
-			repo_url = "https://api.github.com/repos/Davidbkr03/twitch-drops/releases/latest"
-			response = requests.get(repo_url, timeout=10)
+			# Use the same approach as the installer - download from main branch archive
+			repo = "Davidbkr03/twitch-drops"
+			branch = "main"
+			download_url = f"https://github.com/{repo}/archive/refs/heads/{branch}.zip"
 			
-			if response.status_code != 200:
-				return jsonify({'success': False, 'message': 'Failed to fetch release information'}), 500
-			
-			release_data = response.json()
-			download_url = None
-			
-			# Find the zip download URL
-			for asset in release_data.get('assets', []):
-				if asset['name'].endswith('.zip'):
-					download_url = asset['browser_download_url']
-					break
-			
-			if not download_url:
-				return jsonify({'success': False, 'message': 'No zip file found in release'}), 500
-			
-			# Download the update
 			logging.info(f"Downloading update from {download_url}")
 			download_response = requests.get(download_url, timeout=60)
 			
 			if download_response.status_code != 200:
-				return jsonify({'success': False, 'message': 'Failed to download update'}), 500
+				return jsonify({'success': False, 'message': f'Failed to download update. Status: {download_response.status_code}'}), 500
 			
 			# Create temporary directory for extraction
 			with tempfile.TemporaryDirectory() as temp_dir:
@@ -785,16 +805,18 @@ def create_web_app():
 				with zipfile.ZipFile(zip_path, 'r') as zip_ref:
 					zip_ref.extractall(extract_dir)
 				
-				# Find the extracted folder (usually has the repo name)
+				# Find the extracted folder (usually has the repo name with branch suffix)
 				extracted_folders = [f for f in os.listdir(extract_dir) if os.path.isdir(os.path.join(extract_dir, f))]
 				if not extracted_folders:
 					return jsonify({'success': False, 'message': 'Invalid zip file structure'}), 500
 				
 				source_dir = os.path.join(extract_dir, extracted_folders[0])
+				logging.info(f"Extracted to: {source_dir}")
 				
 				# Backup current files (except user data and config)
 				backup_dir = os.path.join(BASE_DIR, 'backup_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
 				os.makedirs(backup_dir, exist_ok=True)
+				logging.info(f"Creating backup at: {backup_dir}")
 				
 				# Files to backup
 				files_to_backup = [
@@ -802,7 +824,8 @@ def create_web_app():
 					'templates',
 					'static',
 					'requirements.txt',
-					'README.md'
+					'README.md',
+					'version.txt'
 				]
 				
 				for item in files_to_backup:
@@ -813,6 +836,7 @@ def create_web_app():
 							shutil.copytree(src, dst)
 						else:
 							shutil.copy2(src, dst)
+						logging.info(f"Backed up: {item}")
 				
 				# Copy new files
 				for item in os.listdir(source_dir):
@@ -820,7 +844,8 @@ def create_web_app():
 					dst = os.path.join(BASE_DIR, item)
 					
 					# Skip user data and config files
-					if item in ['user_data_stealth', 'config.json', 'drops_log.txt', 'venv', '__pycache__']:
+					if item in ['user_data_stealth', 'config.json', 'drops_log.txt', 'venv', '__pycache__', '.git']:
+						logging.info(f"Skipping: {item}")
 						continue
 					
 					if os.path.isdir(src):
@@ -829,6 +854,8 @@ def create_web_app():
 						shutil.copytree(src, dst)
 					else:
 						shutil.copy2(src, dst)
+					
+					logging.info(f"Updated: {item}")
 				
 				logging.info("Update completed successfully")
 			
