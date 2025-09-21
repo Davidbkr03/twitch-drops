@@ -2456,28 +2456,110 @@ async def set_low_quality(stream_page):
 	except Exception:
 		pass
 
+async def is_browser_context_valid(context) -> bool:
+	"""Check if the browser context is still valid and responsive."""
+	try:
+		if context is None:
+			return False
+		# Try to get pages to test if context is responsive
+		pages = context.pages
+		return len(pages) >= 0  # If we can get pages, context is valid
+	except Exception:
+		return False
+
+async def recover_browser_context(p, current_context=None):
+	"""Attempt to recover from a closed browser context by creating a new one."""
+	try:
+		logging.info("Attempting to recover browser context...")
+		if current_context:
+			try:
+				await current_context.close()
+			except Exception:
+				pass
+		
+		# Create new context using the same method as run_flow
+		context, page = await launch_context(p, compat_mode=False)
+		logging.info("Successfully recovered browser context")
+		return context, page
+	except Exception as e:
+		logging.error(f"Failed to recover browser context: {e}")
+		return None, None
+
 async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
-	"""Click all visible 'Claim' buttons on the inventory page.
+	"""Click all visible 'Claim Now' buttons on the inventory page.
 
 	Returns the number of claims clicked. When navigate=False, assumes caller is already on the inventory page.
 	"""
 	claimed = 0
 	try:
+		# Check if browser context is still valid
+		if inv_page.is_closed():
+			logging.warning("Inventory page is closed, cannot claim rewards")
+			return -1  # Return -1 to indicate browser context issue
+		
+		# Check if browser context is still responsive
+		try:
+			context = inv_page.context
+			if not await is_browser_context_valid(context):
+				logging.warning("Browser context is not responsive, cannot claim rewards")
+				return -1
+		except Exception:
+			logging.warning("Cannot access browser context, cannot claim rewards")
+			return -1
+		
 		if navigate:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
 			await inv_page.wait_for_timeout(500)
-		claim_buttons = await inv_page.query_selector_all('button:has-text("Claim")')
+		
+		# Multiple selector strategies for robustness
+		claim_selectors = [
+			'button:has-text("Claim Now")',
+			'button[data-a-target="tw-core-button-label-text"]:has-text("Claim Now")',
+			'button.ScCoreButton-sc-ocjdkq-0:has-text("Claim Now")',
+			'button:has([data-a-target="tw-core-button-label-text"]:has-text("Claim Now"))',
+			'button:has-text("Claim")',  # Fallback for older versions
+		]
+		
+		claim_buttons = []
+		for selector in claim_selectors:
+			try:
+				buttons = await inv_page.query_selector_all(selector)
+				if buttons:
+					claim_buttons = buttons
+					logging.debug(f"Found {len(buttons)} claim buttons using selector: {selector}")
+					break
+			except Exception as e:
+				logging.debug(f"Selector '{selector}' failed: {e}")
+				continue
+		
+		if not claim_buttons:
+			logging.debug("No claim buttons found on inventory page")
+			return 0
+		
 		for btn in claim_buttons:
 			try:
-				await btn.click()
-				claimed += 1
-				logging.info("Claimed a reward")
-				await asyncio.sleep(0.5)
-			except Exception:
+				# Double-check button is still valid and visible
+				if await btn.is_visible():
+					await btn.click()
+					claimed += 1
+					logging.info("Claimed a reward")
+					await asyncio.sleep(0.5)
+				else:
+					logging.debug("Claim button found but not visible, skipping")
+			except Exception as e:
+				logging.warning(f"Failed to click claim button: {e}")
 				continue
-	except Exception:
-		pass
+				
+	except Exception as e:
+		# Check if it's a browser context closure issue
+		if "Target page, context or browser has been closed" in str(e) or "TargetClosedError" in str(e):
+			logging.error("Browser context closed during claim operation")
+			return -1  # Return -1 to indicate browser context issue
+		else:
+			logging.error(f"Unexpected error during claim operation: {e}")
+			return -1  # Return -1 to indicate error
+	
 	return claimed
 
 async def poll_until_reward_complete(context, inv_page, streamer_name: str):
@@ -2505,10 +2587,13 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 			# Early claim: if Claim button present, click and finish (progressbar may be gone at 100%)
 			await inv_page.wait_for_timeout(400)
 			try:
-				if await inv_page.query_selector('button:has-text("Claim")'):
+				if await inv_page.query_selector('button:has-text("Claim Now")') or await inv_page.query_selector('button:has-text("Claim")'):
 					c = await claim_available_rewards(inv_page, navigate=False)
 					if c > 0:
 						return True
+					elif c == -1:
+						logging.error("Browser context issue during claim check, stopping polling")
+						return False
 			except Exception:
 				pass
 			# ensure progressbars rendered (if present)
@@ -3029,7 +3114,11 @@ async def run_drops_workflow(context, test_mode=False):
 					pass
 				if completed:
 					logging.info("Streamer reward completed or claimable. Attempting to claim any available rewards and moving to next.")
-					await claim_available_rewards(inv_page)
+					claim_result = await claim_available_rewards(inv_page)
+					if claim_result == -1:
+						logging.error("Browser context issue during claim operation, stopping workflow")
+						EXIT_EVENT.set()
+						return
 					completed_streamers.add((target_name or "").lower())
 					# Clear current working item
 					update_current_working_item(None)
@@ -3043,7 +3132,11 @@ async def run_drops_workflow(context, test_mode=False):
 			logging.info("No streamer drops available, falling back to general drops")
 			# First, claim any available rewards to ensure we don't exit with pending claims
 			try:
-				await claim_available_rewards(inv_page)
+				claim_result = await claim_available_rewards(inv_page)
+				if claim_result == -1:
+					logging.error("Browser context issue during general drops claim operation, stopping workflow")
+					EXIT_EVENT.set()
+					return
 			except Exception:
 				pass
 			if await are_all_general_drops_complete(inv_page, fp.get('general') if fp else None):

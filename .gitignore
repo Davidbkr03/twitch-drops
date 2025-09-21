@@ -40,3 +40,5 @@ tray.ico
 example_site/
 example_twitch/
 example_twitch_complete/
+example_twitch_claim/
+.gitignore
