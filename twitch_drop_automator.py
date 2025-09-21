@@ -376,14 +376,26 @@ def intelligent_streamer_matching(streamer_name, inventory_progress):
 	"""
 	Intelligent matching for streamer names that don't exactly match inventory titles.
 	Handles cases like 'XCHOCOBARS' -> 'xChoco'
+	Also uses custom name mappings from config.
 	"""
 	streamer_lower = streamer_name.lower().strip()
+	logging.info(f"[INTELLIGENT-MATCH] Starting intelligent matching for '{streamer_name}' (lowercase: '{streamer_lower}')")
+	logging.info(f"[INTELLIGENT-MATCH] Checking against {len(inventory_progress)} inventory items")
 	
-	# First try exact substring match (original behavior)
+	# Get search variations including custom mappings
+	search_variations = generate_search_variations(streamer_name)
+	logging.info(f"[INTELLIGENT-MATCH] Using {len(search_variations)} search variations: {search_variations}")
+	
+	# First try exact substring match with all variations
 	for title, percent in inventory_progress.items():
 		title_lower = title.lower()
-		if streamer_lower in title_lower:
-			return percent, title
+		for variation in search_variations:
+			logging.info(f"[INTELLIGENT-MATCH] Checking if '{variation}' is in '{title_lower}'")
+			if variation in title_lower:
+				logging.info(f"[INTELLIGENT-MATCH] EXACT MATCH FOUND! '{variation}' found in '{title_lower}' -> {percent}%")
+				return percent, title
+			else:
+				logging.info(f"[INTELLIGENT-MATCH] No exact match: '{variation}' not in '{title_lower}'")
 	
 	# Try partial matching - check if streamer name contains significant parts of inventory title
 	for title, percent in inventory_progress.items():
@@ -2269,6 +2281,7 @@ async def fetch_facepunch_drops(context):
 async def get_inventory_progress_map(inv_page):
 	progress = {}
 	try:
+		logging.info(f"[INVENTORY-SCAN] Starting inventory scan...")
 		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 		await maybe_accept_cookies(inv_page)
 		await inv_page.wait_for_timeout(600)
@@ -2301,12 +2314,18 @@ async def get_inventory_progress_map(inv_page):
 			}
 			"""
 		)
+		logging.info(f"[INVENTORY-SCAN] Found {len(items)} progress bars on inventory page")
 		for it in items:
 			title = it.get('title')
+			percent = it.get('percent')
 			if title:
-				progress[title] = it.get('percent')
+				progress[title] = percent
+				logging.info(f"[INVENTORY-SCAN] Item: '{title}' = {percent}%")
+			else:
+				logging.info(f"[INVENTORY-SCAN] Skipping item with no title: {it}")
+		logging.info(f"[INVENTORY-SCAN] Final progress map contains {len(progress)} items")
 	except Exception as e:
-		logging.warning(f"Progress map issue: {e}")
+		logging.warning(f"[INVENTORY-SCAN] Progress map issue: {e}")
 	return progress
 
 async def get_incomplete_rust_rewards(inv_page):
@@ -2377,11 +2396,25 @@ def emit_debug(message: str, level: str = "info"):
 def generate_search_variations(base_name: str) -> list[str]:
 	"""Generate lowercase search variations for a given name.
 	Examples: "FOOLISH - VAGABOND JACKET" -> ["foolish - vagabond jacket", "foolish", "vagabond jacket"].
+	Also includes custom name mappings from config.
 	"""
 	name = (base_name or "").strip().lower()
 	if not name:
 		return []
 	variations = [name]
+	
+	# Add custom name mappings from config
+	try:
+		with CONFIG_LOCK:
+			mappings = PREFERENCES.get("streamer_name_mappings", {})
+		if name in mappings:
+			mapped_name = mappings[name].lower()
+			if mapped_name not in variations:
+				variations.append(mapped_name)
+				logging.info(f"[NAME-MAPPING] Added mapping for '{name}' -> '{mapped_name}'")
+	except Exception as e:
+		logging.warning(f"[NAME-MAPPING] Error accessing name mappings: {e}")
+	
 	if ' ' in name:
 		first_word = name.split()[0]
 		if len(first_word) > 3:
@@ -2437,11 +2470,12 @@ async def scrape_recent_claimed_items(inv_page):
 			  const isTimeText = (s) => {
 				if (!s) return false;
 				const t = s.trim().toLowerCase();
-				return t.includes('yesterday') || t.includes('ago') || t.includes('last month') || t.includes('months ago') || t.includes('month ago');
+				return t.includes('yesterday') || t.includes('ago') || t.includes('last month') || t.includes('months ago') || t.includes('month ago') || t.includes('today');
 			  };
 			  const toDays = (s) => {
 				if (!s) return null;
 				const t = s.trim().toLowerCase();
+				if (t.includes('today')) return 0;
 				if (t.includes('yesterday')) return 1;
 				let m;
 				if ((m = t.match(/(\d+)\s*minutes?/))) return 0;
@@ -3234,20 +3268,25 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			# After logging progress, also check if any streamer-specific items need progress
 			fp = await fetch_facepunch_drops(context)
 			streamer_targets = fp.get('streamer', []) if fp else []
+			logging.info(f"[STREAMER-CHECK] Checking {len(streamer_targets)} streamer targets for completion status")
 			for st in streamer_targets:
 				name = (st.get('streamer') or '').strip()
 				if not name:
+					logging.info(f"[STREAMER-CHECK] Skipping streamer: empty name")
 					continue
 				# Only use Facepunch for live status
 				if not bool(st.get('is_live')):
+					logging.info(f"[STREAMER-CHECK] Skipping '{name}': not live")
 					continue
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
+					logging.info(f"[STREAMER-CHECK] Skipping '{name}': already in completed_streamers set")
 					continue
 				# If we haven't already completed this streamer drop historically, switch now
 				days = is_streamer_recently_claimed(name)
 				if days is not None:
 					# Already claimed previously; skip
+					logging.info(f"[STREAMER-CHECK] Skipping '{name}': claimed {days} day(s) ago")
 					completed_streamers.add(name_lower)
 					continue
 
@@ -3300,7 +3339,11 @@ async def run_drops_workflow(context, test_mode=False):
 
 			# Gather in-progress titles to prioritize watching those
 			progress_map = await get_inventory_progress_map(inv_page)
+			logging.info(f"[PROGRESS-MAP] Retrieved progress map with {len(progress_map)} items:")
+			for title, percent in progress_map.items():
+				logging.info(f"[PROGRESS-MAP] '{title}' = {percent}%")
 			in_progress_titles = { (t or '').lower() for t in progress_map.keys() }
+			logging.info(f"[PROGRESS-MAP] Created in_progress_titles set with {len(in_progress_titles)} lowercase titles")
 			
 	# Initial claim check removed per user request (user will claim manually)
 			
@@ -3314,57 +3357,88 @@ async def run_drops_workflow(context, test_mode=False):
 			recently_claimed = []
 			try:
 				recently_claimed = await scrape_recent_claimed_items(inv_page)
-			except Exception:
+				logging.info(f"[RECENTLY-CLAIMED] Scraped {len(recently_claimed)} recently claimed items:")
+				for i, item in enumerate(recently_claimed):
+					name = item.get('name', 'Unknown')
+					days = item.get('days', 'Unknown')
+					logging.info(f"[RECENTLY-CLAIMED] Item {i+1}: '{name}' (claimed {days} days ago)")
+			except Exception as e:
+				logging.warning(f"[RECENTLY-CLAIMED] Failed to scrape recently claimed items: {e}")
 				recently_claimed = []
 
 			# Helper to check if a streamer appears in recently_claimed
 			def is_streamer_recently_claimed(streamer: str) -> int | None:
+				logging.info(f"[CLAIMED-CHECK] Checking if '{streamer}' is recently claimed...")
 				name_vars = generate_search_variations(streamer)
-				for it in (recently_claimed or []):
+				logging.info(f"[CLAIMED-CHECK] Generated {len(name_vars)} search variations for '{streamer}': {name_vars}")
+				recently_claimed_list = recently_claimed or []
+				logging.info(f"[CLAIMED-CHECK] Checking against {len(recently_claimed_list)} recently claimed items")
+				for i, it in enumerate(recently_claimed_list):
 					n = (it.get('name') or '').lower()
-					for v in name_vars:
+					days = it.get('days')
+					logging.info(f"[CLAIMED-CHECK] Item {i+1}: '{n}' (claimed {days} days ago)")
+					for j, v in enumerate(name_vars):
 						if v and v in n:
-							return int(it.get('days')) if isinstance(it.get('days'), int) else 0
+							logging.info(f"[CLAIMED-CHECK] MATCH FOUND! Variation '{v}' found in '{n}' - streamer '{streamer}' was claimed {days} days ago")
+							return int(days) if isinstance(days, int) else 0
+						else:
+							logging.info(f"[CLAIMED-CHECK] No match: variation '{v}' not found in '{n}'")
+				logging.info(f"[CLAIMED-CHECK] No matches found for '{streamer}' - not recently claimed")
 				return None
 
 			# Build candidates only for streamer-specific items present in inventory (<100%)
 			candidates = []
 			live_any = []
 			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
+			logging.info(f"[INVENTORY-ENTRIES] Processing {len(inventory_entries)} inventory entries:")
+			for title_lower, percent in inventory_entries:
+				logging.info(f"[INVENTORY-ENTRIES] '{title_lower}' = {percent}%")
 			
 			# Debug lists for better visibility
 			streamer_drops_with_progress = []
 			streamer_drops_no_progress = []
 			general_drops_available = []
 			
+			logging.info(f"[STREAMER-EVAL] Evaluating {len(streamer_targets)} streamer targets for drops")
 			for st in streamer_targets:
 				name = (st.get('streamer') or '').strip()
 				if not name:
+					logging.info(f"[STREAMER-EVAL] Skipping streamer: empty name")
 					continue
 				if bool(st.get('is_live')):
 					live_any.append(st)
 				# Only consider live streamers for watching
 				if not bool(st.get('is_live')):
+					logging.info(f"[STREAMER-EVAL] Skipping '{name}': not live")
 					continue
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
+					logging.info(f"[STREAMER-EVAL] Skipping '{name}': already in completed_streamers set")
 					continue
 				# Find matching inventory entry and its percent using intelligent matching
 				match_pct = None
+				logging.info(f"[STREAMER-EVAL] Checking '{name}' against {len(inventory_entries)} inventory entries")
 				# First try exact substring match (original behavior)
 				for t_lower, pct in inventory_entries:
 					if name_lower in t_lower and isinstance(pct, int):
 						match_pct = pct
+						logging.info(f"[STREAMER-EVAL] Found exact match for '{name}': '{t_lower}' = {pct}%")
 						break
 				
 				# If no exact match, try intelligent matching
 				if match_pct is None:
+					logging.info(f"[STREAMER-EVAL] No exact match for '{name}', trying intelligent matching")
 					# Convert inventory_entries back to dict format for intelligent matching
 					inventory_dict = {title: pct for title, pct in inventory_entries if isinstance(pct, int)}
+					logging.info(f"[STREAMER-EVAL] Inventory dict for intelligent matching contains {len(inventory_dict)} items:")
+					for title, pct in inventory_dict.items():
+						logging.info(f"[STREAMER-EVAL]   '{title}' = {pct}%")
 					intelligent_pct, intelligent_title = intelligent_streamer_matching(name, inventory_dict)
 					if intelligent_pct is not None:
 						match_pct = intelligent_pct
-						logging.info(f"Found intelligent match for '{name}': {intelligent_title} ({intelligent_pct}%)")
+						logging.info(f"[STREAMER-EVAL] Found intelligent match for '{name}': {intelligent_title} ({intelligent_pct}%)")
+					else:
+						logging.info(f"[STREAMER-EVAL] No intelligent match found for '{name}' - not on Twitch inventory")
 				
 				emit_debug(f"[candidates] {name}: inventory match_pct={match_pct}")
 				
@@ -3372,6 +3446,7 @@ async def run_drops_workflow(context, test_mode=False):
 				# This is exactly what we want to work on!
 				# Only skip if it's already 100% complete on Twitch
 				if match_pct is not None and match_pct >= 100:
+					logging.info(f"[STREAMER-EVAL] Skipping '{name}': already 100% complete ({match_pct}%)")
 					continue
 				# Prioritize drops based on their state:
 				# Priority 1: Streamers with progress (1-99% on Twitch) - highest priority
@@ -3848,11 +3923,14 @@ async def is_general_item_claimed_on_inventory(inv_page, item_name: str) -> bool
 async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 	try:
 		if not general_list:
+			logging.info(f"[GENERAL-DROPS-CHECK] No general drops to check - returning True")
 			return True
+		logging.info(f"[GENERAL-DROPS-CHECK] Checking {len(general_list)} general drops for completion")
 		# Ensure we are on inventory and scrape current progressbars once
 		progress_map = await get_inventory_progress_map(inv_page)
 		if progress_map is None:
 			progress_map = {}
+		logging.info(f"[GENERAL-DROPS-CHECK] Found {len(progress_map)} items in inventory progress map")
 		def find_percent_for_any(needles: list[str]) -> int | None:
 			cands = [n.strip().lower() for n in (needles or []) if n and n.strip()]
 			if not cands:
@@ -3866,19 +3944,28 @@ async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 			item_name = g.get('item') if isinstance(g, dict) else None
 			alias = g.get('alias') if isinstance(g, dict) else None
 			if not item_name and not alias:
+				logging.info(f"[GENERAL-DROPS-CHECK] Skipping general drop: no item name or alias")
 				continue
-			pct = find_percent_for_any([item_name or '', alias or ''])
+			search_terms = [item_name or '', alias or '']
+			logging.info(f"[GENERAL-DROPS-CHECK] Checking general drop: '{item_name}' (alias: '{alias}')")
+			pct = find_percent_for_any(search_terms)
 			if isinstance(pct, int):
+				logging.info(f"[GENERAL-DROPS-CHECK] Found progress for '{item_name}': {pct}%")
 				if pct < 100:
+					logging.info(f"[GENERAL-DROPS-CHECK] General drop '{item_name}' not complete ({pct}%) - returning False")
 					return False
+				logging.info(f"[GENERAL-DROPS-CHECK] General drop '{item_name}' is complete ({pct}%)")
 				continue
 			# Not found in progress map = no progress bar = completed
 			# This means the item is either completed or not started yet
 			# For general drops, if there's no progress bar, we consider it completed
 			# (since general drops should always show a progress bar when active)
+			logging.info(f"[GENERAL-DROPS-CHECK] No progress bar found for '{item_name}' - considering completed")
 			continue
+		logging.info(f"[GENERAL-DROPS-CHECK] All general drops are complete - returning True")
 		return True
-	except Exception:
+	except Exception as e:
+		logging.warning(f"[GENERAL-DROPS-CHECK] Error checking general drops: {e}")
 		return False
 
 
