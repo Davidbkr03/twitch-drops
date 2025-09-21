@@ -2514,8 +2514,12 @@ async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
 		
 		# Multiple selector strategies for robustness
 		claim_selectors = [
+			# XPath to find a button containing a div with the exact text "Claim Now". Using normalize-space to be robust against whitespace.
+			'xpath=//button[.//div[normalize-space()="Claim Now"]]',
+			# A more specific version of the above, targeting the data-a-target attribute.
+			'xpath=//button[.//div[@data-a-target="tw-core-button-label-text" and normalize-space()="Claim Now"]]',
+			# The original Playwright CSS selectors which might still work.
 			'button:has-text("Claim Now")',
-			'button[data-a-target="tw-core-button-label-text"]:has-text("Claim Now")',
 			'button.ScCoreButton-sc-ocjdkq-0:has-text("Claim Now")',
 			'button:has([data-a-target="tw-core-button-label-text"]:has-text("Claim Now"))',
 			'button:has-text("Claim")',  # Fallback for older versions
