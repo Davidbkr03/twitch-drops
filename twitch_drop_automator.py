@@ -2554,20 +2554,114 @@ async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
 				logging.debug("No claim buttons found on inventory page (including fallbacks)")
 				return 0
 		
-		for btn in claim_buttons:
+		# Robust click helper defined inline to avoid broader refactor
+		async def _robust_click_and_confirm(page, element) -> bool:
+			# Returns True if the click likely succeeded (element disappears, disables, or text changes)
+			async def _confirmed() -> bool:
+				try:
+					return await page.evaluate(
+						"""
+						(el) => {
+						  if (!el) return true;
+						  if (!document.contains(el)) return true;
+						  const t = (el.textContent || '').toLowerCase();
+						  if (el.hasAttribute('disabled')) return true;
+						  if (t.includes('awarded') || t.includes('claimed')) return true;
+						  return false;
+						}
+						""",
+						element
+					)
+				except Exception:
+					return False
+
+			# 0) ensure in view
 			try:
-				# Double-check button is still valid and visible
-				if await btn.is_visible():
+				await element.scroll_into_view_if_needed()
+			except Exception:
+				pass
+
+			# 1) normal click
+			try:
+				await element.click()
+				try:
+					ok = await page.wait_for_function("el => !el || !document.contains(el) || el.hasAttribute('disabled')", element, timeout=2000)
+				except Exception:
+					ok = await _confirmed()
+				return bool(ok)
+			except Exception:
+				pass
+
+			# 2) force click
+			try:
+				await element.click(force=True)
+				try:
+					ok = await page.wait_for_function("el => !el || !document.contains(el) || el.hasAttribute('disabled')", element, timeout=2000)
+				except Exception:
+					ok = await _confirmed()
+				return bool(ok)
+			except Exception:
+				pass
+
+			# 3) JS click
+			try:
+				await page.evaluate("el => el && el.click()", element)
+				ok = await _confirmed()
+				return bool(ok)
+			except Exception:
+				pass
+
+			# 4) Mouse click by bounding box
+			try:
+				box = await element.bounding_box()
+				if box:
+					x = box['x'] + box['width'] / 2
+					y = box['y'] + box['height'] / 2
+					await page.mouse.move(x, y)
+					await page.mouse.click(x, y)
+					ok = await _confirmed()
+					return bool(ok)
+			except Exception:
+				pass
+
+			# 5) Click nearest ancestor button
+			try:
+				ancestor = await element.evaluate_handle("el => { let n = el; for (let i=0; i<5 && n; i++) { if (n.tagName === 'BUTTON') return n; n = n.parentElement; } return null; }")
+				anc_el = ancestor.as_element() if ancestor else None
+				if anc_el:
 					try:
-						await btn.scroll_into_view_if_needed()
+						await anc_el.click(force=True)
+						ok = await _confirmed()
+						return bool(ok)
 					except Exception:
 						pass
-					await btn.click(force=True)
+			except Exception:
+				pass
+
+			# 6) Keyboard fallback (focus then Enter/Space)
+			try:
+				await element.focus()
+				await page.keyboard.press("Enter")
+				await page.wait_for_timeout(150)
+				await page.keyboard.press("Space")
+				ok = await _confirmed()
+				return bool(ok)
+			except Exception:
+				pass
+
+			return False
+
+		for btn in claim_buttons:
+			try:
+				if not await btn.is_enabled():
+					continue
+				ok = await _robust_click_and_confirm(inv_page, btn)
+				if ok:
 					claimed += 1
 					logging.info("Claimed a reward")
 					await asyncio.sleep(0.5)
 				else:
-					logging.debug("Claim button found but not visible, skipping")
+					logging.warning("Claim button click did not confirm; proceeding to next")
 			except Exception as e:
 				logging.warning(f"Failed to click claim button: {e}")
 				continue
