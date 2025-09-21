@@ -2534,14 +2534,35 @@ async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
 				continue
 		
 		if not claim_buttons:
-			logging.debug("No claim buttons found on inventory page")
-			return 0
+			# Fallback: find buttons within cards that have a 100% progress bar, regardless of label text
+			fallback_selectors = [
+				'div:has([role="progressbar"][aria-valuenow="100"]) button:has-text("Claim Now")',
+				'div:has([role="progressbar"][aria-valuenow="100"]) button:has-text("Claim")',
+				'div:has([role="progressbar"][aria-valuenow="100"]) button:not([disabled])',
+			]
+			for selector in fallback_selectors:
+				try:
+					buttons = await inv_page.query_selector_all(selector)
+					if buttons:
+						claim_buttons = buttons
+						logging.debug(f"Fallback found {len(buttons)} claim buttons using selector: {selector}")
+						break
+				except Exception as e:
+					logging.debug(f"Fallback selector '{selector}' failed: {e}")
+					continue
+			if not claim_buttons:
+				logging.debug("No claim buttons found on inventory page (including fallbacks)")
+				return 0
 		
 		for btn in claim_buttons:
 			try:
 				# Double-check button is still valid and visible
 				if await btn.is_visible():
-					await btn.click()
+					try:
+						await btn.scroll_into_view_if_needed()
+					except Exception:
+						pass
+					await btn.click(force=True)
 					claimed += 1
 					logging.info("Claimed a reward")
 					await asyncio.sleep(0.5)
