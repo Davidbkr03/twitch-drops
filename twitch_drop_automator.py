@@ -397,40 +397,48 @@ def intelligent_streamer_matching(streamer_name, inventory_progress):
 			else:
 				logging.info(f"[INTELLIGENT-MATCH] No exact match: '{variation}' not in '{title_lower}'")
 	
-	# Try partial matching - check if streamer name contains significant parts of inventory title
+	# Try partial matching - check if streamer variations contain significant parts of inventory title
 	for title, percent in inventory_progress.items():
 		title_lower = title.lower()
 		
 		# Extract meaningful parts (remove common suffixes/prefixes)
-		streamer_clean = streamer_lower.replace('tv', '').replace('streamer', '').replace('channel', '')
 		title_clean = title_lower.replace('tv', '').replace('streamer', '').replace('channel', '')
 		
-		# Check if cleaned streamer name contains title or vice versa
-		if len(title_clean) >= 4 and title_clean in streamer_clean:
-			logging.info(f"Intelligent streamer match: '{streamer_name}' -> '{title}' (partial match)")
-			return percent, title
-		if len(streamer_clean) >= 4 and streamer_clean in title_clean:
-			logging.info(f"Intelligent streamer match: '{streamer_name}' -> '{title}' (reverse partial match)")
-			return percent, title
+		# Try partial matching with each search variation
+		for variation in search_variations:
+			streamer_clean = variation.replace('tv', '').replace('streamer', '').replace('channel', '')
+			
+			# Check if cleaned streamer variation contains title or vice versa
+			if len(title_clean) >= 4 and title_clean in streamer_clean:
+				logging.info(f"[INTELLIGENT-MATCH] PARTIAL MATCH FOUND! '{streamer_name}' (variation: '{variation}') -> '{title}' (partial match)")
+				return percent, title
+			if len(streamer_clean) >= 4 and streamer_clean in title_clean:
+				logging.info(f"[INTELLIGENT-MATCH] REVERSE PARTIAL MATCH FOUND! '{streamer_name}' (variation: '{variation}') -> '{title}' (reverse partial match)")
+				return percent, title
 	
-	# Try word-based matching for multi-word names
-	streamer_words = [word for word in streamer_lower.split() if len(word) > 2]
-	title_words = [word for word in title_lower.split() if len(word) > 2]
-	
-	if streamer_words and title_words:
-		# Check if any significant words match
-		for streamer_word in streamer_words:
-			for title_word in title_words:
-				if len(streamer_word) >= 4 and len(title_word) >= 4:
-					# Check if one word is contained in the other
-					if streamer_word in title_word or title_word in streamer_word:
-						logging.info(f"Intelligent streamer match: '{streamer_name}' -> '{title}' (word match: '{streamer_word}' <-> '{title_word}')")
-						return percent, title
+	# Try word-based matching for multi-word names using all search variations
+	for title, percent in inventory_progress.items():
+		title_lower = title.lower()
+		title_words = [word for word in title_lower.split() if len(word) > 2]
+		
+		# Try word matching with each search variation
+		for variation in search_variations:
+			streamer_words = [word for word in variation.split() if len(word) > 2]
+			
+			if streamer_words and title_words:
+				# Check if any significant words match
+				for streamer_word in streamer_words:
+					for title_word in title_words:
+						if len(streamer_word) >= 4 and len(title_word) >= 4:
+							# Check if one word is contained in the other
+							if streamer_word in title_word or title_word in streamer_word:
+								logging.info(f"[INTELLIGENT-MATCH] WORD MATCH FOUND! '{streamer_name}' (variation: '{variation}') -> '{title}' (word match: '{streamer_word}' <-> '{title_word}')")
+								return percent, title
 	
 	return None, None
 
 
-def update_cached_drops_data(facepunch_data, inventory_progress, recently_claimed_streamers=None):
+def update_cached_drops_data(facepunch_data, inventory_progress, recently_claimed_streamers=None, general_progress_map=None):
 	"""Update the cached drops data for the web interface."""
 	global cached_drops_data
 	
@@ -536,7 +544,36 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			}
 			
 			if progress is None:
-				drops_data["not_started"].append(drop_info)
+				# Check if this streamer was recently claimed before marking as not_started
+				streamer_claimed = False
+				logging.info(f"[DROPS-CATEGORIZATION] Streamer '{streamer_name}' has no progress - checking if recently claimed")
+				logging.info(f"[DROPS-CATEGORIZATION] Recently claimed streamers list: {recently_claimed_streamers}")
+				
+				if recently_claimed_streamers:
+					for claimed_item in recently_claimed_streamers:
+						claimed_name = claimed_item.get('name', '').lower()
+						logging.info(f"[DROPS-CATEGORIZATION] Checking against claimed item: '{claimed_name}'")
+						# Use intelligent matching to check if this streamer was claimed
+						name_vars = generate_search_variations(streamer_name)
+						logging.info(f"[DROPS-CATEGORIZATION] Generated variations for '{streamer_name}': {name_vars}")
+						for variation in name_vars:
+							if variation and variation in claimed_name:
+								streamer_claimed = True
+								logging.info(f"[DROPS-CATEGORIZATION] MATCH FOUND! Streamer '{streamer_name}' (variation: '{variation}') found in recently claimed items: '{claimed_name}' - marking as completed")
+								break
+						if streamer_claimed:
+							break
+				else:
+					logging.info(f"[DROPS-CATEGORIZATION] No recently claimed streamers list provided")
+				
+				if streamer_claimed:
+					# Mark as completed since it was recently claimed
+					drop_info["ready_to_claim"] = False  # Already claimed
+					drops_data["completed"].append(drop_info)
+					logging.info(f"[DROPS-CATEGORIZATION] Added '{streamer_name}' to completed section")
+				else:
+					drops_data["not_started"].append(drop_info)
+					logging.info(f"[DROPS-CATEGORIZATION] Added '{streamer_name}' to not_started section")
 			elif progress >= 100:
 				# Mark as completed but require manual claim
 				drop_info["ready_to_claim"] = True
@@ -544,21 +581,27 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			else:
 				drops_data["in_progress"].append(drop_info)
 		
-		# Process general drops
+		# Process general drops - use general drops area only
 		general_drops = facepunch_data.get('general', []) if facepunch_data else []
+		
+		# Use the provided general progress map, or fall back to empty dict
+		general_progress_map = general_progress_map or {}
+		if general_drops and general_progress_map:
+			logging.info(f"[GENERAL-DROPS-PROCESSING] Using general drops progress map with {len(general_progress_map)} items")
+		
 		for drop in general_drops:
 			item_name = drop.get('item', '')
 			hours = drop.get('hours', 0)
 			alias = drop.get('alias', '')
 			
-			# Find matching inventory progress
+			# Find matching inventory progress (only in general drops area)
 			progress = None
 			progress_title = None
 			search_terms = [item_name]
 			if alias:
 				search_terms.append(alias)
 			
-			for title, percent in inventory_progress.items():
+			for title, percent in general_progress_map.items():
 				for term in search_terms:
 					# Use word boundaries to avoid partial matches (e.g., "fridge" shouldn't match "Abe Fridge")
 					import re
@@ -571,7 +614,7 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			
 			# If no exact match found, try a more flexible search
 			if progress is None:
-				for title, percent in inventory_progress.items():
+				for title, percent in general_progress_map.items():
 					for term in search_terms:
 						# Try partial matching for common words like "Chestplate", "Kilt", etc.
 						if term.lower() in title.lower() and len(term) > 3:
@@ -583,14 +626,14 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			
 			# If still no match, try intelligent keyword matching
 			if progress is None:
-				progress, progress_title = intelligent_item_matching(item_name, inventory_progress)
+				progress, progress_title = intelligent_item_matching(item_name, general_progress_map)
 				if progress is not None:
 					logging.info(f"Successfully matched '{item_name}' to '{progress_title}' with {progress}% progress")
 			
 			# Debug logging for unmatched items
 			if progress is None and item_name:
 				logging.info(f"Could not find progress for general drop: '{item_name}' (alias: '{alias}')")
-				logging.info(f"Available inventory titles: {list(inventory_progress.keys())}")
+				logging.info(f"Available general drops titles: {list(general_progress_map.keys())}")
 				logging.info(f"Searched terms: {search_terms}")
 			
 			drop_info = {
@@ -2328,6 +2371,103 @@ async def get_inventory_progress_map(inv_page):
 		logging.warning(f"[INVENTORY-SCAN] Progress map issue: {e}")
 	return progress
 
+async def get_general_drops_progress_map(inv_page):
+	"""Get progress map for general drops only, excluding streamer-specific drops."""
+	progress = {}
+	try:
+		logging.info(f"[GENERAL-DROPS-SCAN] Starting general drops area scan...")
+		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+		await maybe_accept_cookies(inv_page)
+		await inv_page.wait_for_timeout(600)
+		items = await inv_page.evaluate(
+			r"""
+			() => {
+			  const out = [];
+			  const findTitleFrom = (container) => {
+				let node = container;
+				while (node) {
+				  let prev = node.previousElementSibling;
+				  while (prev) {
+					const titleEl = prev.querySelector('p.CoreText-sc-1txzju1-0, p');
+					if (titleEl && titleEl.textContent && titleEl.textContent.trim()) {
+					  return titleEl.textContent.trim();
+					}
+					prev = prev.previousElementSibling;
+				  }
+				  node = node.parentElement;
+				}
+				return null;
+			  };
+			  
+			  // Look for general drops section - try multiple selectors
+			  const generalSections = [
+				'[data-test-selector="drops-general-section"]',
+				'.drops-general',
+				'[aria-label*="general" i]',
+				'[aria-label*="General" i]'
+			  ];
+			  
+			  let generalContainer = null;
+			  for (const selector of generalSections) {
+				generalContainer = document.querySelector(selector);
+				if (generalContainer) {
+				  console.log('Found general drops section with selector:', selector);
+				  break;
+				}
+			  }
+			  
+			  // If no specific general section found, look for progress bars that are NOT in streamer sections
+			  const allProgressBars = document.querySelectorAll('[role="progressbar"][aria-valuenow]');
+			  allProgressBars.forEach(pb => {
+				const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
+				const container = pb.parentElement;
+				
+				// Check if this progress bar is in a streamer-specific section
+				const isInStreamerSection = !!pb.closest('[data-test-selector*="streamer"], .streamer-drops, [aria-label*="streamer" i], [aria-label*="Streamer" i]');
+				
+				// If we found a general container, only include items within it
+				// Otherwise, exclude items that are clearly in streamer sections
+				let shouldInclude = false;
+				if (generalContainer) {
+				  shouldInclude = generalContainer.contains(pb);
+				} else {
+				  shouldInclude = !isInStreamerSection;
+				}
+				
+				if (shouldInclude) {
+				  const title = findTitleFrom(container);
+				  if (title) {
+					// Additional check: exclude titles that clearly contain streamer names
+					// (this is a heuristic to avoid streamer-specific items)
+					const titleLower = title.toLowerCase();
+					const hasStreamerIndicators = /\b(streamer|channel|broadcaster|twitch)\b/.test(titleLower) && 
+					  !/\b(general|campaign|event)\b/.test(titleLower);
+					
+					if (!hasStreamerIndicators) {
+					  out.push({ title, percent });
+					}
+				  }
+				}
+			  });
+			  
+			  return out;
+			}
+			"""
+		)
+		logging.info(f"[GENERAL-DROPS-SCAN] Found {len(items)} progress bars in general drops area")
+		for it in items:
+			title = it.get('title')
+			percent = it.get('percent')
+			if title:
+				progress[title] = percent
+				logging.info(f"[GENERAL-DROPS-SCAN] General drop: '{title}' = {percent}%")
+			else:
+				logging.info(f"[GENERAL-DROPS-SCAN] Skipping item with no title: {it}")
+		logging.info(f"[GENERAL-DROPS-SCAN] Final general drops progress map contains {len(progress)} items")
+	except Exception as e:
+		logging.warning(f"[GENERAL-DROPS-SCAN] General drops progress map issue: {e}")
+	return progress
+
 async def get_incomplete_rust_rewards(inv_page):
 	rewards = []
 	try:
@@ -3115,56 +3255,23 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 				except Exception:
 					pass
 			await inv_page.wait_for_timeout(600)
-			items = await inv_page.evaluate(
-				r"""
-				(titleNeedleLower) => {
-				  const out = [];
-				  const findTitleFrom = (container) => {
-					let node = container;
-					while (node) {
-					  let prev = node.previousElementSibling;
-					  while (prev) {
-						const el = prev.querySelector('p, h1, h2, h3, h4, h5, h6, span');
-						if (el && el.textContent && el.textContent.trim()) {
-						  return el.textContent.trim();
-						}
-						prev = prev.previousElementSibling;
-					  }
-					  node = node.parentElement;
-					}
-					return null;
-				  };
-				  document.querySelectorAll('[role="progressbar"][aria-valuenow]').forEach(pb => {
-					const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
-					const container = pb.parentElement;
-					let title = findTitleFrom(container) || '';
-					if (!title) {
-					  const card = pb.closest('[role="group"], [data-test-selector], .Layout-sc');
-					  if (card) {
-					    const t = card.querySelector('p, span, h3');
-					    if (t && t.textContent) title = t.textContent.trim();
-					  }
-					}
-					const tLower = (title || '').toLowerCase();
-					out.push({ title, percent, match: titleNeedleLower && tLower.includes(titleNeedleLower) });
-				  });
-				  return out;
-				}
-				""",
-				target_lower
-			)
-			match = None
-			for it in items or []:
-				if it.get('match'):
-					match = it
+			# Restrict general progress search to the general drops area only
+			general_map = await get_general_drops_progress_map(inv_page)
+			# Find a matching title in the general area
+			match_title = None
+			match_percent = None
+			for title, percent in (general_map or {}).items():
+				if isinstance(title, str) and target_lower in (title or '').lower():
+					match_title = title
+					match_percent = percent if isinstance(percent, int) else None
 					break
-			if match and isinstance(match.get('percent'), int):
-				p = match['percent']
-				logging.info(f"[General] {match.get('title')} Progress: {p}%")
+			if match_title is not None and isinstance(match_percent, int):
+				p = match_percent
+				logging.info(f"[General] {match_title} Progress: {p}%")
 				
 				# Update cache with current progress
 				try:
-					progress_map = {match.get('title'): p}
+					progress_map = {match_title: p}
 					update_cached_drops_data(None, progress_map)
 				except Exception as e:
 					logging.debug(f"Failed to update cache during general progress tracking: {e}")
@@ -3207,56 +3314,23 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 				except Exception:
 					pass
 			await inv_page.wait_for_timeout(600)
-			items = await inv_page.evaluate(
-				r"""
-				(titleNeedleLower) => {
-				  const out = [];
-				  const findTitleFrom = (container) => {
-					let node = container;
-					while (node) {
-					  let prev = node.previousElementSibling;
-					  while (prev) {
-						const el = prev.querySelector('p, h1, h2, h3, h4, h5, h6, span');
-						if (el && el.textContent && el.textContent.trim()) {
-						  return el.textContent.trim();
-						}
-						prev = prev.previousElementSibling;
-					  }
-					  node = node.parentElement;
-					}
-					return null;
-				  };
-				  document.querySelectorAll('[role=\"progressbar\"][aria-valuenow]').forEach(pb => {
-					const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
-					const container = pb.parentElement;
-					let title = findTitleFrom(container) || '';
-					if (!title) {
-					  const card = pb.closest('[role=\"group\"], [data-test-selector], .Layout-sc');
-					  if (card) {
-					    const t = card.querySelector('p, span, h3');
-					    if (t && t.textContent) title = t.textContent.trim();
-					  }
-					}
-					const tLower = (title || '').toLowerCase();
-					out.push({ title, percent, match: titleNeedleLower && tLower.includes(titleNeedleLower) });
-				  });
-				  return out;
-				}
-				""",
-				target_lower
-			)
-			match = None
-			for it in items or []:
-				if it.get('match'):
-					match = it
+			# Restrict general progress search to the general drops area only
+			general_map = await get_general_drops_progress_map(inv_page)
+			# Find a matching title in the general area
+			match_title = None
+			match_percent = None
+			for title, percent in (general_map or {}).items():
+				if isinstance(title, str) and target_lower in (title or '').lower():
+					match_title = title
+					match_percent = percent if isinstance(percent, int) else None
 					break
-			if match and isinstance(match.get('percent'), int):
-				p = match['percent']
-				logging.info(f"[General] {match.get('title')} Progress: {p}%")
+			if match_title is not None and isinstance(match_percent, int):
+				p = match_percent
+				logging.info(f"[General] {match_title} Progress: {p}%")
 				
 				# Update cache with current progress
 				try:
-					progress_map = {match.get('title'): p}
+					progress_map = {match_title: p}
 					update_cached_drops_data(None, progress_map)
 				except Exception as e:
 					logging.debug(f"Failed to update cache during general progress tracking: {e}")
@@ -3347,13 +3421,7 @@ async def run_drops_workflow(context, test_mode=False):
 			
 	# Initial claim check removed per user request (user will claim manually)
 			
-			# Update cached drops data for web interface (will be updated again with claimed list below)
-			update_cached_drops_data(fp, progress_map)
-
-			# Defer general drop decision until after streamer candidates are considered
-			longest_general = None
-
-			# One-time sweep of recently claimed items (<= 21 days)
+			# Scrape recently claimed items first so we can use them for proper categorization
 			recently_claimed = []
 			try:
 				recently_claimed = await scrape_recent_claimed_items(inv_page)
@@ -3365,24 +3433,63 @@ async def run_drops_workflow(context, test_mode=False):
 			except Exception as e:
 				logging.warning(f"[RECENTLY-CLAIMED] Failed to scrape recently claimed items: {e}")
 				recently_claimed = []
+			
+			# Get general drops progress map if we have general drops
+			general_progress_map = {}
+			if fp and fp.get('general'):
+				general_progress_map = await get_general_drops_progress_map(inv_page)
+				logging.info(f"[WORKFLOW] Retrieved general drops progress map with {len(general_progress_map)} items")
+			
+			# Update cached drops data for web interface with recently claimed data
+			update_cached_drops_data(fp, progress_map, recently_claimed, general_progress_map)
+			
+			# Check for ready-to-claim items and log them
+			ready_to_claim_items = []
+			if progress_map:
+				for title, percent in progress_map.items():
+					if isinstance(percent, int) and percent >= 100:
+						ready_to_claim_items.append(title)
+			
+			if ready_to_claim_items:
+				logging.info(f"[READY-TO-CLAIM] Found {len(ready_to_claim_items)} items ready to claim: {ready_to_claim_items}")
+			else:
+				logging.info(f"[READY-TO-CLAIM] No items ready to claim")
 
-			# Helper to check if a streamer appears in recently_claimed
+			# Defer general drop decision until after streamer candidates are considered
+			longest_general = None
+
+			# Recently claimed items already scraped above
+
+			# Helper to check if a streamer appears in recently_claimed using intelligent matching
 			def is_streamer_recently_claimed(streamer: str) -> int | None:
-				logging.info(f"[CLAIMED-CHECK] Checking if '{streamer}' is recently claimed...")
+				logging.info(f"[CLAIMED-CHECK] Checking if '{streamer}' is recently claimed using intelligent matching...")
 				name_vars = generate_search_variations(streamer)
 				logging.info(f"[CLAIMED-CHECK] Generated {len(name_vars)} search variations for '{streamer}': {name_vars}")
 				recently_claimed_list = recently_claimed or []
 				logging.info(f"[CLAIMED-CHECK] Checking against {len(recently_claimed_list)} recently claimed items")
+				
+				# Use intelligent matching approach - check each variation against each claimed item
 				for i, it in enumerate(recently_claimed_list):
 					n = (it.get('name') or '').lower()
 					days = it.get('days')
 					logging.info(f"[CLAIMED-CHECK] Item {i+1}: '{n}' (claimed {days} days ago)")
+					
+					# Try each search variation against this claimed item
 					for j, v in enumerate(name_vars):
 						if v and v in n:
 							logging.info(f"[CLAIMED-CHECK] MATCH FOUND! Variation '{v}' found in '{n}' - streamer '{streamer}' was claimed {days} days ago")
 							return int(days) if isinstance(days, int) else 0
 						else:
 							logging.info(f"[CLAIMED-CHECK] No match: variation '{v}' not found in '{n}'")
+					
+					# Also try reverse matching - check if claimed item name is in streamer variation
+					for j, v in enumerate(name_vars):
+						if v and n in v:
+							logging.info(f"[CLAIMED-CHECK] REVERSE MATCH FOUND! Claimed item '{n}' found in variation '{v}' - streamer '{streamer}' was claimed {days} days ago")
+							return int(days) if isinstance(days, int) else 0
+						else:
+							logging.info(f"[CLAIMED-CHECK] No reverse match: claimed item '{n}' not found in variation '{v}'")
+				
 				logging.info(f"[CLAIMED-CHECK] No matches found for '{streamer}' - not recently claimed")
 				return None
 
@@ -3492,9 +3599,7 @@ async def run_drops_workflow(context, test_mode=False):
 			logging.info(f"Total candidates: {len(candidates)}")
 			logging.info(f"========================")
 
-			# Update cache with recently claimed list for web UI
-			recently_claimed_names = [it.get('name') for it in (recently_claimed or [])]
-			update_cached_drops_data(fp, progress_map, recently_claimed_names)
+			# Cache already updated above with recently claimed data
 
 			# Do not enter general mode here; prefer streamer-specific workflow below
 
@@ -3601,10 +3706,23 @@ async def run_drops_workflow(context, test_mode=False):
 					return
 			except Exception:
 				pass
-			if await are_all_general_drops_complete(inv_page, fp.get('general') if fp else None):
-				logging.info("All general drops are complete. Exiting program.")
-				EXIT_EVENT.set()
-				return
+			general_drops_complete = await are_all_general_drops_complete(inv_page, fp.get('general') if fp else None)
+			if general_drops_complete:
+				# Check if there are any ready-to-claim items that need manual claiming
+				progress_map = await get_inventory_progress_map(inv_page)
+				ready_to_claim_items = []
+				if progress_map:
+					for title, percent in progress_map.items():
+						if isinstance(percent, int) and percent >= 100:
+							ready_to_claim_items.append(title)
+				
+				if ready_to_claim_items:
+					logging.info(f"All general drops are complete, but {len(ready_to_claim_items)} items are ready to claim: {ready_to_claim_items}")
+					logging.info("Continuing to monitor for manual claiming...")
+				else:
+					logging.info("All general drops are complete and claimed. Exiting program.")
+					EXIT_EVENT.set()
+					return
 			# Additional guard: if Facepunch general list is empty but site shows not-started or locked items, handle gracefully
 			try:
 				if fp and (not fp.get('general')) and (fp.get('not_started') or True in [bool((g or {}).get('is_locked')) for g in fp.get('general') or []]):
@@ -3926,11 +4044,11 @@ async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 			logging.info(f"[GENERAL-DROPS-CHECK] No general drops to check - returning True")
 			return True
 		logging.info(f"[GENERAL-DROPS-CHECK] Checking {len(general_list)} general drops for completion")
-		# Ensure we are on inventory and scrape current progressbars once
-		progress_map = await get_inventory_progress_map(inv_page)
+		# Ensure we are on inventory and scrape current progressbars from general drops area only
+		progress_map = await get_general_drops_progress_map(inv_page)
 		if progress_map is None:
 			progress_map = {}
-		logging.info(f"[GENERAL-DROPS-CHECK] Found {len(progress_map)} items in inventory progress map")
+		logging.info(f"[GENERAL-DROPS-CHECK] Found {len(progress_map)} items in general drops progress map")
 		def find_percent_for_any(needles: list[str]) -> int | None:
 			cands = [n.strip().lower() for n in (needles or []) if n and n.strip()]
 			if not cands:

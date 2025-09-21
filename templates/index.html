@@ -1431,7 +1431,10 @@
 
             // Move recently claimed streamers to completed section
             if (dropsData.recently_claimed_streamers && dropsData.recently_claimed_streamers.length > 0) {
-                const claimedNames = dropsData.recently_claimed_streamers.map(name => name.toLowerCase());
+                const claimedNames = dropsData.recently_claimed_streamers
+                    .map(it => (typeof it === 'string' ? it : (it && it.name ? it.name : '')))
+                    .filter(Boolean)
+                    .map(n => n.toLowerCase());
                 
                 // Check in_progress items
                 for (let i = enhancedData.in_progress.length - 1; i >= 0; i--) {
@@ -1440,7 +1443,7 @@
                         const streamerLower = drop.streamer.toLowerCase();
                         if (claimedNames.some(claimed => 
                             streamerLower.includes(claimed) || claimed.includes(streamerLower) ||
-                            streamerLower.split(' ')[0] === claimed.split(' ')[0] // Match first word
+                            (streamerLower.split(' ')[0] && claimed.split(' ')[0] && streamerLower.split(' ')[0] === claimed.split(' ')[0])
                         )) {
                             // Move to completed
                             enhancedData.completed.push(drop);
@@ -1456,7 +1459,7 @@
                         const streamerLower = drop.streamer.toLowerCase();
                         if (claimedNames.some(claimed => 
                             streamerLower.includes(claimed) || claimed.includes(streamerLower) ||
-                            streamerLower.split(' ')[0] === claimed.split(' ')[0] // Match first word
+                            (streamerLower.split(' ')[0] && claimed.split(' ')[0] && streamerLower.split(' ')[0] === claimed.split(' ')[0])
                         )) {
                             // Move to completed
                             enhancedData.completed.push(drop);
