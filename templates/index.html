@@ -290,6 +290,24 @@
             transform: translateY(-2px);
         }
 
+        /* Integrity status pill */
+        .integrity-pill {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-weight: 600;
+            margin-left: 10px;
+            border: 1px solid rgba(0,0,0,0.06);
+        }
+        .integrity-valid {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+        .integrity-expired {
+            background: #ffebee;
+            color: #c62828;
+        }
+
         .info-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -745,6 +763,15 @@
             color: #666;
         }
 
+        .claim-flag {
+            background: #fff3cd;
+            color: #8a6d3b;
+            padding: 4px 8px;
+            border-radius: 12px;
+            border: 1px solid #ffeeba;
+            font-weight: 600;
+        }
+
         .drop-hours {
             background: rgba(102, 126, 234, 0.1);
             color: #667eea;
@@ -864,6 +891,10 @@
                     <div class="info-item">
                         <div class="info-label">Version</div>
                         <div class="info-value" id="appVersion">Loading...</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Integrity</div>
+                        <div class="info-value"><span id="integrityStatusText">Unknown</span></div>
                     </div>
                 </div>
             </div>
@@ -996,6 +1027,8 @@
             <button class="btn btn-primary" onclick="refreshStatus()">🔄 Refresh Status</button>
             <button class="btn btn-secondary" onclick="window.location.reload()">🔄 Reload Page</button>
             <a href="/api/status" class="btn btn-secondary" target="_blank">📋 API Status</a>
+            <button class="btn btn-primary" onclick="renewIntegrity()" id="renewHeadersBtn">🔑 Renew Headers</button>
+            <span id="integrityPill" class="integrity-pill integrity-expired">Integrity: Unknown</span>
         </div>
 
         <div class="log-container debug-only" id="logContainer">
@@ -1114,11 +1147,76 @@
                     if (data.version) {
                         document.getElementById('appVersion').textContent = data.version;
                     }
+                    // Integrity from status
+                    updateIntegrityUI(data.integrity_valid, data.integrity_age_seconds);
                     addLogEntry('Status refreshed', 'info');
                 })
                 .catch(error => {
                     addLogEntry('Failed to refresh status: ' + error, 'error');
                 });
+        }
+
+        // Integrity helpers
+        function formatAge(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const hrs = Math.floor(mins / 60);
+            if (hrs >= 1) return `${hrs}h ${mins % 60}m`;
+            if (mins >= 1) return `${mins}m`;
+            return `${seconds}s`;
+        }
+
+        function updateIntegrityUI(valid, ageSeconds) {
+            const pill = document.getElementById('integrityPill');
+            const text = document.getElementById('integrityStatusText');
+            const age = typeof ageSeconds === 'number' ? ageSeconds : 0;
+            const ageLabel = valid ? ` • age ${formatAge(age)}` : '';
+            if (valid) {
+                pill.classList.remove('integrity-expired');
+                pill.classList.add('integrity-valid');
+                pill.textContent = `Integrity: Valid${ageLabel}`;
+                if (text) text.textContent = 'Valid';
+            } else {
+                pill.classList.remove('integrity-valid');
+                pill.classList.add('integrity-expired');
+                pill.textContent = 'Integrity: Expired';
+                if (text) text.textContent = 'Expired';
+            }
+        }
+
+        function refreshIntegrityStatus() {
+            fetch('/api/integrity')
+                .then(r => r.json())
+                .then(j => {
+                    updateIntegrityUI(Boolean(j.valid), Number(j.age_seconds || 0));
+                    addLogEntry('Integrity status refreshed', 'info');
+                })
+                .catch(err => addLogEntry('Failed to refresh integrity: ' + err, 'error'));
+        }
+
+        function renewIntegrity() {
+            const btn = document.getElementById('renewHeadersBtn');
+            const original = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '🔑 Renewing...';
+            fetch('/api/integrity/renew', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal: AbortSignal.timeout(120000)
+            })
+            .then(r => r.json())
+            .then(j => {
+                if (j.success) {
+                    addLogEntry('Integrity headers renewed', 'success');
+                    refreshIntegrityStatus();
+                } else {
+                    addLogEntry('Integrity renewal failed: ' + (j.message || 'unknown error'), 'error');
+                }
+            })
+            .catch(err => addLogEntry('Integrity renewal error: ' + err, 'error'))
+            .finally(() => {
+                btn.disabled = false;
+                btn.textContent = original;
+            });
         }
 
         // Load settings from server
@@ -1563,6 +1661,7 @@
                 `;
             }
 
+            const claimBadge = (statusClass === 'completed' && drop.ready_to_claim) ? '<span class="claim-flag">Ready to claim</span>' : '';
             return `
                 <div class="drop-card ${statusClass}">
                     <div class="drop-header">
@@ -1578,6 +1677,7 @@
                             ${streamerInfo}
                             ${progressTitleInfo}
                             <div class="drop-type">${drop.type.toUpperCase()} DROP</div>
+                            ${claimBadge}
                         </div>
                     </div>
                     ${progressBar}

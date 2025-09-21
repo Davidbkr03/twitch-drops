@@ -86,6 +86,152 @@ cached_drops_data = {
 	"completed": [],
 	"last_updated": None
 }
+
+# Integrity/header management
+INTEGRITY_RENEW_REQUESTED = threading.Event()
+
+def _now_ts() -> int:
+	try:
+		return int(time.time())
+	except Exception:
+		return 0
+
+def get_integrity_prefs():
+	try:
+		return {
+			"headers": dict(PREFERENCES.get("integrity_headers", {})),
+			"fetched_at": int(PREFERENCES.get("integrity_fetched_at", 0)),
+			"ttl_hours": int(PREFERENCES.get("integrity_ttl_hours", 6)),
+			"auto_renew": bool(PREFERENCES.get("integrity_auto_renew", True)),
+		}
+	except Exception:
+		return {"headers": {}, "fetched_at": 0, "ttl_hours": 6, "auto_renew": True}
+
+def is_integrity_valid() -> bool:
+	try:
+		ip = get_integrity_prefs()
+		if not ip["headers"] or not ip["headers"].get("Client-Integrity"):
+			return False
+		age = max(0, _now_ts() - int(ip["fetched_at"]))
+		return age < max(1, ip["ttl_hours"]) * 3600
+	except Exception:
+		return False
+
+def save_integrity_headers(headers: dict):
+	try:
+		with CONFIG_LOCK:
+			PREFERENCES["integrity_headers"] = headers or {}
+			PREFERENCES["integrity_fetched_at"] = _now_ts()
+			if "integrity_ttl_hours" not in PREFERENCES:
+				PREFERENCES["integrity_ttl_hours"] = 6
+			threading.Thread(target=lambda: save_preferences(PREFERENCES), daemon=True).start()
+	except Exception as e:
+		logging.debug(f"Failed saving integrity headers: {e}")
+
+async def fetch_integrity_headers_with_headed(p) -> dict:
+	"""Launch a temporary headed context using same user data dir and capture Client-Integrity from gql calls."""
+	logging.info("Fetching integrity headers in headed mode…")
+	ctx = None
+	page = None
+	captured = {}
+	try:
+		ctx = await p.chromium.launch_persistent_context(
+			USER_DATA_DIR,
+			headless=False,
+			channel=BROWSER_CHANNEL,
+			slow_mo=50,
+			viewport={"width": 1200, "height": 768},
+			locale="en-US",
+		)
+		await apply_stealth_to_context(ctx, profile=("off" if STEALTH_PROFILE == "off" else STEALTH_PROFILE))
+		try:
+			await apply_additional_stealth(ctx)
+		except Exception:
+			pass
+
+		page = await ctx.new_page()
+		def _maybe_capture_from_headers(h):
+			try:
+				if not h:
+					return False
+				lower = {k.lower(): v for k, v in h.items()}
+				ci = lower.get("client-integrity")
+				if ci:
+					captured.update({k: v for k, v in h.items() if k.lower() in (
+						"client-integrity", "client-session-id", "x-device-id", "client-id"
+					)})
+					logging.info("Captured Client-Integrity header")
+					return True
+				return False
+			except Exception:
+				return False
+
+		def on_request(req):
+			try:
+				if "gql.twitch.tv" in req.url:
+					if _maybe_capture_from_headers(req.headers):
+						return
+			except Exception:
+				pass
+
+		def on_response(resp):
+			try:
+				if "gql.twitch.tv" in resp.url:
+					# Some frameworks expose request headers via resp.request
+					if _maybe_capture_from_headers(getattr(resp.request, 'headers', lambda: {})() if hasattr(resp.request, 'headers') else {}):
+						return
+					# Also try raw response headers just in case
+					_ = resp.headers
+			except Exception:
+				pass
+		page.on("request", on_request)
+		page.on("response", on_response)
+		await goto_with_exit(page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+		await maybe_accept_cookies(page)
+		# Provoke some network activity that triggers gql
+		try:
+			await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+			await page.wait_for_timeout(400)
+			await page.evaluate("window.scrollTo(0, 0)")
+		except Exception:
+			pass
+		# Also visit home which triggers many gql calls
+		try:
+			await goto_with_exit(page, "https://www.twitch.tv/", timeout=60000, wait_until="domcontentloaded")
+			await page.wait_for_timeout(800)
+		except Exception:
+			pass
+		# Wait up to ~20s for a gql request with integrity
+		for _ in range(40):
+			if captured:
+				break
+			await page.wait_for_timeout(500)
+		# Save UA from headed session for reuse in headless
+		try:
+			ua = await page.evaluate("navigator.userAgent")
+			if ua and "HeadlessChrome" not in ua:
+				with CONFIG_LOCK:
+					PREFERENCES["forced_user_agent"] = ua
+				threading.Thread(target=lambda: save_preferences(PREFERENCES), daemon=True).start()
+				logging.info("Saved headed user agent for reuse")
+		except Exception:
+			pass
+	finally:
+		try:
+			if page:
+				await page.close()
+		except Exception:
+			pass
+		try:
+			if ctx:
+				await ctx.close()
+		except Exception:
+			pass
+	return captured
+
+async def apply_integrity_headers_to_context(context):
+    # No-op: integrity-based claiming removed per user request
+    return
 drops_data_lock = threading.RLock()
 
 # Track current working item
@@ -225,6 +371,53 @@ def intelligent_item_matching(item_name, inventory_progress):
 	
 	return None, None
 
+
+def intelligent_streamer_matching(streamer_name, inventory_progress):
+	"""
+	Intelligent matching for streamer names that don't exactly match inventory titles.
+	Handles cases like 'XCHOCOBARS' -> 'xChoco'
+	"""
+	streamer_lower = streamer_name.lower().strip()
+	
+	# First try exact substring match (original behavior)
+	for title, percent in inventory_progress.items():
+		title_lower = title.lower()
+		if streamer_lower in title_lower:
+			return percent, title
+	
+	# Try partial matching - check if streamer name contains significant parts of inventory title
+	for title, percent in inventory_progress.items():
+		title_lower = title.lower()
+		
+		# Extract meaningful parts (remove common suffixes/prefixes)
+		streamer_clean = streamer_lower.replace('tv', '').replace('streamer', '').replace('channel', '')
+		title_clean = title_lower.replace('tv', '').replace('streamer', '').replace('channel', '')
+		
+		# Check if cleaned streamer name contains title or vice versa
+		if len(title_clean) >= 4 and title_clean in streamer_clean:
+			logging.info(f"Intelligent streamer match: '{streamer_name}' -> '{title}' (partial match)")
+			return percent, title
+		if len(streamer_clean) >= 4 and streamer_clean in title_clean:
+			logging.info(f"Intelligent streamer match: '{streamer_name}' -> '{title}' (reverse partial match)")
+			return percent, title
+	
+	# Try word-based matching for multi-word names
+	streamer_words = [word for word in streamer_lower.split() if len(word) > 2]
+	title_words = [word for word in title_lower.split() if len(word) > 2]
+	
+	if streamer_words and title_words:
+		# Check if any significant words match
+		for streamer_word in streamer_words:
+			for title_word in title_words:
+				if len(streamer_word) >= 4 and len(title_word) >= 4:
+					# Check if one word is contained in the other
+					if streamer_word in title_word or title_word in streamer_word:
+						logging.info(f"Intelligent streamer match: '{streamer_name}' -> '{title}' (word match: '{streamer_word}' <-> '{title_word}')")
+						return percent, title
+	
+	return None, None
+
+
 def update_cached_drops_data(facepunch_data, inventory_progress, recently_claimed_streamers=None):
 	"""Update the cached drops data for the web interface."""
 	global cached_drops_data
@@ -238,10 +431,20 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 					# Update progress for matching items
 					for title, percent in inventory_progress.items():
 						# For streamer drops, match by streamer name in title
-						if drop.get("type") == "streamer" and drop.get("streamer") and drop["streamer"].lower() in title.lower():
-							drop["progress"] = percent
-							drop["progress_title"] = title
-							break
+						if drop.get("type") == "streamer" and drop.get("streamer"):
+							streamer_name = drop["streamer"]
+							# First try exact substring match
+							if streamer_name.lower() in title.lower():
+								drop["progress"] = percent
+								drop["progress_title"] = title
+								break
+							# If no exact match, try intelligent matching
+							else:
+								intelligent_progress, intelligent_title = intelligent_streamer_matching(streamer_name, {title: percent})
+								if intelligent_progress is not None:
+									drop["progress"] = percent
+									drop["progress_title"] = title
+									break
 						# For general drops, match by exact item name (not partial match)
 						elif drop.get("type") == "general" and drop.get("item"):
 							# Check if the title contains the exact item name as a standalone word
@@ -292,11 +495,20 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			# Find matching inventory progress
 			progress = None
 			progress_title = None
+			# First try exact substring match (original behavior)
 			for title, percent in inventory_progress.items():
 				if streamer_name.lower() in title.lower():
 					progress = percent
 					progress_title = title
 					break
+			
+			# If no exact match, try intelligent matching
+			if progress is None:
+				intelligent_progress, intelligent_title = intelligent_streamer_matching(streamer_name, inventory_progress)
+				if intelligent_progress is not None:
+					progress = intelligent_progress
+					progress_title = intelligent_title
+					logging.info(f"Found intelligent match for streamer '{streamer_name}': {intelligent_title} ({intelligent_progress}%)")
 			
 			drop_info = {
 				"type": "streamer",
@@ -314,6 +526,8 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			if progress is None:
 				drops_data["not_started"].append(drop_info)
 			elif progress >= 100:
+				# Mark as completed but require manual claim
+				drop_info["ready_to_claim"] = True
 				drops_data["completed"].append(drop_info)
 			else:
 				drops_data["in_progress"].append(drop_info)
@@ -383,6 +597,8 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 				# General drops should always show a progress bar when active
 				drops_data["completed"].append(drop_info)
 			elif progress >= 100:
+				# Mark as completed but require manual claim
+				drop_info["ready_to_claim"] = True
 				drops_data["completed"].append(drop_info)
 			else:
 				drops_data["in_progress"].append(drop_info)
@@ -407,7 +623,7 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 
 def load_preferences():
 	default_prefs = {
-		"headless": DEFAULT_HEADLESS, 
+		"headless": False, 
 		"hide_console": True,
 		"test_mode": False,
 		"debug_mode": False,
@@ -714,6 +930,8 @@ def create_web_app():
 			'test_mode': PREFERENCES.get('test_mode', False) if PREFERENCES else False,
 			'debug_mode': PREFERENCES.get('debug_mode', False) if PREFERENCES else False,
 			'enable_web_interface': PREFERENCES.get('enable_web_interface', True) if PREFERENCES else True,
+			'integrity_valid': is_integrity_valid(),
+			'integrity_age_seconds': max(0, _now_ts() - int(PREFERENCES.get('integrity_fetched_at', 0))) if PREFERENCES else 0,
 			'version': get_current_version(),
 			'timestamp': datetime.now().isoformat()
 		})
@@ -728,6 +946,8 @@ def create_web_app():
 				'test_mode': PREFERENCES.get('test_mode', False) if PREFERENCES else False,
 				'debug_mode': PREFERENCES.get('debug_mode', False) if PREFERENCES else False,
 				'enable_web_interface': PREFERENCES.get('enable_web_interface', True) if PREFERENCES else True,
+				'integrity_auto_renew': PREFERENCES.get('integrity_auto_renew', True) if PREFERENCES else True,
+				'integrity_ttl_hours': PREFERENCES.get('integrity_ttl_hours', 6) if PREFERENCES else 6,
 			})
 		elif request.method == 'POST':
 			try:
@@ -743,6 +963,10 @@ def create_web_app():
 						PREFERENCES['debug_mode'] = bool(data['debug_mode'])
 					if 'enable_web_interface' in data:
 						PREFERENCES['enable_web_interface'] = bool(data['enable_web_interface'])
+					if 'integrity_auto_renew' in data:
+						PREFERENCES['integrity_auto_renew'] = bool(data['integrity_auto_renew'])
+					if 'integrity_ttl_hours' in data:
+						PREFERENCES['integrity_ttl_hours'] = int(data['integrity_ttl_hours'])
 					
 					# Save preferences
 					save_preferences(PREFERENCES)
@@ -750,6 +974,35 @@ def create_web_app():
 				return jsonify({'success': True, 'message': 'Settings updated successfully'})
 			except Exception as e:
 				return jsonify({'success': False, 'message': f'Error updating settings: {str(e)}'}), 500
+
+	@app.route('/api/integrity', methods=['GET'])
+	def api_integrity_status():
+		ip = get_integrity_prefs()
+		return jsonify({
+			'valid': is_integrity_valid(),
+			'headers_present': bool(ip['headers']),
+			'age_seconds': max(0, _now_ts() - int(ip['fetched_at'])),
+			'ttl_hours': ip['ttl_hours'],
+			'auto_renew': ip['auto_renew']
+		})
+
+	@app.route('/api/integrity/renew', methods=['POST'])
+	def api_integrity_renew():
+		try:
+			from playwright.async_api import async_playwright
+			async def _renew():
+				async with async_playwright() as p:
+					captured = await fetch_integrity_headers_with_headed(p)
+					if captured:
+						save_integrity_headers(captured)
+						return True
+					return False
+			loop = asyncio.new_event_loop()
+			ok = loop.run_until_complete(_renew())
+			loop.close()
+			return jsonify({'success': bool(ok)})
+		except Exception as e:
+			return jsonify({'success': False, 'message': str(e)}), 500
 	
 	@app.route('/api/drops', methods=['GET'])
 	def api_drops():
@@ -1350,17 +1603,35 @@ async def apply_stealth_to_context(context, profile: str):
 		stealth = Stealth(init_scripts_only=True)
 	await stealth.apply_stealth_async(context)
 
+async def apply_additional_stealth(context):
+	"""Minimal safe extra evasion to avoid syntax issues."""
+	try:
+		await context.add_init_script(r"""
+		(() => {
+		  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+		})();
+		""")
+	except Exception:
+		pass
+
 async def maybe_accept_cookies(page):
 	try:
 		btn = await page.query_selector('#onetrust-accept-btn-handler')
 		if btn:
-			await btn.click()
+			await click_ui_element(
+				page, 
+				'#onetrust-accept-btn-handler', 
+				"OneTrust cookie accept button", 
+				timeout=2000, 
+				wait_after_click=0.5
+			)
 			logging.info("Accepted OneTrust cookies banner")
-			await asyncio.sleep(0.5)
 	except Exception:
 		pass
 
 async def launch_context(p, compat_mode: bool):
+	headless_pref = get_headless_preference()
+    # Integrity capture removed per user request
 	args = [
 		"--disable-extensions",
 		"--disable-features=BlockThirdPartyCookies,CookieDeprecationMessages",
@@ -1369,8 +1640,6 @@ async def launch_context(p, compat_mode: bool):
 		"--disable-renderer-backgrounding",
 		"--disable-background-networking",
 		"--force-device-scale-factor=1",
-		"--disable-gpu-sandbox",
-		"--disable-features=VizDisplayCompositor",
 		"--run-all-compositor-stages-before-draw",
 		"--disable-ipc-flooding-protection",
 		"--disable-hang-monitor",
@@ -1385,7 +1654,39 @@ async def launch_context(p, compat_mode: bool):
 		"--aggressive-cache-discard",
 		"--disable-background-timer-throttling",
 		"--disable-renderer-backgrounding",
+		# Human-like behavior arguments
+		"--enable-features=NetworkService,NetworkServiceLogging",
+		"--disable-dev-shm-usage",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-default-apps",
+		"--disable-extensions-except",
+		"--disable-extensions-file-access-check",
+		"--disable-extensions-http-throttling",
+		"--disable-popup-blocking",
+		"--disable-field-trial-config",
+		"--disable-back-forward-cache",
+		"--disable-background-media-download",
 	]
+
+	# Prefer a previously captured headed user agent to avoid "HeadlessChrome" token
+	try:
+		with CONFIG_LOCK:
+			ua_saved = PREFERENCES.get("forced_user_agent")
+	except Exception:
+		ua_saved = None
+	# In headless, enable GPU/WebGL related features and remove conflicting disables
+	if headless_pref:
+		args = [a for a in args if a not in ("--disable-gpu-sandbox", "--disable-features=VizDisplayCompositor")]
+		args.extend([
+			"--enable-webgl",
+			"--ignore-gpu-blocklist",
+			"--use-gl=angle",
+			"--use-angle=d3d11",
+			"--enable-accelerated-2d-canvas",
+			"--canvas-msaa-sample-count=4",
+			"--enable-gpu-rasterization",
+		])
 	ignore_default_args = None
 	if not compat_mode:
 		args.append("--disable-blink-features=AutomationControlled")
@@ -1408,12 +1709,12 @@ async def launch_context(p, compat_mode: bool):
 			raise RuntimeError("Google Chrome is required on macOS. Please install it from https://www.google.com/chrome/")
 		context = await p.chromium.launch_persistent_context(
 			USER_DATA_DIR,
-			headless=get_headless_preference(),
+			headless=headless_pref,
 			executable_path=chrome_exec,
 			slow_mo=50,
 			ignore_default_args=ignore_default_args,
 			args=args,
-			user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
+			user_agent=(FORCE_USER_AGENT or ua_saved) if (FORCE_USER_AGENT or ua_saved) else None,
 			viewport={"width": 1366, "height": 768},
 			locale="en-US",
 		)
@@ -1422,12 +1723,12 @@ async def launch_context(p, compat_mode: bool):
 		try:
 			context = await p.chromium.launch_persistent_context(
 				USER_DATA_DIR,
-				headless=get_headless_preference(),
+				headless=headless_pref,
 				channel=BROWSER_CHANNEL,
 				slow_mo=50,
 				ignore_default_args=ignore_default_args,
 				args=args,
-				user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
+				user_agent=(FORCE_USER_AGENT or ua_saved) if (FORCE_USER_AGENT or ua_saved) else None,
 				viewport={"width": 1366, "height": 768},
 				locale="en-US",
 			)
@@ -1435,16 +1736,21 @@ async def launch_context(p, compat_mode: bool):
 			logging.warning(f"Primary browser channel '{BROWSER_CHANNEL}' failed ({e}). Falling back to default Chromium.")
 			context = await p.chromium.launch_persistent_context(
 				USER_DATA_DIR,
-				headless=get_headless_preference(),
+				headless=headless_pref,
 				slow_mo=50,
 				ignore_default_args=ignore_default_args,
 				args=args,
-				user_agent=FORCE_USER_AGENT if FORCE_USER_AGENT else None,
+				user_agent=(FORCE_USER_AGENT or ua_saved) if (FORCE_USER_AGENT or ua_saved) else None,
 				viewport={"width": 1366, "height": 768},
 				locale="en-US",
 			)
 
 	await apply_stealth_to_context(context, profile=("off" if compat_mode else STEALTH_PROFILE))
+	try:
+		await apply_additional_stealth(context)
+	except Exception:
+		pass
+    # Integrity header application disabled per user request
 
 	page = await context.new_page()
 
@@ -2364,16 +2670,26 @@ async def ensure_stream_playing(stream_page):
 		await stream_page.wait_for_selector('button[data-a-target="player-play-pause-button"]', timeout=30000)
 		label = await stream_page.get_attribute('button[data-a-target="player-play-pause-button"]', 'aria-label')
 		if label and 'Play' in label:
-			await stream_page.click('button[data-a-target="player-play-pause-button"]')
-			await asyncio.sleep(1)
+			await click_ui_element(
+				stream_page, 
+				'button[data-a-target="player-play-pause-button"]', 
+				"play button", 
+				timeout=2000, 
+				wait_after_click=1.0
+			)
 	except Exception:
 		pass
 	try:
 		# Ensure muted (only click if currently not muted)
 		val = await stream_page.get_attribute('[data-a-target="player-volume-slider"]', 'aria-valuenow')
 		if val is None or val != '0':
-			await stream_page.click('button[data-a-target="player-mute-unmute-button"]')
-			await asyncio.sleep(0.2)
+			await click_ui_element(
+				stream_page, 
+				'button[data-a-target="player-mute-unmute-button"]', 
+				"mute button", 
+				timeout=2000, 
+				wait_after_click=0.2
+			)
 		# Nudge the slider toward zero anyway
 		try:
 			await stream_page.hover('[data-a-target="player-volume-slider"]')
@@ -2385,32 +2701,93 @@ async def ensure_stream_playing(stream_page):
 	except Exception:
 		pass
 
+async def click_ui_element(page, selectors, description="UI element", timeout=2000, wait_after_click=0.3):
+    """
+    Unified function to click UI elements using simple, direct clicking approach.
+    
+    This function uses the same simple clicking approach as the original set_low_quality function,
+    providing a clean interface for clicking any UI element.
+    
+    Args:
+        page: Playwright page object
+        selectors: List of CSS selectors to try, or single selector string
+        description: Description for logging purposes
+        timeout: Timeout for each click attempt
+        wait_after_click: Time to wait after successful click
+    
+    Returns:
+        bool: True if click was successful, False otherwise
+    
+    Examples:
+        # Click a single button
+        await click_ui_element(page, 'button[data-a-target="claim-button"]', "claim button")
+        
+        # Try multiple selectors
+        await click_ui_element(page, [
+            'button:has-text("Claim")',
+            'button[aria-label*="Claim"]',
+            '[data-test-selector="claim-button"]'
+        ], "claim button")
+        
+        # Click with custom timeout and wait
+        await click_ui_element(page, 'button.settings', "settings button", timeout=5000, wait_after_click=1.0)
+    """
+    if isinstance(selectors, str):
+        selectors = [selectors]
+    
+    for sel in selectors:
+        try:
+            # Try to find and click the element directly
+            element = await page.query_selector(sel)
+            if element:
+                await element.click(timeout=timeout)
+                logging.info(f"Successfully clicked {description} using selector: {sel}")
+                if wait_after_click > 0:
+                    await asyncio.sleep(wait_after_click)
+                return True
+        except Exception:
+            continue
+    
+    logging.debug(f"Failed to click {description} with any of the provided selectors")
+    return False
+
+
 async def set_low_quality(stream_page):
 	try:
-		await stream_page.click('button[data-a-target="player-settings-button"]', timeout=15000)
-		await asyncio.sleep(0.3)
-		# Open Quality submenu using multiple selectors for robustness
-		quality_opened = False
-		for sel in [
+		# Click settings button using unified function
+		settings_clicked = await click_ui_element(
+			stream_page, 
+			'button[data-a-target="player-settings-button"]', 
+			"player settings button", 
+			timeout=15000, 
+			wait_after_click=0.3
+		)
+		if not settings_clicked:
+			return
+			
+		# Open Quality submenu using unified function
+		quality_selectors = [
 			'div[role="menu"] [data-a-target="player-settings-menu-item-quality"]',
 			'div[role="menu"] [data-a-target="player-settings-quality"]',
 			'div[role="menu"] [role="menuitem"]:has-text("Quality")'
-		]:
-			try:
-				btns = await stream_page.query_selector_all(sel)
-				if btns:
-					await btns[0].click()
-					await asyncio.sleep(0.4)
-					quality_opened = True
-					break
-			except Exception:
-				continue
+		]
+		
+		quality_opened = await click_ui_element(
+			stream_page, 
+			quality_selectors, 
+			"quality menu item", 
+			timeout=2000, 
+			wait_after_click=0.4
+		)
+		
 		if not quality_opened:
 			# Close menu and exit
-			try:
-				await stream_page.click('button[data-a-target="player-settings-button"]')
-			except Exception:
-				pass
+			await click_ui_element(
+				stream_page, 
+				'button[data-a-target="player-settings-button"]', 
+				"player settings button (close)", 
+				timeout=2000
+			)
 			return
 
 		# Click the lowest available quality (Audio Only or lowest p)
@@ -2448,11 +2825,13 @@ async def set_low_quality(stream_page):
 			"""
 		)
 		await asyncio.sleep(0.3)
-		# Close settings menu
-		try:
-			await stream_page.click('button[data-a-target="player-settings-button"]')
-		except Exception:
-			pass
+		# Close settings menu using unified function
+		await click_ui_element(
+			stream_page, 
+			'button[data-a-target="player-settings-button"]', 
+			"player settings button (close)", 
+			timeout=2000
+		)
 	except Exception:
 		pass
 
@@ -2490,22 +2869,51 @@ async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
 
 	Returns the number of claims clicked. When navigate=False, assumes caller is already on the inventory page.
 	"""
+
+	# Add console logging to capture JavaScript errors (sanitized for Windows compatibility)
+	def handle_console(msg):
+		try:
+			# Sanitize the message text to remove Unicode characters that cause encoding issues
+			sanitized_text = msg.text.encode('ascii', 'ignore').decode('ascii')
+			
+			if msg.type == "error":
+				logging.error(f"[JS ERROR] {sanitized_text}")
+			elif msg.type == "warning":
+				logging.warning(f"[JS WARNING] {sanitized_text}")
+			elif msg.type == "log":
+				logging.info(f"[JS LOG] {sanitized_text}")
+			else:
+				logging.info(f"[JS {msg.type.upper()}] {sanitized_text}")
+		except Exception as e:
+			# If there's still an encoding issue, just log a simple message
+			logging.debug(f"Console message handling failed: {e}")
+
+	inv_page.on("console", handle_console)
+
 	claimed = 0
 	try:
+		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
+		await maybe_accept_cookies(inv_page)
+		await inv_page.wait_for_timeout(500)
 		if navigate:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
 			await inv_page.wait_for_timeout(500)
-		
-		claim_buttons = await inv_page.query_selector_all('button:has-text("Claim"), button:has-text("Claim Now")')
+		claim_buttons = await inv_page.query_selector_all('button:has-text("Claim")')
 		for btn in claim_buttons:
 			try:
-				await btn.click()
+				await btn.click(force=True)
 				claimed += 1
 				logging.info("Claimed a reward")
 				await asyncio.sleep(0.5)
 			except Exception:
-				continue
+				try:
+					await btn.click()
+					claimed += 1
+					logging.info("Claimed a reward (fallback click)")
+					await asyncio.sleep(0.5)
+				except Exception:
+					continue
 	except Exception:
 		pass
 	return claimed
@@ -2537,18 +2945,7 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 		try:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
-			# Early claim: if Claim button present, click and finish (progressbar may be gone at 100%)
-			await inv_page.wait_for_timeout(400)
-			try:
-				if await inv_page.query_selector('button:has-text("Claim Now")') or await inv_page.query_selector('button:has-text("Claim")'):
-					c = await claim_available_rewards(inv_page, navigate=False)
-					if c > 0:
-						return True
-					elif c == -1:
-						logging.error("Browser context issue during claim check, stopping polling")
-						return False
-			except Exception:
-				pass
+			# Do not auto-claim; user will claim manually
 			# ensure progressbars rendered (if present)
 			try:
 				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
@@ -2579,12 +2976,52 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 					}
 					return null;
 				  };
+				  
+				  // Intelligent matching function
+				  const isIntelligentMatch = (streamerName, title) => {
+					const streamerLower = streamerName.toLowerCase();
+					const titleLower = title.toLowerCase();
+					
+					// First try exact substring match
+					if (titleLower.includes(streamerLower)) {
+					  return true;
+					}
+					
+					// Try partial matching - check if streamer name contains significant parts of title
+					const streamerClean = streamerLower.replace(/tv|streamer|channel/g, '');
+					const titleClean = titleLower.replace(/tv|streamer|channel/g, '');
+					
+					// Check if cleaned title is contained in cleaned streamer name
+					if (titleClean.length >= 4 && streamerClean.includes(titleClean)) {
+					  return true;
+					}
+					// Check if cleaned streamer name is contained in cleaned title
+					if (streamerClean.length >= 4 && titleClean.includes(streamerClean)) {
+					  return true;
+					}
+					
+					// Try word-based matching
+					const streamerWords = streamerLower.split(/\s+/).filter(w => w.length > 2);
+					const titleWords = titleLower.split(/\s+/).filter(w => w.length > 2);
+					
+					for (const streamerWord of streamerWords) {
+					  for (const titleWord of titleWords) {
+						if (streamerWord.length >= 4 && titleWord.length >= 4) {
+						  if (streamerWord.includes(titleWord) || titleWord.includes(streamerWord)) {
+							return true;
+						  }
+						}
+					  }
+					}
+					
+					return false;
+				  };
+				  
 				  document.querySelectorAll('[role="progressbar"][aria-valuenow]').forEach(pb => {
 					const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
 					const container = pb.parentElement;
 					const title = findTitleFrom(container);
-					const titleLower = (title || '').toLowerCase();
-					if (title && titleLower.includes(targetLower)) {
+					if (title && isIntelligentMatch(targetLower, title)) {
 					  results.push({ title, percent });
 					}
 				  });
@@ -2608,7 +3045,7 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 					logging.debug(f"Failed to update cache during progress tracking: {e}")
 				
 				if isinstance(percent, int) and percent >= 100:
-					await claim_available_rewards(inv_page)
+					# Completed; do not auto-claim
 					return True
 			else:
 				logging.info(f"No inventory entry found for streamer '{streamer_name}'.")
@@ -2633,14 +3070,7 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
 			# Early claim if present
-			await inv_page.wait_for_timeout(400)
-			try:
-				if await inv_page.query_selector('button:has-text("Claim Now")') or await inv_page.query_selector('button:has-text("Claim")'):
-					c = await claim_available_rewards(inv_page, navigate=False)
-					if c > 0:
-						return True
-			except Exception:
-				pass
+            # Do not auto-claim; user will claim manually
 			# Progressbars may not exist when the item is claimable; do not treat as error
 			try:
 				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
@@ -2732,15 +3162,7 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			# Check general progress
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
-			# Early claim if present
-			await inv_page.wait_for_timeout(400)
-			try:
-				if await inv_page.query_selector('button:has-text("Claim Now")') or await inv_page.query_selector('button:has-text("Claim")'):
-					c = await claim_available_rewards(inv_page, navigate=False)
-					if c > 0:
-						return (True, False)
-			except Exception:
-				pass
+            # Do not auto-claim; user will claim manually
 			# Progressbars may not exist when the item is claimable; do not treat as error
 			try:
 				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
@@ -2806,7 +3228,7 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 					logging.debug(f"Failed to update cache during general progress tracking: {e}")
 				
 				if p >= 100:
-					await claim_available_rewards(inv_page)
+					# Completed; do not auto-claim
 					return (True, False)
 
 			# After logging progress, also check if any streamer-specific items need progress
@@ -2880,6 +3302,8 @@ async def run_drops_workflow(context, test_mode=False):
 			progress_map = await get_inventory_progress_map(inv_page)
 			in_progress_titles = { (t or '').lower() for t in progress_map.keys() }
 			
+	# Initial claim check removed per user request (user will claim manually)
+			
 			# Update cached drops data for web interface (will be updated again with claimed list below)
 			update_cached_drops_data(fp, progress_map)
 
@@ -2925,12 +3349,23 @@ async def run_drops_workflow(context, test_mode=False):
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
 					continue
-				# Find matching inventory entry and its percent
+				# Find matching inventory entry and its percent using intelligent matching
 				match_pct = None
+				# First try exact substring match (original behavior)
 				for t_lower, pct in inventory_entries:
 					if name_lower in t_lower and isinstance(pct, int):
 						match_pct = pct
 						break
+				
+				# If no exact match, try intelligent matching
+				if match_pct is None:
+					# Convert inventory_entries back to dict format for intelligent matching
+					inventory_dict = {title: pct for title, pct in inventory_entries if isinstance(pct, int)}
+					intelligent_pct, intelligent_title = intelligent_streamer_matching(name, inventory_dict)
+					if intelligent_pct is not None:
+						match_pct = intelligent_pct
+						logging.info(f"Found intelligent match for '{name}': {intelligent_title} ({intelligent_pct}%)")
+				
 				emit_debug(f"[candidates] {name}: inventory match_pct={match_pct}")
 				
 				# If match_pct is None, it means the drop hasn't started yet (not on Twitch inventory)

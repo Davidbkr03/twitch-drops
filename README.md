@@ -71,7 +71,7 @@ playwright install
 
 5) First run:
 ```sh
-python twitch_drop_automator.py
+python main.py
 ```
 Log into Twitch in the opened browser once. Your session will persist.
 
@@ -96,7 +96,7 @@ playwright install
 4) Run it:
 
 ```bash
-python3 twitch_drop_automator.py
+python3 main.py
 ```
 
 Optional helper script:
