@@ -2682,7 +2682,7 @@ async def poll_until_title_complete(context, inv_page, target_title_substr: str)
 			# Early claim if present
 			await inv_page.wait_for_timeout(400)
 			try:
-				if await inv_page.query_selector('button:has-text("Claim")'):
+				if await inv_page.query_selector('button:has-text("Claim Now")') or await inv_page.query_selector('button:has-text("Claim")'):
 					c = await claim_available_rewards(inv_page, navigate=False)
 					if c > 0:
 						return True
@@ -2782,7 +2782,7 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			# Early claim if present
 			await inv_page.wait_for_timeout(400)
 			try:
-				if await inv_page.query_selector('button:has-text("Claim")'):
+				if await inv_page.query_selector('button:has-text("Claim Now")') or await inv_page.query_selector('button:has-text("Claim")'):
 					c = await claim_available_rewards(inv_page, navigate=False)
 					if c > 0:
 						return (True, False)
