@@ -2486,200 +2486,34 @@ async def recover_browser_context(p, current_context=None):
 		return None, None
 
 async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
-	"""Click all visible 'Claim Now' buttons on the inventory page.
+	"""Click all visible 'Claim' buttons on the inventory page.
 
 	Returns the number of claims clicked. When navigate=False, assumes caller is already on the inventory page.
 	"""
 	claimed = 0
 	try:
-		# Check if browser context is still valid
-		if inv_page.is_closed():
-			logging.warning("Inventory page is closed, cannot claim rewards")
-			return -1  # Return -1 to indicate browser context issue
-		
-		# Check if browser context is still responsive
-		try:
-			context = inv_page.context
-			if not await is_browser_context_valid(context):
-				logging.warning("Browser context is not responsive, cannot claim rewards")
-				return -1
-		except Exception:
-			logging.warning("Cannot access browser context, cannot claim rewards")
-			return -1
-		
 		if navigate:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
 			await inv_page.wait_for_timeout(500)
 		
-		# Multiple selector strategies for robustness
-		claim_selectors = [
-			# XPath to find a button containing a div with the exact text "Claim Now". Using normalize-space to be robust against whitespace.
-			'xpath=//button[.//div[normalize-space()="Claim Now"]]',
-			# A more specific version of the above, targeting the data-a-target attribute.
-			'xpath=//button[.//div[@data-a-target="tw-core-button-label-text" and normalize-space()="Claim Now"]]',
-			# The original Playwright CSS selectors which might still work.
-			'button:has-text("Claim Now")',
-			'button.ScCoreButton-sc-ocjdkq-0:has-text("Claim Now")',
-			'button:has([data-a-target="tw-core-button-label-text"]:has-text("Claim Now"))',
-			'button:has-text("Claim")',  # Fallback for older versions
-		]
-		
-		claim_buttons = []
-		for selector in claim_selectors:
-			try:
-				buttons = await inv_page.query_selector_all(selector)
-				if buttons:
-					claim_buttons = buttons
-					logging.debug(f"Found {len(buttons)} claim buttons using selector: {selector}")
-					break
-			except Exception as e:
-				logging.debug(f"Selector '{selector}' failed: {e}")
-				continue
-		
-		if not claim_buttons:
-			# Fallback: find buttons within cards that have a 100% progress bar, regardless of label text
-			fallback_selectors = [
-				'div:has([role="progressbar"][aria-valuenow="100"]) button:has-text("Claim Now")',
-				'div:has([role="progressbar"][aria-valuenow="100"]) button:has-text("Claim")',
-				'div:has([role="progressbar"][aria-valuenow="100"]) button:not([disabled])',
-			]
-			for selector in fallback_selectors:
-				try:
-					buttons = await inv_page.query_selector_all(selector)
-					if buttons:
-						claim_buttons = buttons
-						logging.debug(f"Fallback found {len(buttons)} claim buttons using selector: {selector}")
-						break
-				except Exception as e:
-					logging.debug(f"Fallback selector '{selector}' failed: {e}")
-					continue
-			if not claim_buttons:
-				logging.debug("No claim buttons found on inventory page (including fallbacks)")
-				return 0
-		
-		# Robust click helper defined inline to avoid broader refactor
-		async def _robust_click_and_confirm(page, element) -> bool:
-			# Returns True if the click likely succeeded (element disappears, disables, or text changes)
-			async def _confirmed() -> bool:
-				try:
-					return await page.evaluate(
-						"""
-						(el) => {
-						  if (!el) return true;
-						  if (!document.contains(el)) return true;
-						  const t = (el.textContent || '').toLowerCase();
-						  if (el.hasAttribute('disabled')) return true;
-						  if (t.includes('awarded') || t.includes('claimed')) return true;
-						  return false;
-						}
-						""",
-						element
-					)
-				except Exception:
-					return False
-
-			# 0) ensure in view
-			try:
-				await element.scroll_into_view_if_needed()
-			except Exception:
-				pass
-
-			# 1) normal click
-			try:
-				await element.click()
-				try:
-					ok = await page.wait_for_function("el => !el || !document.contains(el) || el.hasAttribute('disabled')", element, timeout=2000)
-				except Exception:
-					ok = await _confirmed()
-				return bool(ok)
-			except Exception:
-				pass
-
-			# 2) force click
-			try:
-				await element.click(force=True)
-				try:
-					ok = await page.wait_for_function("el => !el || !document.contains(el) || el.hasAttribute('disabled')", element, timeout=2000)
-				except Exception:
-					ok = await _confirmed()
-				return bool(ok)
-			except Exception:
-				pass
-
-			# 3) JS click
-			try:
-				await page.evaluate("el => el && el.click()", element)
-				ok = await _confirmed()
-				return bool(ok)
-			except Exception:
-				pass
-
-			# 4) Mouse click by bounding box
-			try:
-				box = await element.bounding_box()
-				if box:
-					x = box['x'] + box['width'] / 2
-					y = box['y'] + box['height'] / 2
-					await page.mouse.move(x, y)
-					await page.mouse.click(x, y)
-					ok = await _confirmed()
-					return bool(ok)
-			except Exception:
-				pass
-
-			# 5) Click nearest ancestor button
-			try:
-				ancestor = await element.evaluate_handle("el => { let n = el; for (let i=0; i<5 && n; i++) { if (n.tagName === 'BUTTON') return n; n = n.parentElement; } return null; }")
-				anc_el = ancestor.as_element() if ancestor else None
-				if anc_el:
-					try:
-						await anc_el.click(force=True)
-						ok = await _confirmed()
-						return bool(ok)
-					except Exception:
-						pass
-			except Exception:
-				pass
-
-			# 6) Keyboard fallback (focus then Enter/Space)
-			try:
-				await element.focus()
-				await page.keyboard.press("Enter")
-				await page.wait_for_timeout(150)
-				await page.keyboard.press("Space")
-				ok = await _confirmed()
-				return bool(ok)
-			except Exception:
-				pass
-
-			return False
-
+		claim_buttons = await inv_page.query_selector_all('button:has-text("Claim"), button:has-text("Claim Now")')
 		for btn in claim_buttons:
 			try:
-				if not await btn.is_enabled():
-					continue
-				ok = await _robust_click_and_confirm(inv_page, btn)
-				if ok:
-					claimed += 1
-					logging.info("Claimed a reward")
-					await asyncio.sleep(0.5)
-				else:
-					logging.warning("Claim button click did not confirm; proceeding to next")
-			except Exception as e:
-				logging.warning(f"Failed to click claim button: {e}")
+				await btn.click()
+				claimed += 1
+				logging.info("Claimed a reward")
+				await asyncio.sleep(0.5)
+			except Exception:
 				continue
-				
-	except Exception as e:
-		# Check if it's a browser context closure issue
-		if "Target page, context or browser has been closed" in str(e) or "TargetClosedError" in str(e):
-			logging.error("Browser context closed during claim operation")
-			return -1  # Return -1 to indicate browser context issue
-		else:
-			logging.error(f"Unexpected error during claim operation: {e}")
-			return -1  # Return -1 to indicate error
-	
+	except Exception:
+		pass
 	return claimed
+
+async def watch_streamer(stream_page, inv_page, streamer_name: str):
+	"""Watch a streamer and periodically check inventory for drop progress until 100% or exit."""
+	url = stream_page.url
+	logging.info(f"Watching stream: {url}")
 
 async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 	total_wait_seconds = MAX_WATCH_HOURS_PER_REWARD * 3600
@@ -2989,15 +2823,14 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 				if name_lower in completed_streamers:
 					continue
 				# If we haven't already completed this streamer drop historically, switch now
-				try:
-					days = await get_claimed_days_for_streamer(inv_page, name)
-				except Exception:
-					days = None
+				days = is_streamer_recently_claimed(name)
 				if days is not None:
 					# Already claimed previously; skip
+					completed_streamers.add(name_lower)
 					continue
-				# Found a live streamer whose drop has not been claimed yet → switch
-				logging.info(f"Streamer-specific drop available again: {name}. Switching from general mode.")
+
+				logging.info(f"Switching to streamer-specific drop: {name} ({st.get('item')})")
+				await inv_page.close()
 				return (False, True)
 
 			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
