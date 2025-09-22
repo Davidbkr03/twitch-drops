@@ -62,6 +62,7 @@ TEST_MODE = False  # Set to True to keep browser open for testing
 
 # Persisted preferences/config
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
+STREAMER_MAPPINGS_PATH = os.path.join(BASE_DIR, 'streamer_mappings.json')
 CONFIG_LOCK = threading.RLock()
 EXIT_EVENT = threading.Event()
 
@@ -693,6 +694,19 @@ def load_preferences():
 	except Exception as e:
 		logging.debug(f"Could not load preferences: {e}")
 	return default_prefs
+
+
+def load_streamer_mappings():
+	"""Load streamer name mappings from the separate mappings file."""
+	try:
+		if os.path.exists(STREAMER_MAPPINGS_PATH):
+			with open(STREAMER_MAPPINGS_PATH, 'r', encoding='utf-8') as f:
+				data = json.load(f)
+				if isinstance(data, dict):
+					return data
+	except Exception as e:
+		logging.debug(f"Could not load streamer mappings: {e}")
+	return {}
 
 
 def save_preferences(prefs):
@@ -2543,10 +2557,9 @@ def generate_search_variations(base_name: str) -> list[str]:
 		return []
 	variations = [name]
 	
-	# Add custom name mappings from config
+	# Add custom name mappings from separate mappings file
 	try:
-		with CONFIG_LOCK:
-			mappings = PREFERENCES.get("streamer_name_mappings", {})
+		mappings = load_streamer_mappings()
 		if name in mappings:
 			mapped_name = mappings[name].lower()
 			if mapped_name not in variations:
