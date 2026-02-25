@@ -201,6 +201,197 @@
             font-size: 1.5rem;
         }
 
+        .header-subtitle-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .status-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            padding: 5px 10px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.18);
+            border: 1px solid rgba(255, 255, 255, 0.28);
+        }
+
+        .login-helper-card {
+            border-top: 4px solid #7c4dff;
+        }
+
+        .login-state-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 14px;
+            flex-wrap: wrap;
+        }
+
+        .login-state-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            border: 1px solid transparent;
+        }
+
+        .login-state-pill.logged-in {
+            color: #1b5e20;
+            background: #e8f5e9;
+            border-color: #b9e0be;
+        }
+
+        .login-state-pill.awaiting-login,
+        .login-state-pill.pending-restart {
+            color: #7b4f00;
+            background: #fff8e1;
+            border-color: #ffe08a;
+        }
+
+        .login-state-pill.error {
+            color: #b71c1c;
+            background: #ffebee;
+            border-color: #ffcdd2;
+        }
+
+        .login-state-pill.starting {
+            color: #1e3a8a;
+            background: #e8edff;
+            border-color: #c3d0ff;
+        }
+
+        .login-state-pill.unknown {
+            color: #374151;
+            background: #f3f4f6;
+            border-color: #e5e7eb;
+        }
+
+        .login-state-message {
+            color: #4b5563;
+            font-size: 0.95rem;
+        }
+
+        .login-steps {
+            margin: 0 0 14px 18px;
+            color: #4b5563;
+            display: grid;
+            gap: 6px;
+            font-size: 0.92rem;
+        }
+
+        .compact-controls {
+            margin-top: 0;
+            gap: 10px;
+        }
+
+        .compact-controls .btn {
+            padding: 10px 14px;
+            font-size: 0.92rem;
+        }
+
+        .games-discovery {
+            grid-column: 1 / -1;
+            border-top: 4px solid #22c55e;
+        }
+
+        .games-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .games-meta {
+            color: #6b7280;
+            font-size: 0.9rem;
+            margin-bottom: 14px;
+        }
+
+        .games-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+            gap: 12px;
+        }
+
+        .game-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            padding: 12px;
+            background: #f8fafc;
+            display: grid;
+            gap: 8px;
+        }
+
+        .game-title-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .game-title {
+            font-weight: 700;
+            color: #1f2937;
+            font-size: 0.95rem;
+            line-height: 1.3;
+        }
+
+        .game-count {
+            font-size: 0.8rem;
+            font-weight: 700;
+            color: #14532d;
+            background: #dcfce7;
+            border: 1px solid #bbf7d0;
+            padding: 3px 8px;
+            border-radius: 999px;
+            white-space: nowrap;
+        }
+
+        .game-link {
+            color: #4f46e5;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.88rem;
+        }
+
+        .game-link:hover {
+            text-decoration: underline;
+        }
+
+        .game-streamers {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .game-streamer-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 8px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #475569;
+            background: white;
+            border: 1px solid #e2e8f0;
+        }
+
+        .game-viewers {
+            color: #64748b;
+            font-size: 0.78rem;
+        }
+
         .status-indicator {
             display: inline-block;
             width: 12px;
@@ -845,7 +1036,10 @@
             <div class="header-content">
                 <div class="header-left">
                     <h1>🎮 Twitch Drop Automator</h1>
-                    <p>Monitor and control your Twitch drop farming</p>
+                    <div class="header-subtitle-row">
+                        <p>Discover drop-enabled games and track campaign progress</p>
+                        <span class="status-chip" id="heroLoginChip">Login: checking...</span>
+                    </div>
                 </div>
                 <div class="header-right">
                     <div class="dropdown">
@@ -896,6 +1090,28 @@
                         <div class="info-label">Integrity</div>
                         <div class="info-value"><span id="integrityStatusText">Unknown</span></div>
                     </div>
+                    <div class="info-item">
+                        <div class="info-label">Login State</div>
+                        <div class="info-value" id="statusLoginState">Checking...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card login-helper-card">
+                <h2>🔐 Twitch Login Assistant</h2>
+                <div class="login-state-row">
+                    <span class="login-state-pill unknown" id="loginStatePill">Unknown</span>
+                    <span class="login-state-message" id="loginStateMessage">Checking current login state...</span>
+                </div>
+                <ol class="login-steps">
+                    <li>Click <strong>Start Guided Login</strong> to switch to visible-browser mode.</li>
+                    <li>After restart, complete Twitch sign-in in the opened browser window.</li>
+                    <li>Click <strong>Restore Normal Mode</strong> when login is complete.</li>
+                </ol>
+                <div class="controls compact-controls">
+                    <button class="btn btn-primary" onclick="enableGuidedLoginMode()">🧭 Start Guided Login</button>
+                    <button class="btn btn-secondary" onclick="restoreNormalMode()">✅ Restore Normal Mode</button>
+                    <button class="btn btn-secondary" onclick="refreshLoginStatus()">🔄 Check Login</button>
                 </div>
             </div>
 
@@ -976,6 +1192,20 @@
                 </div>
             </div>
 
+            <div class="card games-discovery">
+                <div class="games-header">
+                    <h2>🕹️ Drop-Enabled Games</h2>
+                    <span class="section-count" id="gamesCount">0</span>
+                </div>
+                <div class="games-meta" id="gamesMeta">Scraping Twitch directory for games with active drops...</div>
+                <div class="controls compact-controls">
+                    <button class="btn btn-secondary" onclick="refreshGames()">🔄 Refresh Games</button>
+                </div>
+                <div class="games-grid" id="gamesGrid">
+                    <div class="no-drops">No game data yet. Click refresh to scrape current campaigns.</div>
+                </div>
+            </div>
+
             <div class="card">
                 <h2>⚙️ Settings</h2>
                 <div class="settings-grid">
@@ -1044,6 +1274,8 @@
         const socket = io();
         let screenshotCount = 0;
         let startTime = Date.now();
+        let gamesData = null;
+        let loginStatusData = null;
 
         // Connection status
         socket.on('connect', function() {
@@ -1081,6 +1313,12 @@
 
         socket.on('drops_error', function(data) {
             addLogEntry('Drops update error: ' + data.error, 'error');
+        });
+
+        socket.on('games_update', function(data) {
+            gamesData = data;
+            updateGamesDisplay(data);
+            addLogEntry('Game discovery cache updated', 'info');
         });
 
         // Screenshot updates
@@ -1123,6 +1361,18 @@
             indicator.className = `status-indicator ${className}`;
         }
 
+        function formatLoginState(state, loggedIn) {
+            if (loggedIn) return 'Logged in';
+            if (!state) return 'Unknown';
+            return state.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        }
+
+        function updateHeroLoginChip(loggedIn, state) {
+            const chip = document.getElementById('heroLoginChip');
+            if (!chip) return;
+            chip.textContent = `Login: ${formatLoginState(state, loggedIn)}`;
+        }
+
         // Add log entry
         function addLogEntry(message, level) {
             const logContainer = document.getElementById('logContainer');
@@ -1147,6 +1397,8 @@
                     if (data.version) {
                         document.getElementById('appVersion').textContent = data.version;
                     }
+                    document.getElementById('statusLoginState').textContent = formatLoginState(data.login_state, Boolean(data.logged_in));
+                    updateHeroLoginChip(Boolean(data.logged_in), data.login_state);
                     // Integrity from status
                     updateIntegrityUI(data.integrity_valid, data.integrity_age_seconds);
                     addLogEntry('Status refreshed', 'info');
@@ -1275,6 +1527,173 @@
             .catch(error => {
                 addLogEntry(`Error updating ${setting}: ${error}`, 'error');
             });
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function updateLoginStatusUI(data) {
+            if (!data) return;
+            loginStatusData = data;
+            const state = (data.state || 'unknown').toLowerCase();
+            const loggedIn = Boolean(data.logged_in);
+            const label = formatLoginState(state, loggedIn);
+            const pill = document.getElementById('loginStatePill');
+            const message = document.getElementById('loginStateMessage');
+            const statusLabel = document.getElementById('statusLoginState');
+
+            const stateClass = loggedIn ? 'logged-in' : (state.replace(/[^a-z-]/g, '-') || 'unknown');
+            pill.className = `login-state-pill ${stateClass}`;
+            pill.textContent = label;
+
+            let text = data.message || 'No login details available.';
+            if (!loggedIn && data.needs_visible_browser) {
+                text += ' (Headless is enabled; guided mode recommended.)';
+            }
+            message.textContent = text;
+            statusLabel.textContent = label;
+            updateHeroLoginChip(loggedIn, state);
+        }
+
+        function refreshLoginStatus() {
+            fetch('/api/login-status')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        throw new Error(data.error);
+                    }
+                    updateLoginStatusUI(data);
+                })
+                .catch(error => {
+                    addLogEntry('Failed to refresh login status: ' + error, 'warning');
+                });
+        }
+
+        async function setLoginMode(mode) {
+            const modeLabel = mode === 'guided' ? 'guided login mode' : 'normal mode';
+            try {
+                const response = await fetch('/api/login/mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode })
+                });
+                const result = await response.json();
+                if (!result.success) {
+                    throw new Error(result.message || 'Failed to update login mode');
+                }
+                addLogEntry(`Switched to ${modeLabel}. Restarting...`, 'info');
+                updateLoginStatusUI({
+                    state: 'pending_restart',
+                    logged_in: false,
+                    message: `Switched to ${modeLabel}. Restarting application...`,
+                    needs_visible_browser: mode === 'guided'
+                });
+                applySettings();
+            } catch (error) {
+                addLogEntry(`Failed to switch ${modeLabel}: ${error}`, 'error');
+            }
+        }
+
+        function enableGuidedLoginMode() {
+            setLoginMode('guided');
+        }
+
+        function restoreNormalMode() {
+            setLoginMode('normal');
+        }
+
+        function createGameCard(game) {
+            const gameName = escapeHtml(game.game || 'Unknown Game');
+            const gameUrl = game.game_url || '';
+            const activeChannels = Number(game.active_channels || 0);
+            const streamers = (game.sample_streamers || []).slice(0, 4);
+            const viewerSamples = (game.viewer_samples || []).slice(0, 2);
+            const streamersHtml = streamers.length
+                ? `<div class="game-streamers">${streamers.map(name => `<span class="game-streamer-chip">${escapeHtml(name)}</span>`).join('')}</div>`
+                : '<div class="game-viewers">No sampled streamer names</div>';
+            const viewersHtml = viewerSamples.length
+                ? `<div class="game-viewers">Viewer samples: ${viewerSamples.map(escapeHtml).join(' • ')}</div>`
+                : '<div class="game-viewers">Viewer samples unavailable</div>';
+            const linkHtml = gameUrl
+                ? `<a class="game-link" href="${escapeHtml(gameUrl)}" target="_blank" rel="noopener noreferrer">Open category</a>`
+                : '<span class="game-viewers">No category link</span>';
+            return `
+                <div class="game-card">
+                    <div class="game-title-row">
+                        <div class="game-title">${gameName}</div>
+                        <span class="game-count">${activeChannels} channel${activeChannels === 1 ? '' : 's'}</span>
+                    </div>
+                    ${linkHtml}
+                    ${streamersHtml}
+                    ${viewersHtml}
+                </div>
+            `;
+        }
+
+        function updateGamesDisplay(data) {
+            const games = (data && Array.isArray(data.games)) ? data.games : [];
+            const gamesGrid = document.getElementById('gamesGrid');
+            const gamesCount = document.getElementById('gamesCount');
+            const gamesMeta = document.getElementById('gamesMeta');
+            gamesCount.textContent = games.length;
+
+            if (data && data.error) {
+                gamesMeta.textContent = `Last scrape failed: ${data.error}`;
+            } else if (data && data.last_updated) {
+                const ts = new Date(data.last_updated);
+                gamesMeta.textContent = `Source: Twitch drops-enabled directory • Updated ${ts.toLocaleTimeString()}`;
+            } else {
+                gamesMeta.textContent = 'Source: Twitch drops-enabled directory';
+            }
+
+            if (!games.length) {
+                gamesGrid.innerHTML = '<div class="no-drops">No drop-enabled games found in cache.</div>';
+                return;
+            }
+            gamesGrid.innerHTML = games.slice(0, 24).map(createGameCard).join('');
+        }
+
+        function fetchGamesData() {
+            fetch('/api/games')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        throw new Error(data.error);
+                    }
+                    gamesData = data;
+                    updateGamesDisplay(data);
+                })
+                .catch(error => {
+                    addLogEntry('Failed to fetch game discovery data: ' + error, 'warning');
+                });
+        }
+
+        async function refreshGames() {
+            const meta = document.getElementById('gamesMeta');
+            const previous = meta.textContent;
+            meta.textContent = 'Refreshing games list...';
+            try {
+                const response = await fetch('/api/games/refresh', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    signal: AbortSignal.timeout(120000)
+                });
+                const result = await response.json();
+                if (!result.success) {
+                    throw new Error(result.message || 'refresh failed');
+                }
+                addLogEntry(`Refreshed game list (${result.count} games)`, 'success');
+                fetchGamesData();
+            } catch (error) {
+                meta.textContent = previous;
+                addLogEntry('Failed to refresh game discovery: ' + error, 'error');
+            }
         }
 
         // Dropdown toggle
@@ -1863,8 +2282,12 @@
         // Initial status fetch and settings load
         refreshStatus();
         loadSettings();
+        refreshLoginStatus();
+        fetchGamesData();
         startDropsUpdates();
         startHeartbeat();
+        setInterval(refreshLoginStatus, 30000);
+        setInterval(fetchGamesData, 120000);
     </script>
 </body>
 </html>
