@@ -142,7 +142,9 @@
   socket.on('automation_status', function(s) {
     running = s.running;
     statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
-    statusMsg.textContent = s.message || (running ? 'Running' : 'Stopped');
+    var msg = s.message || (running ? 'Running' : 'Stopped');
+    statusMsg.textContent = msg;
+    statusMsg.className = 'status-text' + (msg.indexOf('2FA') >= 0 || msg.indexOf('verification') >= 0 ? ' status-alert' : '');
     startBtn.disabled = running;
     stopBtn.disabled  = !running;
 

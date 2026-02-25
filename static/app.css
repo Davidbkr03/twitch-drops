@@ -64,6 +64,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .status-dot{width:10px;height:10px;border-radius:50%;background:#555;display:inline-block}
 .status-dot.on{background:var(--success)}.status-dot.off{background:#555}
 .status-text{font-size:.9rem;color:var(--muted)}
+.status-alert{color:var(--warning);font-weight:600}
 .watch-time{font-size:.82rem;color:var(--primary);font-weight:600}
 
 .dash-grid{display:grid;grid-template-columns:1fr 340px;gap:1rem}
