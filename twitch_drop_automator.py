@@ -134,12 +134,18 @@ def get_login_status_snapshot() -> dict:
 	with login_status_lock:
 		return dict(cached_login_status)
 
-def update_cached_games_data(games: list[dict] | None = None, source: str = "twitch_directory", error: str | None = None):
+def update_cached_games_data(
+	games: list[dict] | None = None,
+	source: str = "twitch_directory",
+	error: str | None = None,
+	keep_existing_on_empty: bool = True
+):
 	"""Update game discovery cache and push to dashboard clients."""
 	global cached_games_data
 	with games_data_lock:
 		if games is not None:
-			cached_games_data["games"] = list(games)
+			if games or not keep_existing_on_empty or not cached_games_data.get("games"):
+				cached_games_data["games"] = list(games)
 			cached_games_data["source"] = source
 		cached_games_data["error"] = error
 		cached_games_data["last_updated"] = datetime.now().isoformat()
