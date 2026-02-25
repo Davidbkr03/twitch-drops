@@ -4,34 +4,55 @@
 
 ### Overview
 
-This is a **Twitch Drop Automator** — a single-file Python application (`twitch_drop_automator.py`) that uses Playwright to automate watching Twitch streams and claiming in-game drops. It includes a Flask + Socket.IO web dashboard on `localhost:5000`.
+This is a **Twitch Drop Automator** — a multi-user web application that automates watching Twitch streams to earn in-game drops. It runs as a Docker Compose stack with:
+- **App container**: Python/Flask with Playwright browser automation and CDP screencast
+- **PostgreSQL container**: Stores user accounts, settings, and drop history
 
-There are no automated tests, linter configs, or build steps in this repository.
+### Running with Docker (recommended)
 
-### Running the application
+Single command to start everything:
 
 ```bash
-source /workspace/venv/bin/activate
-python twitch_drop_automator.py --no-tray --test
+docker compose up -d
 ```
 
-- `--no-tray`: Required in headless/server environments (no display server for pystray).
-- `--test`: Keeps the browser open for screenshot testing via the web dashboard.
-- `--no-web`: Disables the Flask web interface (rarely needed).
-- The app defaults to headless browser mode via `config.json` (`"headless": true`).
+The app runs at `http://localhost:5000`. Users register/login individually, each getting isolated browser sessions.
 
-### Key endpoints
+To rebuild after code changes:
 
-- `GET /` — Web dashboard UI
-- `GET /api/status` — Application status JSON
-- `GET /api/settings` — Current settings
-- `POST /api/settings` — Update settings (JSON body with keys like `headless`, `test_mode`, `debug_mode`)
+```bash
+docker compose up -d --build
+```
+
+### Running without Docker (legacy single-user mode)
+
+The original `twitch_drop_automator.py` still works standalone. See `README.md` for setup instructions. Use `--no-tray` and `--test` flags in headless environments.
+
+### Architecture
+
+- `app/` — Flask package (multi-user mode): auth, routes, models, automator, extensions
+- `run.py` — Entry point for Docker/multi-user mode
+- `twitch_drop_automator.py` — Original single-user monolith (still functional)
+- `docker-compose.yml` — App + PostgreSQL
+- `Dockerfile` — Python 3.12 + Playwright Chromium
+
+### Key API endpoints (multi-user mode)
+
+- `GET /` — Dashboard (requires auth)
+- `POST /api/start` — Start per-user automation
+- `POST /api/stop` — Stop automation
+- `GET /api/status` — Current automation status
+- `GET|POST /api/settings` — User settings
+- `GET /api/drops` — Drop history
+
+### Screencast
+
+Uses Chrome DevTools Protocol `Page.startScreencast` instead of periodic screenshots. Frames are streamed via Socket.IO to the dashboard canvas. Users can click/type in the preview to interact with the browser (needed for Twitch login).
 
 ### Gotchas
 
-- The app uses `BROWSER_CHANNEL = "chrome"` by default but falls back to Playwright's bundled Chromium if Chrome is unavailable. Google Chrome is pre-installed in the Cloud VM.
-- `python3.12-venv` must be installed via apt before creating the virtual environment (`sudo apt-get install -y python3.12-venv`). This is a one-time system setup already done.
-- Playwright browsers must be installed after pip dependencies: `playwright install --with-deps chromium`.
-- The application will attempt to connect to Twitch on startup. Without a logged-in Twitch session, it will hit the login page and loop. The web dashboard remains fully functional regardless.
-- Logs are written to `drops_log.txt` in the project root.
-- Configuration is stored in `config.json` (auto-created on first run).
+- Docker requires the `fuse-overlayfs` storage driver and `iptables-legacy` in Cloud VM environments (already configured).
+- Each user's Playwright browser data is stored at `/data/browser/<user_id>` inside the container (persisted via Docker volume).
+- The PostgreSQL data persists via the `postgres_data` Docker volume.
+- After `docker compose down`, data is retained in volumes. Use `docker compose down -v` to wipe.
+- The app uses `async_mode='threading'` for Flask-SocketIO to bridge async Playwright with sync Flask.
