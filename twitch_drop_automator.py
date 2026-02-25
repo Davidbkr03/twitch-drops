@@ -2834,7 +2834,7 @@ async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limi
 	else:
 		await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
 	await maybe_accept_cookies(page)
-	await page.wait_for_timeout(1200)
+	await page.wait_for_timeout(2500)
 	rows = await page.evaluate(
 		r"""
 		(args) => {
@@ -2842,7 +2842,11 @@ async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limi
 		  const out = [];
 		  const cards = Array.from(document.querySelectorAll('article')).slice(0, maxCards);
 		  for (const card of cards) {
-			const streamerAnchor = card.querySelector('a[data-a-target="preview-card-title-link"]');
+			const streamerAnchor = card.querySelector('a[data-a-target="preview-card-title-link"], a[data-a-target="preview-card-image-link"]')
+			  || Array.from(card.querySelectorAll('a[href^="/"]')).find(a => {
+				const hrefCandidate = (a.getAttribute('href') || '').trim();
+				return /^\/[a-z0-9_]+(?:\?|$)/i.test(hrefCandidate);
+			  });
 			if (!streamerAnchor) continue;
 			const href = (streamerAnchor.getAttribute('href') || '').trim();
 			if (!href) continue;
