@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone
 
 from playwright.async_api import async_playwright
-from playwright_stealth import Stealth, ALL_EVASIONS_DISABLED_KWARGS
+from playwright_stealth import Stealth
 
 logger = logging.getLogger(__name__)
 
@@ -222,9 +222,8 @@ class UserAutomator:
             )
             self.context = await p.chromium.launch_persistent_context(**launch_kwargs)
 
-        # Stealth — navigator.webdriver override
-        stealth_kwargs = {**ALL_EVASIONS_DISABLED_KWARGS, "navigator_webdriver": True}
-        stealth = Stealth(init_scripts_only=True, **stealth_kwargs)
+        # Stealth — navigator.webdriver override only
+        stealth = Stealth(init_scripts_only=True, navigator_webdriver=True)
         await stealth.apply_stealth_async(self.context)
 
         try:
@@ -456,9 +455,7 @@ class UserAutomator:
             menu = await self.page.query_selector(
                 '[data-a-target="user-menu-toggle"]'
             )
-            if menu:
-                return True
-            return "twitch.tv/drops/inventory" in url and "/login" not in url
+            return menu is not None
         except Exception:
             return False
 
