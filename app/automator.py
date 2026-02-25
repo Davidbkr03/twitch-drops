@@ -16,11 +16,6 @@ TWITCH_INVENTORY_URL = "https://www.twitch.tv/drops/inventory"
 TWITCH_RUST_DIRECTORY_URL = "https://www.twitch.tv/directory/game/Rust"
 TWITCH_LOGIN_URL = "https://www.twitch.tv/login"
 
-CHROME_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-features=BlockThirdPartyCookies,CookieDeprecationMessages",
@@ -192,13 +187,14 @@ class UserAutomator:
     # ------------------------------------------------------------------
 
     async def _launch_browser(self, p):
+        # Run in HEADED mode on Xvfb virtual display.
+        # This completely avoids Twitch's headless browser fingerprinting.
         launch_kwargs = dict(
             user_data_dir=self.data_dir,
-            headless=True,
+            headless=False,
             slow_mo=50,
             ignore_default_args=["--enable-automation"],
             args=BROWSER_ARGS,
-            user_agent=CHROME_USER_AGENT,
             viewport=VIEWPORT,
             locale="en-US",
         )
@@ -207,7 +203,7 @@ class UserAutomator:
             self.context = await p.chromium.launch_persistent_context(
                 channel="chrome", **launch_kwargs
             )
-            logger.info("User %s: launched with Google Chrome channel", self.user_id)
+            logger.info("User %s: launched with Google Chrome (headed on Xvfb)", self.user_id)
         except Exception as e:
             logger.warning(
                 "User %s: Chrome channel failed (%s), falling back to Chromium",
@@ -215,18 +211,15 @@ class UserAutomator:
             )
             self.context = await p.chromium.launch_persistent_context(**launch_kwargs)
 
-        # Full stealth — patches webdriver, plugins, languages, WebGL, etc.
-        stealth = Stealth(init_scripts_only=True)
+        # Stealth — navigator.webdriver override
+        stealth_kwargs = {**ALL_EVASIONS_DISABLED_KWARGS, "navigator_webdriver": True}
+        stealth = Stealth(init_scripts_only=True, **stealth_kwargs)
         await stealth.apply_stealth_async(self.context)
 
-        # Extra webdriver override
         try:
             await self.context.add_init_script(
                 """(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+                    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch(e){}
                 })();"""
             )
         except Exception:
