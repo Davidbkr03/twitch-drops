@@ -149,3 +149,21 @@ def on_browser_input(data):
         asyncio.run_coroutine_threadsafe(
             automator.handle_input(data), automator._loop
         )
+
+
+@socketio.on("twitch_login")
+def on_twitch_login(data):
+    if not current_user.is_authenticated:
+        return
+    mgr = AutomationManager.get()
+    if not mgr:
+        return
+    automator = mgr.get_automator(current_user.id)
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return
+    if automator and automator._loop and automator._loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            automator.auto_login(username, password), automator._loop
+        )
