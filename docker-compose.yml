@@ -1,0 +1,34 @@
+services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=postgresql://twitch:twitch@db:5432/twitch_drops
+      - SECRET_KEY=change-this-to-a-random-secret
+      - DATA_DIR=/data
+    volumes:
+      - browser_data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=twitch
+      - POSTGRES_PASSWORD=twitch
+      - POSTGRES_DB=twitch_drops
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twitch"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  browser_data:

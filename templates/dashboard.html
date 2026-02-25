@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Twitch Drop Automator{% endblock %}
+
+{% block head %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+
+  <!-- Top controls -->
+  <section class="dash-toolbar">
+    <div class="toolbar-left">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-text" id="statusMsg">Connecting…</span>
+    </div>
+    <div class="toolbar-right">
+      <button class="btn btn-success" id="startBtn" onclick="doStart()">▶ Start</button>
+      <button class="btn btn-danger"  id="stopBtn"  onclick="doStop()" disabled>■ Stop</button>
+    </div>
+  </section>
+
+  <div class="dash-grid">
+
+    <!-- Screencast panel -->
+    <section class="card card-screencast">
+      <div class="card-header">
+        <h2>Browser Preview</h2>
+        <span class="badge" id="streamBadge" style="display:none"></span>
+      </div>
+      <div class="screencast-wrap" id="screencastWrap">
+        <canvas id="screencast" tabindex="1"></canvas>
+        <div class="sc-overlay" id="scOverlay">
+          <p>Press <strong>Start</strong> to begin automation.<br>
+          You can interact with the browser here to log in to Twitch.</p>
+        </div>
+      </div>
+      <p class="hint">Click inside the preview to interact. Focus it to type.</p>
+    </section>
+
+    <!-- Side panel -->
+    <aside class="side-panel">
+
+      <!-- Drops -->
+      <section class="card">
+        <div class="card-header"><h2>Drops</h2></div>
+        <div class="card-body" id="dropsBody">
+          <p class="empty">No drop data yet.</p>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section class="card">
+        <div class="card-header"><h2>Settings</h2></div>
+        <div class="card-body">
+          <div class="field">
+            <label><input type="checkbox" id="autoClaim" {% if settings and settings.auto_claim %}checked{% endif %}> Auto-claim drops</label>
+          </div>
+          <div class="field">
+            <label>Check interval (s)</label>
+            <input type="number" id="checkInterval" min="10" max="600"
+                   value="{{ settings.check_interval if settings else 60 }}">
+          </div>
+          <div class="field">
+            <label>Preview quality</label>
+            <select id="scQuality">
+              <option value="30" {% if settings and settings.screencast_quality == 30 %}selected{% endif %}>Low</option>
+              <option value="50" {% if not settings or settings.screencast_quality == 50 %}selected{% endif %}>Medium</option>
+              <option value="70" {% if settings and settings.screencast_quality == 70 %}selected{% endif %}>High</option>
+            </select>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="saveSettings()">Save</button>
+        </div>
+      </section>
+
+      <!-- Drop history -->
+      <section class="card">
+        <div class="card-header"><h2>History</h2></div>
+        <div class="card-body" id="historyBody">
+          <p class="empty">No history yet.</p>
+        </div>
+      </section>
+
+    </aside>
+  </div>
+</div>
+
+<script>
+(function() {
+  const socket = io();
+  const canvas = document.getElementById('screencast');
+  const ctx    = canvas.getContext('2d');
+  const overlay = document.getElementById('scOverlay');
+  const statusDot = document.getElementById('statusDot');
+  const statusMsg = document.getElementById('statusMsg');
+  const streamBadge = document.getElementById('streamBadge');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  let running = false;
+
+  /* -------- screencast frames -------- */
+  const frameImg = new Image();
+  let framePending = false;
+
+  socket.on('screencast_frame', function(d) {
+    if (framePending) return;           // skip if previous frame still decoding
+    framePending = true;
+    frameImg.onload = function() {
+      canvas.width  = frameImg.width;
+      canvas.height = frameImg.height;
+      ctx.drawImage(frameImg, 0, 0);
+      overlay.style.display = 'none';
+      framePending = false;
+    };
+    frameImg.onerror = function() { framePending = false; };
+    frameImg.src = 'data:image/jpeg;base64,' + d.data;
+  });
+
+  /* -------- status updates -------- */
+  socket.on('automation_status', function(s) {
+    running = s.running;
+    statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
+    statusMsg.textContent = s.message || (running ? 'Running' : 'Stopped');
+    startBtn.disabled = running;
+    stopBtn.disabled  = !running;
+    if (s.stream_name) {
+      streamBadge.textContent = s.stream_name;
+      streamBadge.style.display = '';
+    } else {
+      streamBadge.style.display = 'none';
+    }
+    renderDrops(s);
+  });
+
+  function renderDrops(s) {
+    var html = '';
+    if (s.drops_in_progress && s.drops_in_progress.length) {
+      s.drops_in_progress.forEach(function(d) {
+        html += '<div class="drop-row"><span class="drop-name">' +
+          esc(d.name || 'Drop') + '</span><span class="drop-pct">' +
+          (d.progress || 0) + '%</span></div>';
+      });
+    }
+    if (s.drops_claimed && s.drops_claimed.length) {
+      s.drops_claimed.forEach(function(d) {
+        html += '<div class="drop-row claimed"><span class="drop-name">✓ ' +
+          esc(d.name || 'Drop') + '</span></div>';
+      });
+    }
+    if (!html) html = '<p class="empty">No active drops.</p>';
+    document.getElementById('dropsBody').innerHTML = html;
+  }
+
+  /* -------- input forwarding -------- */
+  canvas.addEventListener('mousedown', function(e) {
+    if (!running) return;
+    canvas.focus();
+    var r = canvas.getBoundingClientRect();
+    var sx = canvas.width / r.width;
+    var sy = canvas.height / r.height;
+    socket.emit('browser_input', {
+      type: 'click',
+      x: Math.round((e.clientX - r.left) * sx),
+      y: Math.round((e.clientY - r.top)  * sy)
+    });
+  });
+
+  canvas.addEventListener('keydown', function(e) {
+    if (!running) return;
+    e.preventDefault();
+    if (e.key.length === 1) {
+      socket.emit('browser_input', { type: 'type', text: e.key });
+    } else {
+      var mapped = mapKey(e);
+      if (mapped) socket.emit('browser_input', { type: 'press', key: mapped });
+    }
+  });
+
+  canvas.addEventListener('wheel', function(e) {
+    if (!running) return;
+    e.preventDefault();
+    socket.emit('browser_input', {
+      type: 'scroll', deltaX: e.deltaX, deltaY: e.deltaY
+    });
+  }, { passive: false });
+
+  function mapKey(e) {
+    var map = {
+      'Backspace':'Backspace','Tab':'Tab','Enter':'Enter','Escape':'Escape',
+      'ArrowUp':'ArrowUp','ArrowDown':'ArrowDown','ArrowLeft':'ArrowLeft',
+      'ArrowRight':'ArrowRight','Delete':'Delete','Home':'Home','End':'End',
+      'PageUp':'PageUp','PageDown':'PageDown',' ':'Space'
+    };
+    return map[e.key] || null;
+  }
+
+  /* -------- controls -------- */
+  window.doStart = function() {
+    fetch('/api/start', { method:'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d) {
+        if (d.success) {
+          startBtn.disabled = true;
+          stopBtn.disabled = false;
+          overlay.innerHTML = '<p>Starting browser…</p>';
+        }
+      });
+  };
+  window.doStop = function() {
+    fetch('/api/stop', { method:'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d) {
+        if (d.success) {
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+          overlay.style.display = '';
+          overlay.innerHTML = '<p>Automation stopped.</p>';
+        }
+      });
+  };
+  window.saveSettings = function() {
+    fetch('/api/settings', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        auto_claim: document.getElementById('autoClaim').checked,
+        check_interval: parseInt(document.getElementById('checkInterval').value),
+        screencast_quality: parseInt(document.getElementById('scQuality').value)
+      })
+    }).then(function(r){ return r.json(); })
+      .then(function(d){ if(d.success) statusMsg.textContent='Settings saved'; });
+  };
+
+  /* -------- history -------- */
+  function loadHistory() {
+    fetch('/api/drops').then(function(r){ return r.json(); }).then(function(list) {
+      if (!list.length) return;
+      var html = '';
+      list.slice(0, 20).forEach(function(d) {
+        html += '<div class="drop-row ' + (d.status==='claimed'?'claimed':'') + '">' +
+          '<span class="drop-name">' + esc(d.name || 'Drop') + '</span>' +
+          '<span class="drop-pct">' + (d.status==='claimed'?'Claimed': (d.progress||0)+'%') + '</span></div>';
+      });
+      document.getElementById('historyBody').innerHTML = html;
+    });
+  }
+  loadHistory();
+  setInterval(loadHistory, 30000);
+
+  /* -------- init -------- */
+  fetch('/api/status').then(function(r){ return r.json(); }).then(function(s) {
+    running = s.running;
+    statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
+    statusMsg.textContent = s.message || (running ? 'Running' : 'Stopped');
+    startBtn.disabled = running;
+    stopBtn.disabled  = !running;
+    if (running) overlay.style.display = 'none';
+  });
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+})();
+</script>
+{% endblock %}

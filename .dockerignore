@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.git
+.gitignore
+drops_log.txt
+config.json
+user_data_stealth/
+*.bat
+*.ps1
+AGENTS.md
