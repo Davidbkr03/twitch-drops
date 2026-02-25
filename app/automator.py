@@ -188,8 +188,9 @@ class UserAutomator:
     # ------------------------------------------------------------------
 
     async def _launch_browser(self, p):
-        # Run in HEADED mode on Xvfb virtual display.
-        # This completely avoids Twitch's headless browser fingerprinting.
+        # Always run headed on the Xvfb virtual display provided by the
+        # container entrypoint.  Headed mode is indistinguishable from a
+        # real desktop browser, which prevents Twitch from blocking login.
 
         # Clean stale lock files from previous sessions so Chrome doesn't
         # think another instance owns this profile.
@@ -260,6 +261,19 @@ class UserAutomator:
     async def _start_screencast(self):
         if not self.page:
             return
+
+        quality = 50
+        every_nth = 3
+        try:
+            with self.app.app_context():
+                from app.models import UserSettings
+                s = UserSettings.query.filter_by(user_id=self.user_id).first()
+                if s:
+                    quality = max(10, min(100, s.screencast_quality or 50))
+                    every_nth = max(1, min(10, s.screencast_max_fps or 3))
+        except Exception:
+            pass
+
         try:
             self.cdp_session = await self.context.new_cdp_session(self.page)
             self.cdp_session.on("Page.screencastFrame", self._on_screencast_frame)
@@ -267,10 +281,10 @@ class UserAutomator:
                 "Page.startScreencast",
                 {
                     "format": "jpeg",
-                    "quality": 50,
+                    "quality": quality,
                     "maxWidth": VIEWPORT["width"],
                     "maxHeight": VIEWPORT["height"],
-                    "everyNthFrame": 3,
+                    "everyNthFrame": every_nth,
                 },
             )
         except Exception:
