@@ -36,6 +36,9 @@ python_installer.exe
 # Generated icons
 tray.ico
 
+# Docker / secrets
+.env
+
 # Other
 example_site/
 example_twitch/
