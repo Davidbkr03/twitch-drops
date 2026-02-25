@@ -178,6 +178,136 @@ def should_refresh_games_cache(force: bool = False) -> bool:
 	except Exception:
 		return True
 
+def derive_game_key(game_url: str | None = None, game_name: str | None = None) -> str:
+	raw_url = (game_url or "").strip()
+	if raw_url:
+		try:
+			parsed = urlparse(raw_url if raw_url.startswith("http") else f"https://www.twitch.tv{raw_url}")
+			parts = [p.lower() for p in parsed.path.split('/') if p]
+			for marker in ("category", "game"):
+				if marker in parts:
+					idx = parts.index(marker)
+					if idx + 1 < len(parts):
+						return parts[idx + 1]
+			if parts:
+				return parts[-1]
+		except Exception:
+			pass
+	name_norm = _normalize_match_text(game_name or "")
+	if not name_norm:
+		return ""
+	key = re.sub(r"[^a-z0-9]+", "-", name_norm).strip("-")
+	return key
+
+def _sanitize_watch_preferences(raw: dict | None) -> dict:
+	clean = {"games": {}}
+	if not isinstance(raw, dict):
+		return clean
+	games = raw.get("games", {})
+	if not isinstance(games, dict):
+		return clean
+	for input_key, entry in games.items():
+		if not isinstance(entry, dict):
+			continue
+		game_name = (entry.get("game") or "").strip()
+		game_url = (entry.get("game_url") or "").strip()
+		game_key = derive_game_key(game_url, game_name) or _normalize_match_text(str(input_key))
+		if not game_key:
+			continue
+		streamers_raw = entry.get("streamers", {})
+		streamers = {}
+		if isinstance(streamers_raw, dict):
+			for streamer, enabled in streamers_raw.items():
+				if not bool(enabled):
+					continue
+				login = _extract_channel_login(str(streamer)) or _compact_match_text(str(streamer))
+				if login:
+					streamers[login] = True
+		clean["games"][game_key] = {
+			"game": game_name,
+			"game_url": game_url,
+			"enabled": bool(entry.get("enabled", False)),
+			"streamers": streamers
+		}
+	return clean
+
+def get_watch_preferences_snapshot() -> dict:
+	with CONFIG_LOCK:
+		if isinstance(PREFERENCES, dict):
+			raw = PREFERENCES.get("watch_preferences", {"games": {}})
+		else:
+			raw = {"games": {}}
+		if not isinstance(raw, dict):
+			raw = {"games": {}}
+	return _sanitize_watch_preferences(raw)
+
+def update_watch_preferences(new_preferences: dict) -> dict:
+	clean = _sanitize_watch_preferences(new_preferences)
+	with CONFIG_LOCK:
+		PREFERENCES["watch_preferences"] = clean
+		save_preferences(PREFERENCES)
+	return clean
+
+def upsert_watch_preference_game(game_name: str, game_url: str, enabled: bool | None = None, streamers: dict | None = None) -> dict:
+	game_key = derive_game_key(game_url, game_name)
+	if not game_key:
+		return get_watch_preferences_snapshot()
+	with CONFIG_LOCK:
+		current = _sanitize_watch_preferences(PREFERENCES.get("watch_preferences", {"games": {}}))
+		entry = current["games"].get(game_key, {
+			"game": game_name or "",
+			"game_url": game_url or "",
+			"enabled": False,
+			"streamers": {}
+		})
+		if game_name:
+			entry["game"] = game_name
+		if game_url:
+			entry["game_url"] = game_url
+		if enabled is not None:
+			entry["enabled"] = bool(enabled)
+		if isinstance(streamers, dict):
+			entry["streamers"] = {k: bool(v) for k, v in streamers.items() if bool(v)}
+		current["games"][game_key] = entry
+		PREFERENCES["watch_preferences"] = current
+		save_preferences(PREFERENCES)
+	return get_watch_preferences_snapshot()
+
+def get_enabled_game_preferences(watch_preferences: dict | None = None) -> list[dict]:
+	prefs = watch_preferences or get_watch_preferences_snapshot()
+	out = []
+	for key, game in (prefs.get("games", {}) or {}).items():
+		if not isinstance(game, dict):
+			continue
+		if game.get("enabled"):
+			entry = dict(game)
+			entry["game_key"] = key
+			out.append(entry)
+	return out
+
+def is_rust_game_preference(game_entry: dict) -> bool:
+	if not isinstance(game_entry, dict):
+		return False
+	key = (game_entry.get("game_key") or derive_game_key(game_entry.get("game_url"), game_entry.get("game")) or "").lower()
+	name = (game_entry.get("game") or "").lower()
+	url = (game_entry.get("game_url") or "").lower()
+	return "rust" in key or name == "rust" or "/rust" in url
+
+def is_streamer_allowed_for_game_preference(game_entry: dict, streamer_name: str, streamer_url: str | None = None) -> bool:
+	"""If no specific streamers selected, all streamers are allowed."""
+	if not isinstance(game_entry, dict):
+		return True
+	streamers = game_entry.get("streamers", {})
+	if not isinstance(streamers, dict) or not streamers:
+		return True
+	selected_streamers = [s for s, enabled in streamers.items() if bool(enabled)]
+	if not selected_streamers:
+		return True
+	for selected in selected_streamers:
+		if is_streamer_name_match(streamer_name, selected, streamer_url=streamer_url):
+			return True
+	return False
+
 def get_integrity_prefs():
 	try:
 		return {
@@ -820,7 +950,8 @@ def load_preferences():
 		"hide_console": True,
 		"test_mode": False,
 		"debug_mode": False,
-		"enable_web_interface": True
+		"enable_web_interface": True,
+		"watch_preferences": {"games": {}}
 	}
 	try:
 		if os.path.exists(CONFIG_PATH):
@@ -828,6 +959,7 @@ def load_preferences():
 				data = json.load(f)
 				if isinstance(data, dict):
 					default_prefs.update(data)
+					default_prefs["watch_preferences"] = _sanitize_watch_preferences(default_prefs.get("watch_preferences"))
 	except Exception as e:
 		logging.debug(f"Could not load preferences: {e}")
 	return default_prefs
@@ -1130,6 +1262,8 @@ def create_web_app():
 	@app.route('/api/status')
 	def api_status():
 		"""API endpoint to get current status"""
+		watch_prefs = get_watch_preferences_snapshot()
+		enabled_games = get_enabled_game_preferences(watch_prefs)
 		return jsonify({
 			'status': 'running',
 			'headless': PREFERENCES.get('headless', DEFAULT_HEADLESS) if PREFERENCES else DEFAULT_HEADLESS,
@@ -1140,6 +1274,8 @@ def create_web_app():
 			'integrity_age_seconds': max(0, _now_ts() - int(PREFERENCES.get('integrity_fetched_at', 0))) if PREFERENCES else 0,
 			'login_state': get_login_status_snapshot().get('state'),
 			'logged_in': bool(get_login_status_snapshot().get('logged_in')),
+			'watch_selection_active': bool(enabled_games),
+			'watch_selected_games_count': len(enabled_games),
 			'version': get_current_version(),
 			'timestamp': datetime.now().isoformat()
 		})
@@ -1231,6 +1367,29 @@ def create_web_app():
 		except Exception as e:
 			return jsonify({'error': str(e)}), 500
 
+	@app.route('/api/games/streamers', methods=['GET'])
+	def api_game_streamers():
+		"""Fetch live drop-enabled streamers for a specific game category URL."""
+		game_url = (request.args.get("game_url") or "").strip()
+		if not game_url:
+			return jsonify({'success': False, 'message': 'Missing game_url'}), 400
+		try:
+			async def _refresh():
+				return await fetch_game_streamers_public(game_url, limit=100)
+			loop = asyncio.new_event_loop()
+			try:
+				streamers = loop.run_until_complete(_refresh())
+			finally:
+				loop.close()
+			return jsonify({
+				"success": True,
+				"game_url": game_url,
+				"count": len(streamers),
+				"streamers": streamers
+			})
+		except Exception as e:
+			return jsonify({'success': False, 'message': str(e)}), 500
+
 	@app.route('/api/games/refresh', methods=['POST'])
 	def api_games_refresh():
 		"""Refresh drop-enabled games immediately."""
@@ -1297,6 +1456,21 @@ def create_web_app():
 				'test_mode': PREFERENCES.get('test_mode', False),
 				'message': message + " Restart required."
 			})
+		except Exception as e:
+			return jsonify({'success': False, 'message': str(e)}), 500
+
+	@app.route('/api/watch-preferences', methods=['GET', 'POST'])
+	def api_watch_preferences():
+		"""Get or update selected games and streamer toggles."""
+		if request.method == 'GET':
+			try:
+				return jsonify(get_watch_preferences_snapshot())
+			except Exception as e:
+				return jsonify({'error': str(e)}), 500
+		try:
+			data = request.get_json(silent=True) or {}
+			updated = update_watch_preferences(data)
+			return jsonify({'success': True, 'watch_preferences': updated})
 		except Exception as e:
 			return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -2623,6 +2797,101 @@ async def _extract_drop_games_from_directory_page(page, limit: int = 120) -> lis
 	)
 	return games
 
+def _normalize_game_directory_url(game_url: str) -> str:
+	url = (game_url or "").strip()
+	if not url:
+		return ""
+	if url.startswith("http://") or url.startswith("https://"):
+		return url
+	if url.startswith("/"):
+		return f"https://www.twitch.tv{url}"
+	return f"https://www.twitch.tv/directory/category/{url.strip('/')}"
+
+def _viewer_count_score(viewers_text: str) -> int:
+	text = (viewers_text or "").strip().lower().replace(",", "")
+	if not text:
+		return 0
+	try:
+		m = re.search(r"(\d+(?:\.\d+)?)\s*([km]?)", text)
+		if not m:
+			return 0
+		value = float(m.group(1))
+		scale = m.group(2)
+		if scale == "k":
+			value *= 1000
+		elif scale == "m":
+			value *= 1000000
+		return int(value)
+	except Exception:
+		return 0
+
+async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limit: int = 80, use_exit_guard: bool = True) -> list[dict]:
+	target_url = _normalize_game_directory_url(game_url)
+	if not target_url:
+		return []
+	if use_exit_guard:
+		await goto_with_exit(page, target_url, timeout=120000, wait_until="domcontentloaded")
+	else:
+		await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
+	await maybe_accept_cookies(page)
+	await page.wait_for_timeout(1200)
+	rows = await page.evaluate(
+		r"""
+		(args) => {
+		  const maxCards = (args && args.limit) || 80;
+		  const out = [];
+		  const cards = Array.from(document.querySelectorAll('article')).slice(0, maxCards);
+		  for (const card of cards) {
+			const streamerAnchor = card.querySelector('a[data-a-target="preview-card-title-link"]');
+			if (!streamerAnchor) continue;
+			const href = (streamerAnchor.getAttribute('href') || '').trim();
+			if (!href) continue;
+			const login = href.replace(/^\//, '').split('/')[0].trim().toLowerCase();
+			if (!login) continue;
+			const tags = Array.from(card.querySelectorAll('[data-a-target="tag"], a[data-a-target="tag"], span'))
+			  .map(n => (n.textContent || '').trim().toLowerCase())
+			  .filter(Boolean);
+			const hasDrops = tags.some(t => t.includes('drops'));
+			if (!hasDrops) continue;
+			const viewers = (card.querySelector('[data-a-target="animated-channel-viewers-count"], [data-a-target*="viewers"]')?.textContent || '').trim();
+			const game = (card.querySelector('a[data-a-target="preview-card-game-link"]')?.textContent || '').trim();
+			out.push({
+			  streamer: login,
+			  stream_url: href.startsWith('/') ? `https://www.twitch.tv${href}` : href,
+			  viewers_text: viewers,
+			  game
+			});
+		  }
+		  return out;
+		}
+		""",
+		{"limit": int(limit)}
+	)
+	# Deduplicate by streamer, keep highest viewer score.
+	best_by_streamer = {}
+	for row in rows or []:
+		streamer = (row.get("streamer") or "").strip().lower()
+		if not streamer:
+			continue
+		score = _viewer_count_score(row.get("viewers_text") or "")
+		prev = best_by_streamer.get(streamer)
+		if not prev or score > prev.get("viewer_score", 0):
+			item = dict(row)
+			item["viewer_score"] = score
+			best_by_streamer[streamer] = item
+	streamers = sorted(best_by_streamer.values(), key=lambda s: (-(s.get("viewer_score") or 0), s.get("streamer") or ""))
+	return streamers
+
+async def fetch_live_drops_streamers_for_game(context, game_url: str, limit: int = 80) -> list[dict]:
+	page = await context.new_page()
+	try:
+		return await _extract_live_drops_streamers_from_game_page(page, game_url=game_url, limit=limit, use_exit_guard=True)
+	finally:
+		try:
+			await page.close()
+		except Exception:
+			pass
+
 async def fetch_drops_enabled_games(context, limit: int = 120) -> list[dict]:
 	page = await context.new_page()
 	try:
@@ -2640,6 +2909,27 @@ async def fetch_drops_enabled_games_public(limit: int = 120) -> list[dict]:
 		page = await browser.new_page(locale="en-US")
 		try:
 			return await _extract_drop_games_from_directory_page(page, limit=limit)
+		finally:
+			try:
+				await browser.close()
+			except Exception:
+				pass
+
+async def fetch_game_streamers_public(game_url: str, limit: int = 80) -> list[dict]:
+	"""One-off scrape for live drop-enabled streamers in a selected game category."""
+	target_url = _normalize_game_directory_url(game_url)
+	if not target_url:
+		return []
+	async with async_playwright() as p:
+		browser = await p.chromium.launch(headless=True)
+		page = await browser.new_page(locale="en-US")
+		try:
+			return await _extract_live_drops_streamers_from_game_page(
+				page,
+				game_url=target_url,
+				limit=limit,
+				use_exit_guard=False
+			)
 		finally:
 			try:
 				await browser.close()
@@ -3175,6 +3465,81 @@ async def pick_live_rust_stream_with_drops(context, preferred_streamers=None):
 	finally:
 		await page.close()
 
+async def pick_live_stream_from_enabled_games(context, enabled_games: list[dict]) -> dict | None:
+	"""Pick the strongest live drops-enabled stream from selected games/preferences."""
+	candidates = []
+	for game_entry in enabled_games or []:
+		game_name = (game_entry.get("game") or "").strip()
+		game_url = (game_entry.get("game_url") or "").strip()
+		if not game_url:
+			continue
+		try:
+			streamers = await fetch_live_drops_streamers_for_game(context, game_url, limit=80)
+		except Exception as e:
+			logging.debug(f"Failed loading streamers for {game_name or game_url}: {e}")
+			continue
+		for stream in streamers:
+			streamer = (stream.get("streamer") or "").strip()
+			stream_url = (stream.get("stream_url") or "").strip()
+			if not streamer or not stream_url:
+				continue
+			if not is_streamer_allowed_for_game_preference(game_entry, streamer, streamer_url=stream_url):
+				continue
+			candidate = {
+				"game": game_name or stream.get("game") or game_entry.get("game_key") or "Unknown Game",
+				"game_url": game_url,
+				"game_key": game_entry.get("game_key") or derive_game_key(game_url, game_name),
+				"streamer": streamer,
+				"stream_url": stream_url,
+				"viewer_score": int(stream.get("viewer_score") or 0),
+				"viewers_text": stream.get("viewers_text") or ""
+			}
+			candidates.append(candidate)
+	if not candidates:
+		return None
+	candidates.sort(key=lambda c: (-(c.get("viewer_score") or 0), c.get("streamer") or ""))
+	return candidates[0]
+
+async def watch_selected_games_cycle(context, inv_page, enabled_games: list[dict]) -> bool:
+	"""Watch selected non-Rust games with optional streamer filters."""
+	target = await pick_live_stream_from_enabled_games(context, enabled_games)
+	if not target:
+		logging.info("No live drops-enabled stream found for selected games. Retrying shortly.")
+		await asyncio.sleep(20)
+		return False
+	stream_page = await context.new_page()
+	try:
+		await goto_with_exit(stream_page, target["stream_url"], timeout=120000, wait_until="domcontentloaded")
+		await maybe_accept_cookies(stream_page)
+		update_current_working_item({
+			"type": "game",
+			"item": target.get("game"),
+			"streamer": target.get("streamer"),
+			"url": target.get("stream_url"),
+			"status": "selected game mode"
+		})
+		send_notification("Twitch Drops", f"Watching {target.get('streamer')} for {target.get('game')}")
+		await ensure_stream_playing(stream_page)
+		await set_low_quality(stream_page)
+		# Short watch slice; workflow loop will repick based on current live status/preferences.
+		for _ in range(4):
+			if EXIT_EVENT.is_set():
+				return True
+			try:
+				progress_map = await get_inventory_progress_map(inv_page)
+				if progress_map:
+					update_cached_drops_data(None, progress_map)
+			except Exception as e:
+				logging.debug(f"Selected-game progress refresh failed: {e}")
+			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
+		return True
+	finally:
+		try:
+			await stream_page.close()
+		except Exception:
+			pass
+		update_current_working_item(None)
+
 async def ensure_stream_playing(stream_page):
 	try:
 		await stream_page.wait_for_selector('button[data-a-target="player-play-pause-button"]', timeout=30000)
@@ -3643,6 +4008,17 @@ async def run_drops_workflow(context, test_mode=False):
 				logging.warning(f"Game discovery refresh failed: {game_err}")
 				update_cached_games_data(games=None, source="twitch_directory", error=str(game_err))
 				GAMES_REFRESH_REQUESTED.clear()
+
+			# Optional watch-target selection mode from dashboard.
+			watch_prefs = get_watch_preferences_snapshot()
+			enabled_game_prefs = get_enabled_game_preferences(watch_prefs)
+			rust_game_pref = next((g for g in enabled_game_prefs if is_rust_game_preference(g)), None)
+			non_rust_enabled_games = [g for g in enabled_game_prefs if not is_rust_game_preference(g)]
+			if enabled_game_prefs and rust_game_pref is None:
+				logging.info("Watch target mode active without Rust selected; using selected games stream cycle.")
+				await watch_selected_games_cycle(context, inv_page, enabled_game_prefs)
+				continue
+
 			fp = await fetch_facepunch_drops(context)
 			# If the campaign hasn't started yet, notify and exit early (unless in test mode)
 			try:
@@ -3753,6 +4129,13 @@ async def run_drops_workflow(context, test_mode=False):
 				# Only consider live streamers for watching
 				if not bool(st.get('is_live')):
 					logging.info(f"[STREAMER-EVAL] Skipping '{name}': not live")
+					continue
+				if rust_game_pref and not is_streamer_allowed_for_game_preference(
+					rust_game_pref,
+					name,
+					streamer_url=st.get('url')
+				):
+					logging.info(f"[STREAMER-EVAL] Skipping '{name}': not selected in watch preferences")
 					continue
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
@@ -4061,6 +4444,10 @@ async def run_drops_workflow(context, test_mode=False):
 				continue
 
 			# No streamers and no general strategy applicable; wait briefly
+			if non_rust_enabled_games:
+				logging.info("No Rust target available right now; switching to selected non-Rust games.")
+				await watch_selected_games_cycle(context, inv_page, non_rust_enabled_games)
+				continue
 			logging.info("No live streamer drops and no general progress to track. Retrying shortly.")
 			await asyncio.sleep(10)
 			continue
