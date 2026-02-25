@@ -1,5 +1,4 @@
 import asyncio
-from datetime import datetime, timezone
 
 from flask import Blueprint, render_template, jsonify, request
 from flask_login import login_required, current_user
@@ -16,7 +15,6 @@ main_bp = Blueprint("main", __name__)
 # Pages
 # ------------------------------------------------------------------
 
-
 @main_bp.route("/")
 @login_required
 def dashboard():
@@ -28,12 +26,16 @@ def dashboard():
 # REST API
 # ------------------------------------------------------------------
 
-
 @main_bp.route("/api/status")
 @login_required
 def api_status():
     mgr = AutomationManager.get()
     status = mgr.get_status(current_user.id) if mgr else {"running": False}
+    # Supplement with DB info
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if s and s.twitch_username:
+        status["twitch_user"] = s.twitch_username
+        status["twitch_saved"] = True
     return jsonify(status)
 
 
@@ -57,34 +59,59 @@ def api_stop():
     return jsonify({"success": ok})
 
 
-@main_bp.route("/api/settings", methods=["GET", "POST"])
+@main_bp.route("/api/twitch-account", methods=["GET", "POST"])
 @login_required
-def api_settings():
-    settings = UserSettings.query.filter_by(user_id=current_user.id).first()
-    if not settings:
-        settings = UserSettings(user_id=current_user.id)
-        db.session.add(settings)
+def api_twitch_account():
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if not s:
+        s = UserSettings(user_id=current_user.id)
+        db.session.add(s)
         db.session.commit()
 
     if request.method == "GET":
-        return jsonify(
-            {
-                "auto_claim": settings.auto_claim,
-                "check_interval": settings.check_interval,
-                "screencast_quality": settings.screencast_quality,
-                "screencast_max_fps": settings.screencast_max_fps,
-            }
-        )
+        return jsonify({
+            "twitch_username": s.twitch_username or "",
+            "has_password": bool(s.twitch_password),
+        })
+
+    data = request.get_json(silent=True) or {}
+    u = (data.get("twitch_username") or "").strip()
+    p = data.get("twitch_password") or ""
+    if not u:
+        return jsonify({"success": False, "error": "Username required"}), 400
+    s.twitch_username = u
+    if p:
+        s.twitch_password = p
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@main_bp.route("/api/settings", methods=["GET", "POST"])
+@login_required
+def api_settings():
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if not s:
+        s = UserSettings(user_id=current_user.id)
+        db.session.add(s)
+        db.session.commit()
+
+    if request.method == "GET":
+        return jsonify({
+            "auto_claim": s.auto_claim,
+            "check_interval": s.check_interval,
+            "screencast_quality": s.screencast_quality,
+            "screencast_max_fps": s.screencast_max_fps,
+        })
 
     data = request.get_json(silent=True) or {}
     if "auto_claim" in data:
-        settings.auto_claim = bool(data["auto_claim"])
+        s.auto_claim = bool(data["auto_claim"])
     if "check_interval" in data:
-        settings.check_interval = max(10, int(data["check_interval"]))
+        s.check_interval = max(10, int(data["check_interval"]))
     if "screencast_quality" in data:
-        settings.screencast_quality = max(10, min(100, int(data["screencast_quality"])))
+        s.screencast_quality = max(10, min(100, int(data["screencast_quality"])))
     if "screencast_max_fps" in data:
-        settings.screencast_max_fps = max(1, min(10, int(data["screencast_max_fps"])))
+        s.screencast_max_fps = max(1, min(10, int(data["screencast_max_fps"])))
     db.session.commit()
     return jsonify({"success": True})
 
@@ -98,26 +125,17 @@ def api_drops():
         .limit(100)
         .all()
     )
-    return jsonify(
-        [
-            {
-                "id": d.id,
-                "name": d.drop_name,
-                "game": d.game,
-                "status": d.status,
-                "progress": d.progress,
-                "created_at": d.created_at.isoformat() if d.created_at else None,
-                "claimed_at": d.claimed_at.isoformat() if d.claimed_at else None,
-            }
-            for d in logs
-        ]
-    )
+    return jsonify([{
+        "id": d.id, "name": d.drop_name, "game": d.game,
+        "status": d.status, "progress": d.progress,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+        "claimed_at": d.claimed_at.isoformat() if d.claimed_at else None,
+    } for d in logs])
 
 
 # ------------------------------------------------------------------
-# Socket.IO events
+# Socket.IO
 # ------------------------------------------------------------------
-
 
 @socketio.on("connect")
 def on_connect():
@@ -125,10 +143,7 @@ def on_connect():
         join_room(f"user_{current_user.id}")
         mgr = AutomationManager.get()
         if mgr:
-            status = mgr.get_status(current_user.id)
-            socketio.emit(
-                "automation_status", status, room=f"user_{current_user.id}"
-            )
+            socketio.emit("automation_status", mgr.get_status(current_user.id), room=f"user_{current_user.id}")
 
 
 @socketio.on("disconnect")
@@ -144,11 +159,9 @@ def on_browser_input(data):
     mgr = AutomationManager.get()
     if not mgr:
         return
-    automator = mgr.get_automator(current_user.id)
-    if automator and automator._loop and automator._loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            automator.handle_input(data), automator._loop
-        )
+    a = mgr.get_automator(current_user.id)
+    if a and a._loop and a._loop.is_running():
+        asyncio.run_coroutine_threadsafe(a.handle_input(data), a._loop)
 
 
 @socketio.on("twitch_login")
@@ -158,12 +171,10 @@ def on_twitch_login(data):
     mgr = AutomationManager.get()
     if not mgr:
         return
-    automator = mgr.get_automator(current_user.id)
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
-    if not username or not password:
+    a = mgr.get_automator(current_user.id)
+    u = (data.get("username") or "").strip()
+    p = data.get("password") or ""
+    if not u or not p:
         return
-    if automator and automator._loop and automator._loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            automator.auto_login(username, password), automator._loop
-        )
+    if a and a._loop and a._loop.is_running():
+        asyncio.run_coroutine_threadsafe(a.auto_login(u, p), a._loop)

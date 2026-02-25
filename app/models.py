@@ -27,6 +27,11 @@ class UserSettings(db.Model):
     user_id = db.Column(
         db.Integer, db.ForeignKey("users.id"), unique=True, nullable=False
     )
+
+    # Twitch credentials — stored so the bot can auto-login on start
+    twitch_username = db.Column(db.String(100), nullable=True)
+    twitch_password = db.Column(db.String(256), nullable=True)
+
     auto_claim = db.Column(db.Boolean, default=True)
     check_interval = db.Column(db.Integer, default=60)
     screencast_quality = db.Column(db.Integer, default=50)
