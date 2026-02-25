@@ -1,6 +1,5 @@
 {% extends "base.html" %}
 {% block title %}Dashboard — Twitch Drop Automator{% endblock %}
-
 {% block head %}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 {% endblock %}
@@ -8,13 +7,14 @@
 {% block content %}
 <div class="dashboard">
 
-  <!-- Top controls -->
+  <!-- Toolbar -->
   <section class="dash-toolbar">
     <div class="toolbar-left">
       <span class="status-dot" id="statusDot"></span>
       <span class="status-text" id="statusMsg">Connecting…</span>
     </div>
     <div class="toolbar-right">
+      <span class="watch-time" id="watchTime"></span>
       <button class="btn btn-success" id="startBtn" onclick="doStart()">▶ Start</button>
       <button class="btn btn-danger"  id="stopBtn"  onclick="doStop()" disabled>■ Stop</button>
     </div>
@@ -22,47 +22,52 @@
 
   <div class="dash-grid">
 
-    <!-- Screencast panel -->
+    <!-- Screencast -->
     <section class="card card-screencast">
       <div class="card-header">
         <h2>Browser Preview</h2>
         <span class="badge" id="streamBadge" style="display:none"></span>
       </div>
-      <div class="screencast-wrap" id="screencastWrap">
+      <div class="screencast-wrap">
         <canvas id="screencast" tabindex="1"></canvas>
         <div class="sc-overlay" id="scOverlay">
           <p>Press <strong>Start</strong> to begin automation.<br>
-          You can interact with the browser here to log in to Twitch.</p>
+          You can also interact with the browser here.</p>
         </div>
       </div>
-      <p class="hint">Click inside the preview to interact. Focus it to type.</p>
+      <p class="hint">Click inside the preview to interact &middot; Focus it to type</p>
     </section>
 
-    <!-- Side panel -->
+    <!-- Sidebar -->
     <aside class="side-panel">
 
-      <!-- Twitch Login -->
-      <section class="card" id="twitchLoginCard">
-        <div class="card-header"><h2>Twitch Login</h2></div>
+      <!-- Twitch Account -->
+      <section class="card" id="twitchAccountCard">
+        <div class="card-header">
+          <h2>Twitch Account</h2>
+          <span class="badge badge-sm" id="twitchStatus">Not linked</span>
+        </div>
         <div class="card-body">
-          <p class="hint-text" id="loginHint">Enter your Twitch credentials to auto-login, or click directly in the browser preview.</p>
           <div class="field">
             <label>Twitch Username</label>
-            <input type="text" id="twitchUser" placeholder="Username" autocomplete="off">
+            <input type="text" id="twitchUser"
+                   value="{{ settings.twitch_username or '' if settings else '' }}"
+                   placeholder="Your Twitch username">
           </div>
           <div class="field">
             <label>Twitch Password</label>
-            <input type="password" id="twitchPass" placeholder="Password" autocomplete="off">
+            <input type="password" id="twitchPass" placeholder="{% if settings and settings.twitch_password %}••••••••{% else %}Enter password{% endif %}">
           </div>
-          <button class="btn btn-primary btn-sm btn-block" onclick="twitchLogin()">Log in to Twitch</button>
+          <button class="btn btn-primary btn-sm btn-block" onclick="saveTwitchAccount()">Save &amp; Login</button>
+          <p class="hint-text" id="twitchHint">Credentials are stored so the bot auto-logs in on every start.</p>
         </div>
       </section>
 
-      <!-- Drops -->
+      <!-- Active Drops -->
       <section class="card">
-        <div class="card-header"><h2>Drops</h2></div>
+        <div class="card-header"><h2>Active Drops</h2></div>
         <div class="card-body" id="dropsBody">
-          <p class="empty">No drop data yet.</p>
+          <p class="empty">No active drops.</p>
         </div>
       </section>
 
@@ -71,10 +76,10 @@
         <div class="card-header"><h2>Settings</h2></div>
         <div class="card-body">
           <div class="field">
-            <label><input type="checkbox" id="autoClaim" {% if settings and settings.auto_claim %}checked{% endif %}> Auto-claim drops</label>
+            <label><input type="checkbox" id="autoClaim" {% if settings and settings.auto_claim %}checked{% endif %}> Auto-claim completed drops</label>
           </div>
           <div class="field">
-            <label>Check interval (s)</label>
+            <label>Check interval (seconds)</label>
             <input type="number" id="checkInterval" min="10" max="600"
                    value="{{ settings.check_interval if settings else 60 }}">
           </div>
@@ -86,13 +91,13 @@
               <option value="70" {% if settings and settings.screencast_quality == 70 %}selected{% endif %}>High</option>
             </select>
           </div>
-          <button class="btn btn-primary btn-sm" onclick="saveSettings()">Save</button>
+          <button class="btn btn-primary btn-sm" onclick="saveSettings()">Save Settings</button>
         </div>
       </section>
 
-      <!-- Drop history -->
+      <!-- Claim History -->
       <section class="card">
-        <div class="card-header"><h2>History</h2></div>
+        <div class="card-header"><h2>Claim History</h2></div>
         <div class="card-body" id="historyBody">
           <p class="empty">No history yet.</p>
         </div>
@@ -104,27 +109,27 @@
 
 <script>
 (function() {
-  const socket = io();
-  const canvas = document.getElementById('screencast');
-  const ctx    = canvas.getContext('2d');
-  const overlay = document.getElementById('scOverlay');
-  const statusDot = document.getElementById('statusDot');
-  const statusMsg = document.getElementById('statusMsg');
-  const streamBadge = document.getElementById('streamBadge');
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn  = document.getElementById('stopBtn');
-  let running = false;
+  var socket = io();
+  var canvas = document.getElementById('screencast');
+  var ctx    = canvas.getContext('2d');
+  var overlay = document.getElementById('scOverlay');
+  var statusDot = document.getElementById('statusDot');
+  var statusMsg = document.getElementById('statusMsg');
+  var streamBadge = document.getElementById('streamBadge');
+  var startBtn = document.getElementById('startBtn');
+  var stopBtn  = document.getElementById('stopBtn');
+  var watchTimeEl = document.getElementById('watchTime');
+  var twitchStatusBadge = document.getElementById('twitchStatus');
+  var running = false;
 
-  /* -------- screencast frames -------- */
-  const frameImg = new Image();
-  let framePending = false;
-
+  /* ---- screencast ---- */
+  var frameImg = new Image();
+  var framePending = false;
   socket.on('screencast_frame', function(d) {
-    if (framePending) return;           // skip if previous frame still decoding
+    if (framePending) return;
     framePending = true;
     frameImg.onload = function() {
-      canvas.width  = frameImg.width;
-      canvas.height = frameImg.height;
+      canvas.width = frameImg.width; canvas.height = frameImg.height;
       ctx.drawImage(frameImg, 0, 0);
       overlay.style.display = 'none';
       framePending = false;
@@ -133,164 +138,190 @@
     frameImg.src = 'data:image/jpeg;base64,' + d.data;
   });
 
-  /* -------- status updates -------- */
+  /* ---- status updates ---- */
   socket.on('automation_status', function(s) {
     running = s.running;
     statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
     statusMsg.textContent = s.message || (running ? 'Running' : 'Stopped');
     startBtn.disabled = running;
     stopBtn.disabled  = !running;
+
+    // Stream badge
     if (s.stream_name) {
       streamBadge.textContent = s.stream_name;
       streamBadge.style.display = '';
     } else {
       streamBadge.style.display = 'none';
     }
-    var loginCard = document.getElementById('twitchLoginCard');
-    if (loginCard) loginCard.style.display = s.logged_in ? 'none' : '';
+
+    // Twitch account status
+    if (s.logged_in) {
+      twitchStatusBadge.textContent = 'Logged in';
+      twitchStatusBadge.className = 'badge badge-sm badge-success';
+    } else if (s.twitch_saved) {
+      twitchStatusBadge.textContent = 'Saved';
+      twitchStatusBadge.className = 'badge badge-sm badge-warn';
+    } else {
+      twitchStatusBadge.textContent = 'Not linked';
+      twitchStatusBadge.className = 'badge badge-sm';
+    }
+
+    // Watch time
+    if (s.watch_seconds && s.watch_seconds > 0) {
+      watchTimeEl.textContent = fmtTime(s.watch_seconds);
+    } else {
+      watchTimeEl.textContent = '';
+    }
+
     renderDrops(s);
   });
 
+  function fmtTime(sec) {
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = sec % 60;
+    var parts = [];
+    if (h) parts.push(h + 'h');
+    parts.push(m + 'm');
+    if (!h) parts.push(s + 's');
+    return parts.join(' ');
+  }
+
+  /* ---- drops with progress bars ---- */
   function renderDrops(s) {
     var html = '';
     if (s.drops_in_progress && s.drops_in_progress.length) {
       s.drops_in_progress.forEach(function(d) {
-        html += '<div class="drop-row"><span class="drop-name">' +
-          esc(d.name || 'Drop') + '</span><span class="drop-pct">' +
-          (d.progress || 0) + '%</span></div>';
+        var pct = d.progress || 0;
+        html += '<div class="drop-item">' +
+          '<div class="drop-item-top">' +
+            '<span class="drop-name">' + esc(d.name || 'Drop') + '</span>' +
+            '<span class="drop-pct">' + pct + '%</span>' +
+          '</div>' +
+          '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
+        '</div>';
       });
     }
     if (s.drops_claimed && s.drops_claimed.length) {
-      s.drops_claimed.forEach(function(d) {
-        html += '<div class="drop-row claimed"><span class="drop-name">✓ ' +
-          esc(d.name || 'Drop') + '</span></div>';
+      s.drops_claimed.slice(-5).reverse().forEach(function(d) {
+        html += '<div class="drop-item claimed">' +
+          '<span class="drop-name">✓ ' + esc(d.name || 'Drop') + '</span>' +
+        '</div>';
       });
     }
     if (!html) html = '<p class="empty">No active drops.</p>';
     document.getElementById('dropsBody').innerHTML = html;
   }
 
-  /* -------- input forwarding -------- */
+  /* ---- input forwarding ---- */
   canvas.addEventListener('mousedown', function(e) {
     if (!running) return;
     canvas.focus();
     var r = canvas.getBoundingClientRect();
-    var sx = canvas.width / r.width;
-    var sy = canvas.height / r.height;
     socket.emit('browser_input', {
-      type: 'click',
-      x: Math.round((e.clientX - r.left) * sx),
-      y: Math.round((e.clientY - r.top)  * sy)
+      type:'click',
+      x: Math.round((e.clientX - r.left) * canvas.width / r.width),
+      y: Math.round((e.clientY - r.top)  * canvas.height / r.height)
     });
   });
-
   canvas.addEventListener('keydown', function(e) {
     if (!running) return;
     e.preventDefault();
-    if (e.key.length === 1) {
-      socket.emit('browser_input', { type: 'type', text: e.key });
-    } else {
-      var mapped = mapKey(e);
-      if (mapped) socket.emit('browser_input', { type: 'press', key: mapped });
+    if (e.key.length === 1) socket.emit('browser_input', {type:'type', text:e.key});
+    else {
+      var m = {'Backspace':'Backspace','Tab':'Tab','Enter':'Enter','Escape':'Escape',
+        'ArrowUp':'ArrowUp','ArrowDown':'ArrowDown','ArrowLeft':'ArrowLeft','ArrowRight':'ArrowRight',
+        'Delete':'Delete',' ':'Space'}[e.key];
+      if (m) socket.emit('browser_input', {type:'press', key:m});
     }
   });
-
   canvas.addEventListener('wheel', function(e) {
     if (!running) return;
     e.preventDefault();
-    socket.emit('browser_input', {
-      type: 'scroll', deltaX: e.deltaX, deltaY: e.deltaY
-    });
-  }, { passive: false });
+    socket.emit('browser_input', {type:'scroll', deltaX:e.deltaX, deltaY:e.deltaY});
+  }, {passive:false});
 
-  function mapKey(e) {
-    var map = {
-      'Backspace':'Backspace','Tab':'Tab','Enter':'Enter','Escape':'Escape',
-      'ArrowUp':'ArrowUp','ArrowDown':'ArrowDown','ArrowLeft':'ArrowLeft',
-      'ArrowRight':'ArrowRight','Delete':'Delete','Home':'Home','End':'End',
-      'PageUp':'PageUp','PageDown':'PageDown',' ':'Space'
-    };
-    return map[e.key] || null;
-  }
-
-  /* -------- controls -------- */
+  /* ---- controls ---- */
   window.doStart = function() {
-    fetch('/api/start', { method:'POST' })
-      .then(function(r){ return r.json(); })
-      .then(function(d) {
-        if (d.success) {
-          startBtn.disabled = true;
-          stopBtn.disabled = false;
-          overlay.innerHTML = '<p>Starting browser…</p>';
-        }
-      });
+    fetch('/api/start',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+      if(d.success){ startBtn.disabled=true; stopBtn.disabled=false; overlay.innerHTML='<p>Starting…</p>'; }
+    });
   };
   window.doStop = function() {
-    fetch('/api/stop', { method:'POST' })
-      .then(function(r){ return r.json(); })
-      .then(function(d) {
-        if (d.success) {
-          startBtn.disabled = false;
-          stopBtn.disabled = true;
-          overlay.style.display = '';
-          overlay.innerHTML = '<p>Automation stopped.</p>';
-        }
-      });
+    fetch('/api/stop',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+      if(d.success){ startBtn.disabled=false; stopBtn.disabled=true; overlay.style.display=''; overlay.innerHTML='<p>Stopped.</p>'; }
+    });
   };
+
+  /* ---- save twitch account ---- */
+  window.saveTwitchAccount = function() {
+    var u = document.getElementById('twitchUser').value.trim();
+    var p = document.getElementById('twitchPass').value;
+    if (!u) { alert('Enter your Twitch username'); return; }
+    var body = { twitch_username: u };
+    if (p) body.twitch_password = p;
+    fetch('/api/twitch-account', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) {
+        document.getElementById('twitchHint').textContent = 'Saved! Credentials will be used on next start.';
+        twitchStatusBadge.textContent = 'Saved';
+        twitchStatusBadge.className = 'badge badge-sm badge-warn';
+        // If automation is running, trigger login now
+        if (running && p) {
+          socket.emit('twitch_login', {username: u, password: p});
+          document.getElementById('twitchHint').textContent = 'Logging in…';
+        }
+        document.getElementById('twitchPass').value = '';
+        document.getElementById('twitchPass').placeholder = '••••••••';
+      }
+    });
+  };
+
+  /* ---- save settings ---- */
   window.saveSettings = function() {
     fetch('/api/settings', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         auto_claim: document.getElementById('autoClaim').checked,
         check_interval: parseInt(document.getElementById('checkInterval').value),
         screencast_quality: parseInt(document.getElementById('scQuality').value)
       })
-    }).then(function(r){ return r.json(); })
-      .then(function(d){ if(d.success) statusMsg.textContent='Settings saved'; });
+    }).then(function(r){return r.json()}).then(function(d){
+      if(d.success) statusMsg.textContent='Settings saved';
+    });
   };
 
-  /* -------- twitch login -------- */
-  window.twitchLogin = function() {
-    var u = document.getElementById('twitchUser').value.trim();
-    var p = document.getElementById('twitchPass').value;
-    if (!u || !p) { alert('Enter both username and password'); return; }
-    socket.emit('twitch_login', { username: u, password: p });
-    document.getElementById('twitchPass').value = '';
-    document.getElementById('loginHint').textContent = 'Credentials sent — check the preview…';
-  };
-
-  /* -------- history -------- */
+  /* ---- history ---- */
   function loadHistory() {
-    fetch('/api/drops').then(function(r){ return r.json(); }).then(function(list) {
+    fetch('/api/drops').then(function(r){return r.json()}).then(function(list) {
       if (!list.length) return;
       var html = '';
-      list.slice(0, 20).forEach(function(d) {
-        html += '<div class="drop-row ' + (d.status==='claimed'?'claimed':'') + '">' +
-          '<span class="drop-name">' + esc(d.name || 'Drop') + '</span>' +
-          '<span class="drop-pct">' + (d.status==='claimed'?'Claimed': (d.progress||0)+'%') + '</span></div>';
+      list.slice(0,20).forEach(function(d) {
+        html += '<div class="drop-row '+(d.status==='claimed'?'claimed':'')+'">' +
+          '<span class="drop-name">'+ esc(d.name||'Drop')+'</span>' +
+          '<span class="drop-pct">'+(d.status==='claimed'?'Claimed':(d.progress||0)+'%')+'</span></div>';
       });
       document.getElementById('historyBody').innerHTML = html;
     });
   }
-  loadHistory();
-  setInterval(loadHistory, 30000);
+  loadHistory(); setInterval(loadHistory, 30000);
 
-  /* -------- init -------- */
-  fetch('/api/status').then(function(r){ return r.json(); }).then(function(s) {
+  /* ---- init ---- */
+  fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
     running = s.running;
-    statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
-    statusMsg.textContent = s.message || (running ? 'Running' : 'Stopped');
-    startBtn.disabled = running;
-    stopBtn.disabled  = !running;
+    statusDot.className = 'status-dot '+(running?'on':'off');
+    statusMsg.textContent = s.message||(running?'Running':'Stopped');
+    startBtn.disabled = running; stopBtn.disabled = !running;
     if (running) overlay.style.display = 'none';
+    if (s.twitch_user) {
+      document.getElementById('twitchUser').value = s.twitch_user;
+      twitchStatusBadge.textContent = s.logged_in ? 'Logged in' : 'Saved';
+      twitchStatusBadge.className = 'badge badge-sm ' + (s.logged_in ? 'badge-success' : 'badge-warn');
+    }
   });
 
-  function esc(s) {
-    var d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
-  }
+  function esc(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 })();
 </script>
 {% endblock %}

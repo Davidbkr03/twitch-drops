@@ -44,9 +44,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 /* ===== Forms ===== */
 .form-group{margin-bottom:1rem}
 .form-group label{display:block;font-size:.8rem;font-weight:600;color:var(--muted);margin-bottom:.3rem}
-.form-group input,.field input[type=number],.field select{width:100%;padding:.5rem .65rem;
-  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-  color:var(--text);font-size:.9rem}
+.form-group input,.field input[type=text],.field input[type=password],.field input[type=number],.field select{
+  width:100%;padding:.5rem .65rem;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);font-size:.9rem}
 .form-group input:focus,.field input:focus,.field select:focus{outline:none;border-color:var(--primary)}
 
 /* ===== Flash messages ===== */
@@ -60,19 +60,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .dash-toolbar{display:flex;align-items:center;justify-content:space-between;
   margin-bottom:1rem;flex-wrap:wrap;gap:.5rem}
 .toolbar-left{display:flex;align-items:center;gap:.5rem}
-.toolbar-right{display:flex;gap:.5rem}
+.toolbar-right{display:flex;align-items:center;gap:.75rem}
 .status-dot{width:10px;height:10px;border-radius:50%;background:#555;display:inline-block}
-.status-dot.on{background:var(--success)}
-.status-dot.off{background:#555}
+.status-dot.on{background:var(--success)}.status-dot.off{background:#555}
 .status-text{font-size:.9rem;color:var(--muted)}
+.watch-time{font-size:.82rem;color:var(--primary);font-weight:600}
 
-.dash-grid{display:grid;grid-template-columns:1fr 320px;gap:1rem}
+.dash-grid{display:grid;grid-template-columns:1fr 340px;gap:1rem}
 @media(max-width:900px){.dash-grid{grid-template-columns:1fr}}
 
 /* ===== Cards ===== */
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
-.card-header{padding:.65rem 1rem;border-bottom:1px solid var(--border);display:flex;align-items:center;
-  justify-content:space-between}
+.card-header{padding:.65rem 1rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .card-header h2{font-size:.95rem;font-weight:600}
 .card-body{padding:.75rem 1rem}
 
@@ -84,8 +83,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
   background:rgba(0,0,0,.7);color:var(--muted);text-align:center;padding:1rem;font-size:.9rem}
 .hint{padding:.4rem 1rem;font-size:.75rem;color:var(--muted)}
 
-/* ===== Badge ===== */
+/* ===== Badges ===== */
 .badge{background:var(--primary);color:#fff;padding:.15rem .55rem;border-radius:4px;font-size:.75rem;font-weight:600}
+.badge-sm{font-size:.7rem;padding:.1rem .4rem}
+.badge-success{background:#1a8a4a}
+.badge-warn{background:#8a6a1a}
 
 /* ===== Side panel ===== */
 .side-panel{display:flex;flex-direction:column;gap:1rem}
@@ -94,13 +96,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .field select{padding:.35rem .5rem}
 .field input[type=number]{width:80px}
 
-/* ===== Drops ===== */
+/* ===== Drops with progress bars ===== */
+.drop-item{padding:.5rem 0;border-bottom:1px solid var(--border)}
+.drop-item:last-child{border-bottom:none}
+.drop-item-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem}
+.drop-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.82rem;padding-right:.5rem}
+.drop-pct{color:var(--primary);font-weight:600;font-size:.82rem;white-space:nowrap}
+.drop-item.claimed .drop-name{color:var(--success)}
+
+.progress-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.progress-fill{height:100%;background:var(--primary);border-radius:3px;transition:width .3s ease}
+
+/* legacy drop-row */
 .drop-row{display:flex;justify-content:space-between;align-items:center;padding:.4rem 0;
   border-bottom:1px solid var(--border);font-size:.82rem}
 .drop-row:last-child{border-bottom:none}
-.drop-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:.5rem}
-.drop-pct{color:var(--primary);font-weight:600;white-space:nowrap}
 .drop-row.claimed .drop-name{color:var(--success)}
 .drop-row.claimed .drop-pct{color:var(--success)}
+
 .empty{color:var(--muted);font-size:.82rem;text-align:center;padding:.5rem 0}
-.hint-text{color:var(--muted);font-size:.78rem;margin-bottom:.6rem}
+.hint-text{color:var(--muted);font-size:.78rem;margin-top:.5rem}
