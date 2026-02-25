@@ -2852,14 +2852,14 @@ async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limi
 			  .map(n => (n.textContent || '').trim().toLowerCase())
 			  .filter(Boolean);
 			const hasDrops = tags.some(t => t.includes('drops'));
-			if (!hasDrops) continue;
 			const viewers = (card.querySelector('[data-a-target="animated-channel-viewers-count"], [data-a-target*="viewers"]')?.textContent || '').trim();
 			const game = (card.querySelector('a[data-a-target="preview-card-game-link"]')?.textContent || '').trim();
 			out.push({
 			  streamer: login,
 			  stream_url: href.startsWith('/') ? `https://www.twitch.tv${href}` : href,
 			  viewers_text: viewers,
-			  game
+			  game,
+			  has_drops: hasDrops
 			});
 		  }
 		  return out;
@@ -2875,11 +2875,20 @@ async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limi
 			continue
 		score = _viewer_count_score(row.get("viewers_text") or "")
 		prev = best_by_streamer.get(streamer)
-		if not prev or score > prev.get("viewer_score", 0):
+		row_has_drops = bool(row.get("has_drops"))
+		prev_has_drops = bool(prev.get("has_drops")) if prev else False
+		if (
+			not prev
+			or (row_has_drops and not prev_has_drops)
+			or (row_has_drops == prev_has_drops and score > prev.get("viewer_score", 0))
+		):
 			item = dict(row)
 			item["viewer_score"] = score
 			best_by_streamer[streamer] = item
-	streamers = sorted(best_by_streamer.values(), key=lambda s: (-(s.get("viewer_score") or 0), s.get("streamer") or ""))
+	streamers = sorted(
+		best_by_streamer.values(),
+		key=lambda s: (0 if s.get("has_drops") else 1, -(s.get("viewer_score") or 0), s.get("streamer") or "")
+	)
 	return streamers
 
 async def fetch_live_drops_streamers_for_game(context, game_url: str, limit: int = 80) -> list[dict]:
@@ -3491,13 +3500,16 @@ async def pick_live_stream_from_enabled_games(context, enabled_games: list[dict]
 				"game_key": game_entry.get("game_key") or derive_game_key(game_url, game_name),
 				"streamer": streamer,
 				"stream_url": stream_url,
+				"has_drops": bool(stream.get("has_drops")),
 				"viewer_score": int(stream.get("viewer_score") or 0),
 				"viewers_text": stream.get("viewers_text") or ""
 			}
 			candidates.append(candidate)
 	if not candidates:
 		return None
-	candidates.sort(key=lambda c: (-(c.get("viewer_score") or 0), c.get("streamer") or ""))
+	candidates.sort(
+		key=lambda c: (0 if c.get("has_drops") else 1, -(c.get("viewer_score") or 0), c.get("streamer") or "")
+	)
 	return candidates[0]
 
 async def watch_selected_games_cycle(context, inv_page, enabled_games: list[dict]) -> bool:
