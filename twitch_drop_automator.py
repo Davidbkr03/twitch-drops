@@ -10,10 +10,12 @@ import atexit
 import signal
 import sys
 import subprocess
+import time
 from datetime import datetime, timezone, timedelta
 import base64
 import io
 import argparse
+from urllib.parse import urlparse
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 
@@ -42,6 +44,7 @@ LOG_FILE = os.path.join(BASE_DIR, 'drops_log.txt')
 USER_DATA_DIR = os.path.join(BASE_DIR, 'user_data_stealth')
 TWITCH_INVENTORY_URL = 'https://www.twitch.tv/drops/inventory'
 TWITCH_RUST_DIRECTORY_URL = 'https://www.twitch.tv/directory/game/Rust'
+TWITCH_DROPS_ENABLED_DIRECTORY_URL = 'https://www.twitch.tv/directory/all/tags/dropsenabled'
 FACEPUNCH_DROPS_URL = 'https://twitch.facepunch.com/#drops'
 DEFAULT_HEADLESS = True  # Default when no config exists
 BROWSER_CHANNEL = "chrome"  # Alternatives: "msedge"
@@ -87,15 +90,223 @@ cached_drops_data = {
 	"completed": [],
 	"last_updated": None
 }
+cached_games_data = {
+	"games": [],
+	"last_updated": None,
+	"source": "twitch_directory",
+	"error": None
+}
+cached_login_status = {
+	"state": "starting",
+	"logged_in": False,
+	"message": "Starting browser session",
+	"last_updated": None
+}
 
 # Integrity/header management
 INTEGRITY_RENEW_REQUESTED = threading.Event()
+GAMES_REFRESH_REQUESTED = threading.Event()
+GAMES_CACHE_TTL_SECONDS = 10 * 60
+games_data_lock = threading.RLock()
+login_status_lock = threading.RLock()
 
 def _now_ts() -> int:
 	try:
 		return int(time.time())
 	except Exception:
 		return 0
+
+def set_login_status(state: str, logged_in: bool, message: str, extra: dict | None = None):
+	"""Update login status cache for the web dashboard."""
+	global cached_login_status
+	with login_status_lock:
+		payload = {
+			"state": state,
+			"logged_in": bool(logged_in),
+			"message": message or "",
+			"last_updated": datetime.now().isoformat()
+		}
+		if isinstance(extra, dict):
+			payload.update(extra)
+		cached_login_status = payload
+
+def get_login_status_snapshot() -> dict:
+	with login_status_lock:
+		return dict(cached_login_status)
+
+def update_cached_games_data(
+	games: list[dict] | None = None,
+	source: str = "twitch_directory",
+	error: str | None = None,
+	keep_existing_on_empty: bool = True
+):
+	"""Update game discovery cache and push to dashboard clients."""
+	global cached_games_data
+	with games_data_lock:
+		if games is not None:
+			if games or not keep_existing_on_empty or not cached_games_data.get("games"):
+				cached_games_data["games"] = list(games)
+			cached_games_data["source"] = source
+		cached_games_data["error"] = error
+		cached_games_data["last_updated"] = datetime.now().isoformat()
+		payload = dict(cached_games_data)
+	if socketio:
+		try:
+			socketio.emit('games_update', payload)
+		except Exception:
+			pass
+
+def get_cached_games_data_snapshot() -> dict:
+	with games_data_lock:
+		return {
+			"games": list(cached_games_data.get("games", [])),
+			"last_updated": cached_games_data.get("last_updated"),
+			"source": cached_games_data.get("source"),
+			"error": cached_games_data.get("error")
+		}
+
+def should_refresh_games_cache(force: bool = False) -> bool:
+	if force:
+		return True
+	with games_data_lock:
+		last_updated = cached_games_data.get("last_updated")
+	if not last_updated:
+		return True
+	try:
+		last_dt = datetime.fromisoformat(last_updated)
+		return (datetime.now() - last_dt).total_seconds() >= GAMES_CACHE_TTL_SECONDS
+	except Exception:
+		return True
+
+def derive_game_key(game_url: str | None = None, game_name: str | None = None) -> str:
+	raw_url = (game_url or "").strip()
+	if raw_url:
+		try:
+			parsed = urlparse(raw_url if raw_url.startswith("http") else f"https://www.twitch.tv{raw_url}")
+			parts = [p.lower() for p in parsed.path.split('/') if p]
+			for marker in ("category", "game"):
+				if marker in parts:
+					idx = parts.index(marker)
+					if idx + 1 < len(parts):
+						return parts[idx + 1]
+			if parts:
+				return parts[-1]
+		except Exception:
+			pass
+	name_norm = _normalize_match_text(game_name or "")
+	if not name_norm:
+		return ""
+	key = re.sub(r"[^a-z0-9]+", "-", name_norm).strip("-")
+	return key
+
+def _sanitize_watch_preferences(raw: dict | None) -> dict:
+	clean = {"games": {}}
+	if not isinstance(raw, dict):
+		return clean
+	games = raw.get("games", {})
+	if not isinstance(games, dict):
+		return clean
+	for input_key, entry in games.items():
+		if not isinstance(entry, dict):
+			continue
+		game_name = (entry.get("game") or "").strip()
+		game_url = (entry.get("game_url") or "").strip()
+		game_key = derive_game_key(game_url, game_name) or _normalize_match_text(str(input_key))
+		if not game_key:
+			continue
+		streamers_raw = entry.get("streamers", {})
+		streamers = {}
+		if isinstance(streamers_raw, dict):
+			for streamer, enabled in streamers_raw.items():
+				if not bool(enabled):
+					continue
+				login = _extract_channel_login(str(streamer)) or _compact_match_text(str(streamer))
+				if login:
+					streamers[login] = True
+		clean["games"][game_key] = {
+			"game": game_name,
+			"game_url": game_url,
+			"enabled": bool(entry.get("enabled", False)),
+			"streamers": streamers
+		}
+	return clean
+
+def get_watch_preferences_snapshot() -> dict:
+	with CONFIG_LOCK:
+		if isinstance(PREFERENCES, dict):
+			raw = PREFERENCES.get("watch_preferences", {"games": {}})
+		else:
+			raw = {"games": {}}
+		if not isinstance(raw, dict):
+			raw = {"games": {}}
+	return _sanitize_watch_preferences(raw)
+
+def update_watch_preferences(new_preferences: dict) -> dict:
+	clean = _sanitize_watch_preferences(new_preferences)
+	with CONFIG_LOCK:
+		PREFERENCES["watch_preferences"] = clean
+		save_preferences(PREFERENCES)
+	return clean
+
+def upsert_watch_preference_game(game_name: str, game_url: str, enabled: bool | None = None, streamers: dict | None = None) -> dict:
+	game_key = derive_game_key(game_url, game_name)
+	if not game_key:
+		return get_watch_preferences_snapshot()
+	with CONFIG_LOCK:
+		current = _sanitize_watch_preferences(PREFERENCES.get("watch_preferences", {"games": {}}))
+		entry = current["games"].get(game_key, {
+			"game": game_name or "",
+			"game_url": game_url or "",
+			"enabled": False,
+			"streamers": {}
+		})
+		if game_name:
+			entry["game"] = game_name
+		if game_url:
+			entry["game_url"] = game_url
+		if enabled is not None:
+			entry["enabled"] = bool(enabled)
+		if isinstance(streamers, dict):
+			entry["streamers"] = {k: bool(v) for k, v in streamers.items() if bool(v)}
+		current["games"][game_key] = entry
+		PREFERENCES["watch_preferences"] = current
+		save_preferences(PREFERENCES)
+	return get_watch_preferences_snapshot()
+
+def get_enabled_game_preferences(watch_preferences: dict | None = None) -> list[dict]:
+	prefs = watch_preferences or get_watch_preferences_snapshot()
+	out = []
+	for key, game in (prefs.get("games", {}) or {}).items():
+		if not isinstance(game, dict):
+			continue
+		if game.get("enabled"):
+			entry = dict(game)
+			entry["game_key"] = key
+			out.append(entry)
+	return out
+
+def is_rust_game_preference(game_entry: dict) -> bool:
+	if not isinstance(game_entry, dict):
+		return False
+	key = (game_entry.get("game_key") or derive_game_key(game_entry.get("game_url"), game_entry.get("game")) or "").lower()
+	name = (game_entry.get("game") or "").lower()
+	url = (game_entry.get("game_url") or "").lower()
+	return "rust" in key or name == "rust" or "/rust" in url
+
+def is_streamer_allowed_for_game_preference(game_entry: dict, streamer_name: str, streamer_url: str | None = None) -> bool:
+	"""If no specific streamers selected, all streamers are allowed."""
+	if not isinstance(game_entry, dict):
+		return True
+	streamers = game_entry.get("streamers", {})
+	if not isinstance(streamers, dict) or not streamers:
+		return True
+	selected_streamers = [s for s, enabled in streamers.items() if bool(enabled)]
+	if not selected_streamers:
+		return True
+	for selected in selected_streamers:
+		if is_streamer_name_match(streamer_name, selected, streamer_url=streamer_url):
+			return True
+	return False
 
 def get_integrity_prefs():
 	try:
@@ -328,6 +539,145 @@ def update_current_working_item(item_info):
 		current_working_item = item_info
 		logging.debug(f"Updated current working item: {item_info}")
 
+def _normalize_match_text(value: str) -> str:
+	text = (value or "").strip().lower()
+	if not text:
+		return ""
+	text = text.replace("_", " ").replace("-", " ")
+	text = re.sub(r"https?://(www\.)?twitch\.tv/", "", text)
+	text = re.sub(r"[^a-z0-9\s]", " ", text)
+	text = re.sub(r"\s+", " ", text).strip()
+	return text
+
+def _compact_match_text(value: str) -> str:
+	return _normalize_match_text(value).replace(" ", "")
+
+def _tokenize_match_text(value: str) -> set[str]:
+	return {tok for tok in _normalize_match_text(value).split(" ") if len(tok) >= 3}
+
+def _extract_channel_login(url: str | None) -> str | None:
+	raw = (url or "").strip()
+	if not raw:
+		return None
+	try:
+		parsed = urlparse(raw if raw.startswith("http") else f"https://www.twitch.tv{raw}")
+		parts = [p for p in parsed.path.split('/') if p]
+		if not parts:
+			return None
+		first = parts[0].lower()
+		invalid = {"directory", "drops", "videos", "settings", "login", "signup"}
+		return None if first in invalid else first
+	except Exception:
+		return None
+
+def _absolutize_twitch_href(href: str | None) -> str:
+	link = (href or "").strip()
+	if not link:
+		return ""
+	return f"https://www.twitch.tv{link}" if link.startswith("/") else link
+
+def _contains_variation(title_norm: str, title_compact: str, variation: str) -> bool:
+	var_norm = _normalize_match_text(variation)
+	if not var_norm:
+		return False
+	var_compact = var_norm.replace(" ", "")
+	if len(var_norm) >= 3 and f" {var_norm} " in f" {title_norm} ":
+		return True
+	if len(var_norm) >= 4 and var_norm in title_norm:
+		return True
+	if len(var_compact) >= 4 and var_compact in title_compact:
+		return True
+	return False
+
+def is_streamer_name_match(streamer_name: str, candidate_name: str, streamer_url: str | None = None) -> bool:
+	"""Flexible name matcher for Facepunch/Twitch naming differences."""
+	candidate_norm = _normalize_match_text(candidate_name)
+	candidate_compact = candidate_norm.replace(" ", "")
+	if not candidate_norm:
+		return False
+	variations = generate_search_variations(streamer_name)
+	channel_login = _extract_channel_login(streamer_url)
+	if channel_login:
+		variations.append(channel_login)
+	seen = set()
+	for variation in variations:
+		key = _normalize_match_text(variation)
+		if not key or key in seen:
+			continue
+		seen.add(key)
+		if _contains_variation(candidate_norm, candidate_compact, variation):
+			return True
+	# Token overlap fallback
+	streamer_tokens = set()
+	for variation in seen:
+		streamer_tokens.update(_tokenize_match_text(variation))
+	if channel_login:
+		streamer_tokens.update(_tokenize_match_text(channel_login))
+	if streamer_tokens and (streamer_tokens & _tokenize_match_text(candidate_name)):
+		return True
+	return False
+
+def find_recently_claimed_match(streamer_name: str, recently_claimed_items: list[dict] | None, streamer_url: str | None = None) -> dict | None:
+	for item in recently_claimed_items or []:
+		claimed_name = item.get("name", "")
+		if not claimed_name:
+			continue
+		if is_streamer_name_match(streamer_name, claimed_name, streamer_url=streamer_url):
+			return item
+	return None
+
+def match_streamer_drop_progress(drop: dict, inventory_progress: dict, used_titles: set[str] | None = None) -> tuple[int | None, str | None, int]:
+	"""Score inventory titles using streamer + item (+ channel URL) to avoid collisions."""
+	streamer_name = drop.get("streamer", "") if isinstance(drop, dict) else ""
+	item_name = drop.get("item", "") if isinstance(drop, dict) else ""
+	streamer_url = drop.get("url", "") if isinstance(drop, dict) else ""
+	if not streamer_name and not item_name:
+		return None, None, 0
+	channel_login = _extract_channel_login(streamer_url)
+	streamer_variations = generate_search_variations(streamer_name)
+	if channel_login:
+		streamer_variations.append(channel_login)
+	item_variations = generate_search_variations(item_name)
+	title_scores: list[tuple[int, str, int]] = []
+	used = used_titles or set()
+	for title, percent in (inventory_progress or {}).items():
+		if not isinstance(title, str) or not isinstance(percent, int):
+			continue
+		title_norm = _normalize_match_text(title)
+		title_compact = title_norm.replace(" ", "")
+		score = 0
+		# Strong signal: channel login from Facepunch twitch URL
+		if channel_login and _contains_variation(title_norm, title_compact, channel_login):
+			score += 70
+		# Streamer text matching
+		for variation in streamer_variations:
+			if _contains_variation(title_norm, title_compact, variation):
+				score += 42
+				break
+		streamer_tokens = set()
+		for variation in streamer_variations:
+			streamer_tokens.update(_tokenize_match_text(variation))
+		streamer_overlap = len(streamer_tokens & _tokenize_match_text(title))
+		score += min(24, streamer_overlap * 8)
+		# Item text matching helps disambiguate multiple drops for one streamer
+		for variation in item_variations:
+			if _contains_variation(title_norm, title_compact, variation):
+				score += 40
+				break
+		item_overlap = len(_tokenize_match_text(item_name) & _tokenize_match_text(title))
+		score += min(24, item_overlap * 8)
+		if title in used:
+			score -= 20
+		if score > 0:
+			title_scores.append((score, title, percent))
+	if not title_scores:
+		return None, None, 0
+	title_scores.sort(key=lambda s: (-s[0], s[1]))
+	best_score, best_title, best_percent = title_scores[0]
+	if best_score < 40:
+		return None, None, best_score
+	return best_percent, best_title, best_score
+
 
 def intelligent_item_matching(item_name, inventory_progress):
 	"""
@@ -376,67 +726,13 @@ def intelligent_item_matching(item_name, inventory_progress):
 def intelligent_streamer_matching(streamer_name, inventory_progress):
 	"""
 	Intelligent matching for streamer names that don't exactly match inventory titles.
-	Handles cases like 'XCHOCOBARS' -> 'xChoco'
-	Also uses custom name mappings from config.
+	Legacy wrapper for compatibility with existing call sites.
 	"""
-	streamer_lower = streamer_name.lower().strip()
-	logging.info(f"[INTELLIGENT-MATCH] Starting intelligent matching for '{streamer_name}' (lowercase: '{streamer_lower}')")
-	logging.info(f"[INTELLIGENT-MATCH] Checking against {len(inventory_progress)} inventory items")
-	
-	# Get search variations including custom mappings
-	search_variations = generate_search_variations(streamer_name)
-	logging.info(f"[INTELLIGENT-MATCH] Using {len(search_variations)} search variations: {search_variations}")
-	
-	# First try exact substring match with all variations
-	for title, percent in inventory_progress.items():
-		title_lower = title.lower()
-		for variation in search_variations:
-			logging.info(f"[INTELLIGENT-MATCH] Checking if '{variation}' is in '{title_lower}'")
-			if variation in title_lower:
-				logging.info(f"[INTELLIGENT-MATCH] EXACT MATCH FOUND! '{variation}' found in '{title_lower}' -> {percent}%")
-				return percent, title
-			else:
-				logging.info(f"[INTELLIGENT-MATCH] No exact match: '{variation}' not in '{title_lower}'")
-	
-	# Try partial matching - check if streamer variations contain significant parts of inventory title
-	for title, percent in inventory_progress.items():
-		title_lower = title.lower()
-		
-		# Extract meaningful parts (remove common suffixes/prefixes)
-		title_clean = title_lower.replace('tv', '').replace('streamer', '').replace('channel', '')
-		
-		# Try partial matching with each search variation
-		for variation in search_variations:
-			streamer_clean = variation.replace('tv', '').replace('streamer', '').replace('channel', '')
-			
-			# Check if cleaned streamer variation contains title or vice versa
-			if len(title_clean) >= 4 and title_clean in streamer_clean:
-				logging.info(f"[INTELLIGENT-MATCH] PARTIAL MATCH FOUND! '{streamer_name}' (variation: '{variation}') -> '{title}' (partial match)")
-				return percent, title
-			if len(streamer_clean) >= 4 and streamer_clean in title_clean:
-				logging.info(f"[INTELLIGENT-MATCH] REVERSE PARTIAL MATCH FOUND! '{streamer_name}' (variation: '{variation}') -> '{title}' (reverse partial match)")
-				return percent, title
-	
-	# Try word-based matching for multi-word names using all search variations
-	for title, percent in inventory_progress.items():
-		title_lower = title.lower()
-		title_words = [word for word in title_lower.split() if len(word) > 2]
-		
-		# Try word matching with each search variation
-		for variation in search_variations:
-			streamer_words = [word for word in variation.split() if len(word) > 2]
-			
-			if streamer_words and title_words:
-				# Check if any significant words match
-				for streamer_word in streamer_words:
-					for title_word in title_words:
-						if len(streamer_word) >= 4 and len(title_word) >= 4:
-							# Check if one word is contained in the other
-							if streamer_word in title_word or title_word in streamer_word:
-								logging.info(f"[INTELLIGENT-MATCH] WORD MATCH FOUND! '{streamer_name}' (variation: '{variation}') -> '{title}' (word match: '{streamer_word}' <-> '{title_word}')")
-								return percent, title
-	
-	return None, None
+	progress, title, _ = match_streamer_drop_progress(
+		{"streamer": streamer_name, "item": "", "url": ""},
+		inventory_progress,
+	)
+	return progress, title
 
 
 def update_cached_drops_data(facepunch_data, inventory_progress, recently_claimed_streamers=None, general_progress_map=None):
@@ -449,30 +745,17 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			# Update existing cache with new progress data
 			if cached_drops_data and cached_drops_data.get("in_progress"):
 				for drop in cached_drops_data["in_progress"]:
-					# Update progress for matching items
+					if drop.get("type") == "streamer":
+						match_progress, match_title, _ = match_streamer_drop_progress(drop, inventory_progress)
+						if match_progress is not None:
+							drop["progress"] = match_progress
+							drop["progress_title"] = match_title
+						continue
+					# Update progress for matching general items
 					for title, percent in inventory_progress.items():
-						# For streamer drops, match by streamer name in title
-						if drop.get("type") == "streamer" and drop.get("streamer"):
-							streamer_name = drop["streamer"]
-							# First try exact substring match
-							if streamer_name.lower() in title.lower():
-								drop["progress"] = percent
-								drop["progress_title"] = title
-								break
-							# If no exact match, try intelligent matching
-							else:
-								intelligent_progress, intelligent_title = intelligent_streamer_matching(streamer_name, {title: percent})
-								if intelligent_progress is not None:
-									drop["progress"] = percent
-									drop["progress_title"] = title
-									break
-						# For general drops, match by exact item name (not partial match)
-						elif drop.get("type") == "general" and drop.get("item"):
-							# Check if the title contains the exact item name as a standalone word
+						if drop.get("type") == "general" and drop.get("item"):
 							item_lower = drop["item"].lower()
 							title_lower = title.lower()
-							# Use word boundaries to avoid partial matches
-							import re
 							if re.search(r'\b' + re.escape(item_lower) + r'\b', title_lower):
 								drop["progress"] = percent
 								drop["progress_title"] = title
@@ -506,6 +789,7 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 
 		# Process streamer-specific drops
 		streamer_drops = facepunch_data.get('streamer', []) if facepunch_data else []
+		used_progress_titles = set()
 		for drop in streamer_drops:
 			streamer_name = drop.get('streamer', '')
 			item_name = drop.get('item', '')
@@ -513,23 +797,19 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			is_live = drop.get('is_live', False)
 			url = drop.get('url', '')
 			
-			# Find matching inventory progress
-			progress = None
-			progress_title = None
-			# First try exact substring match (original behavior)
-			for title, percent in inventory_progress.items():
-				if streamer_name.lower() in title.lower():
-					progress = percent
-					progress_title = title
-					break
-			
-			# If no exact match, try intelligent matching
-			if progress is None:
-				intelligent_progress, intelligent_title = intelligent_streamer_matching(streamer_name, inventory_progress)
-				if intelligent_progress is not None:
-					progress = intelligent_progress
-					progress_title = intelligent_title
-					logging.info(f"Found intelligent match for streamer '{streamer_name}': {intelligent_title} ({intelligent_progress}%)")
+			progress, progress_title, match_score = match_streamer_drop_progress(
+				drop,
+				inventory_progress,
+				used_titles=used_progress_titles
+			)
+			if progress_title:
+				used_progress_titles.add(progress_title)
+				logging.info(
+					f"[STREAMER-MATCH] '{streamer_name}' / '{item_name}' -> '{progress_title}' "
+					f"({progress}%, score={match_score})"
+				)
+			else:
+				logging.info(f"[STREAMER-MATCH] No progress title matched for '{streamer_name}' / '{item_name}'")
 			
 			drop_info = {
 				"type": "streamer",
@@ -546,26 +826,13 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			
 			if progress is None:
 				# Check if this streamer was recently claimed before marking as not_started
-				streamer_claimed = False
-				logging.info(f"[DROPS-CATEGORIZATION] Streamer '{streamer_name}' has no progress - checking if recently claimed")
-				logging.info(f"[DROPS-CATEGORIZATION] Recently claimed streamers list: {recently_claimed_streamers}")
-				
-				if recently_claimed_streamers:
-					for claimed_item in recently_claimed_streamers:
-						claimed_name = claimed_item.get('name', '').lower()
-						logging.info(f"[DROPS-CATEGORIZATION] Checking against claimed item: '{claimed_name}'")
-						# Use intelligent matching to check if this streamer was claimed
-						name_vars = generate_search_variations(streamer_name)
-						logging.info(f"[DROPS-CATEGORIZATION] Generated variations for '{streamer_name}': {name_vars}")
-						for variation in name_vars:
-							if variation and variation in claimed_name:
-								streamer_claimed = True
-								logging.info(f"[DROPS-CATEGORIZATION] MATCH FOUND! Streamer '{streamer_name}' (variation: '{variation}') found in recently claimed items: '{claimed_name}' - marking as completed")
-								break
-						if streamer_claimed:
-							break
-				else:
-					logging.info(f"[DROPS-CATEGORIZATION] No recently claimed streamers list provided")
+				claimed_match = find_recently_claimed_match(streamer_name, recently_claimed_streamers, streamer_url=url)
+				streamer_claimed = bool(claimed_match)
+				if streamer_claimed:
+					logging.info(
+						f"[DROPS-CATEGORIZATION] '{streamer_name}' treated as completed from claimed history "
+						f"('{claimed_match.get('name')}', {claimed_match.get('days')} day(s) ago)"
+					)
 				
 				if streamer_claimed:
 					# Mark as completed since it was recently claimed
@@ -683,7 +950,8 @@ def load_preferences():
 		"hide_console": True,
 		"test_mode": False,
 		"debug_mode": False,
-		"enable_web_interface": True
+		"enable_web_interface": True,
+		"watch_preferences": {"games": {}}
 	}
 	try:
 		if os.path.exists(CONFIG_PATH):
@@ -691,6 +959,7 @@ def load_preferences():
 				data = json.load(f)
 				if isinstance(data, dict):
 					default_prefs.update(data)
+					default_prefs["watch_preferences"] = _sanitize_watch_preferences(default_prefs.get("watch_preferences"))
 	except Exception as e:
 		logging.debug(f"Could not load preferences: {e}")
 	return default_prefs
@@ -993,6 +1262,8 @@ def create_web_app():
 	@app.route('/api/status')
 	def api_status():
 		"""API endpoint to get current status"""
+		watch_prefs = get_watch_preferences_snapshot()
+		enabled_games = get_enabled_game_preferences(watch_prefs)
 		return jsonify({
 			'status': 'running',
 			'headless': PREFERENCES.get('headless', DEFAULT_HEADLESS) if PREFERENCES else DEFAULT_HEADLESS,
@@ -1001,6 +1272,10 @@ def create_web_app():
 			'enable_web_interface': PREFERENCES.get('enable_web_interface', True) if PREFERENCES else True,
 			'integrity_valid': is_integrity_valid(),
 			'integrity_age_seconds': max(0, _now_ts() - int(PREFERENCES.get('integrity_fetched_at', 0))) if PREFERENCES else 0,
+			'login_state': get_login_status_snapshot().get('state'),
+			'logged_in': bool(get_login_status_snapshot().get('logged_in')),
+			'watch_selection_active': bool(enabled_games),
+			'watch_selected_games_count': len(enabled_games),
 			'version': get_current_version(),
 			'timestamp': datetime.now().isoformat()
 		})
@@ -1083,6 +1358,121 @@ def create_web_app():
 		except Exception as e:
 			logging.error(f"Error fetching drops data: {e}")
 			return jsonify({'error': str(e)}), 500
+
+	@app.route('/api/games', methods=['GET'])
+	def api_games():
+		"""Get cached list of drop-enabled games."""
+		try:
+			return jsonify(get_cached_games_data_snapshot())
+		except Exception as e:
+			return jsonify({'error': str(e)}), 500
+
+	@app.route('/api/games/streamers', methods=['GET'])
+	def api_game_streamers():
+		"""Fetch live drop-enabled streamers for a specific game category URL."""
+		game_url = (request.args.get("game_url") or "").strip()
+		if not game_url:
+			return jsonify({'success': False, 'message': 'Missing game_url'}), 400
+		try:
+			async def _refresh():
+				return await fetch_game_streamers_public(game_url, limit=100)
+			loop = asyncio.new_event_loop()
+			try:
+				streamers = loop.run_until_complete(_refresh())
+			finally:
+				loop.close()
+			return jsonify({
+				"success": True,
+				"game_url": game_url,
+				"count": len(streamers),
+				"streamers": streamers
+			})
+		except Exception as e:
+			return jsonify({'success': False, 'message': str(e)}), 500
+
+	@app.route('/api/games/refresh', methods=['POST'])
+	def api_games_refresh():
+		"""Refresh drop-enabled games immediately."""
+		try:
+			async def _refresh():
+				return await fetch_drops_enabled_games_public(limit=160)
+			loop = asyncio.new_event_loop()
+			try:
+				games = loop.run_until_complete(_refresh())
+			finally:
+				loop.close()
+			update_cached_games_data(games=games, source="twitch_directory", error=None)
+			# Also ask the workflow loop to refresh with the signed-in context later.
+			GAMES_REFRESH_REQUESTED.set()
+			return jsonify({
+				"success": True,
+				"count": len(games),
+				"games": games,
+				"last_updated": datetime.now().isoformat()
+			})
+		except Exception as e:
+			update_cached_games_data(games=None, source="twitch_directory", error=str(e))
+			return jsonify({'success': False, 'message': str(e)}), 500
+
+	@app.route('/api/login-status', methods=['GET'])
+	def api_login_status():
+		"""Expose login-helper status for the dashboard."""
+		try:
+			data = get_login_status_snapshot()
+			data["headless"] = PREFERENCES.get('headless', DEFAULT_HEADLESS) if PREFERENCES else DEFAULT_HEADLESS
+			data["test_mode"] = PREFERENCES.get('test_mode', False) if PREFERENCES else False
+			data["needs_visible_browser"] = bool(data.get("headless"))
+			return jsonify(data)
+		except Exception as e:
+			return jsonify({'error': str(e)}), 500
+
+	@app.route('/api/login/mode', methods=['POST'])
+	def api_login_mode():
+		"""Switch between guided-login mode and normal mode."""
+		try:
+			data = request.get_json(silent=True) or {}
+			mode = (data.get('mode') or 'guided').strip().lower()
+			with CONFIG_LOCK:
+				if mode == 'guided':
+					PREFERENCES['headless'] = False
+					PREFERENCES['test_mode'] = True
+					message = "Guided login mode enabled (visible browser + test mode)."
+				elif mode == 'normal':
+					PREFERENCES['headless'] = bool(data.get('headless', True))
+					PREFERENCES['test_mode'] = bool(data.get('test_mode', False))
+					message = "Normal mode settings restored."
+				else:
+					return jsonify({'success': False, 'message': f"Unsupported mode '{mode}'"}), 400
+				save_preferences(PREFERENCES)
+			set_login_status(
+				state="pending_restart",
+				logged_in=False,
+				message=f"{message} Click restart to apply."
+			)
+			return jsonify({
+				'success': True,
+				'mode': mode,
+				'headless': PREFERENCES.get('headless', DEFAULT_HEADLESS),
+				'test_mode': PREFERENCES.get('test_mode', False),
+				'message': message + " Restart required."
+			})
+		except Exception as e:
+			return jsonify({'success': False, 'message': str(e)}), 500
+
+	@app.route('/api/watch-preferences', methods=['GET', 'POST'])
+	def api_watch_preferences():
+		"""Get or update selected games and streamer toggles."""
+		if request.method == 'GET':
+			try:
+				return jsonify(get_watch_preferences_snapshot())
+			except Exception as e:
+				return jsonify({'error': str(e)}), 500
+		try:
+			data = request.get_json(silent=True) or {}
+			updated = update_watch_preferences(data)
+			return jsonify({'success': True, 'watch_preferences': updated})
+		except Exception as e:
+			return jsonify({'success': False, 'message': str(e)}), 500
 
 	@app.route('/api/restart', methods=['POST'])
 	def api_restart():
@@ -1849,6 +2239,7 @@ async def wait_until_logged_in(context, page) -> None:
 	"""
 	poll_page = None
 	try:
+		set_login_status("awaiting_login", False, "Waiting for Twitch login in browser")
 		# One-time reminder toast
 		try:
 			send_notification("Twitch Drops", "Waiting for login… Right-click tray → untick 'Headless mode'")
@@ -1869,8 +2260,10 @@ async def wait_until_logged_in(context, page) -> None:
 				avatar = await poll_page.query_selector('img[alt="User Avatar"]')
 				if avatar:
 					logging.info("Detected user avatar; login complete.")
+					set_login_status("logged_in", True, "Logged in to Twitch", {"url": poll_page.url})
 					return
 				logging.info("Not logged in yet; still waiting…")
+				set_login_status("awaiting_login", False, "Not logged in yet", {"url": poll_page.url})
 			except Exception:
 				pass
 			await asyncio.sleep(5)
@@ -1888,6 +2281,7 @@ async def run_flow(p):
 	while True:
 		if EXIT_EVENT.is_set():
 			raise asyncio.CancelledError("Exit requested")
+		set_login_status("starting", False, "Launching browser and checking login")
 		context = None
 		page = None
 		passport_429_count = {"count": 0}
@@ -1912,6 +2306,7 @@ async def run_flow(p):
 
 			warm_done = False
 			if any(x in page.url for x in ["/login", "id.twitch.tv"]):
+				set_login_status("awaiting_login", False, "Twitch login required", {"url": page.url})
 				logging.info("Detected Twitch login flow. Waiting for SSO to initialize...")
 				try:
 					await wait_with_exit(asyncio.create_task(page.wait_for_load_state("networkidle", timeout=30000)))
@@ -1954,6 +2349,7 @@ async def run_flow(p):
 				
 				if avatar_found:
 					success = True
+					set_login_status("logged_in", True, "Logged in to Twitch", {"url": page.url})
 					return context
 				else:
 					logging.warning("Could not find user avatar with any selector. User may not be logged in.")
@@ -1961,6 +2357,7 @@ async def run_flow(p):
 					
 			except Exception:
 				logging.warning("Could not find user avatar. User may not be logged in. Waiting for user to complete login.")
+				set_login_status("awaiting_login", False, "Waiting for manual Twitch login", {"url": page.url})
 				await wait_until_logged_in(context, page)
 				# After wait, verify again with multiple selectors
 				avatar_found = False
@@ -1975,10 +2372,12 @@ async def run_flow(p):
 				
 				if avatar_found:
 					success = True
+					set_login_status("logged_in", True, "Logged in to Twitch", {"url": page.url})
 					return context
 				else:
 					raise Exception("Login verification failed - no avatar found after waiting")
 		except Exception as e:
+			set_login_status("error", False, f"Login flow failed: {e}")
 			if passport_429_count["count"] >= PASSPORT_429_THRESHOLD and not tried_compat:
 				tried_compat = True
 				logging.info("Closing current context to retry in compatibility mode...")
@@ -2333,6 +2732,228 @@ async def fetch_facepunch_drops(context):
 		except Exception:
 			pass
 
+async def _extract_drop_games_from_directory_page(page, limit: int = 120) -> list[dict]:
+	await goto_with_exit(page, TWITCH_DROPS_ENABLED_DIRECTORY_URL, timeout=120000, wait_until="domcontentloaded")
+	await maybe_accept_cookies(page)
+	await page.wait_for_timeout(1200)
+	raw_rows = await page.evaluate(
+		r"""
+		(args) => {
+		  const maxCards = (args && args.limit) || 120;
+		  const rows = [];
+		  const cards = Array.from(document.querySelectorAll('article')).slice(0, maxCards);
+		  for (const card of cards) {
+			const tags = Array.from(card.querySelectorAll('[data-a-target="tag"], a[data-a-target="tag"], span'))
+			  .map(n => (n.textContent || '').trim().toLowerCase())
+			  .filter(Boolean);
+			const hasDrops = tags.some(t => t.includes('drops'));
+			if (!hasDrops) continue;
+			const gameAnchor = card.querySelector('a[data-a-target="preview-card-game-link"], a[href*="/directory/category/"], a[href*="/directory/game/"]');
+			const game = (gameAnchor?.textContent || '').trim();
+			if (!game) continue;
+			const gameHref = (gameAnchor?.getAttribute('href') || '').trim();
+			const streamerAnchor = card.querySelector('a[data-a-target="preview-card-title-link"], a[href^="/"]');
+			const streamerHref = (streamerAnchor?.getAttribute('href') || '').trim();
+			const viewerNode = card.querySelector('[data-a-target="animated-channel-viewers-count"], [data-a-target*="viewers"]');
+			const viewersText = (viewerNode?.textContent || '').trim();
+			rows.push({
+			  game,
+			  game_url: gameHref,
+			  streamer_url: streamerHref,
+			  viewers_text: viewersText
+			});
+		  }
+		  return rows;
+		}
+		""",
+		{"limit": int(limit)}
+	)
+	aggregated = {}
+	for row in raw_rows or []:
+		game_name = (row.get("game") or "").strip()
+		if not game_name:
+			continue
+		game_url = _absolutize_twitch_href(row.get("game_url"))
+		streamer_login = _extract_channel_login(row.get("streamer_url"))
+		key = game_url or _normalize_match_text(game_name)
+		if not key:
+			continue
+		entry = aggregated.setdefault(key, {
+			"game": game_name,
+			"game_url": game_url,
+			"active_channels": 0,
+			"sample_streamers": [],
+			"viewer_samples": []
+		})
+		entry["active_channels"] += 1
+		if streamer_login and streamer_login not in entry["sample_streamers"] and len(entry["sample_streamers"]) < 4:
+			entry["sample_streamers"].append(streamer_login)
+		viewer_text = (row.get("viewers_text") or "").strip()
+		if viewer_text and viewer_text not in entry["viewer_samples"] and len(entry["viewer_samples"]) < 3:
+			entry["viewer_samples"].append(viewer_text)
+	games = sorted(
+		aggregated.values(),
+		key=lambda g: (-(g.get("active_channels") or 0), _normalize_match_text(g.get("game") or ""))
+	)
+	return games
+
+def _normalize_game_directory_url(game_url: str) -> str:
+	url = (game_url or "").strip()
+	if not url:
+		return ""
+	if url.startswith("http://") or url.startswith("https://"):
+		return url
+	if url.startswith("/"):
+		return f"https://www.twitch.tv{url}"
+	return f"https://www.twitch.tv/directory/category/{url.strip('/')}"
+
+def _viewer_count_score(viewers_text: str) -> int:
+	text = (viewers_text or "").strip().lower().replace(",", "")
+	if not text:
+		return 0
+	try:
+		m = re.search(r"(\d+(?:\.\d+)?)\s*([km]?)", text)
+		if not m:
+			return 0
+		value = float(m.group(1))
+		scale = m.group(2)
+		if scale == "k":
+			value *= 1000
+		elif scale == "m":
+			value *= 1000000
+		return int(value)
+	except Exception:
+		return 0
+
+async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limit: int = 80, use_exit_guard: bool = True) -> list[dict]:
+	target_url = _normalize_game_directory_url(game_url)
+	if not target_url:
+		return []
+	if use_exit_guard:
+		await goto_with_exit(page, target_url, timeout=120000, wait_until="domcontentloaded")
+	else:
+		await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
+	await maybe_accept_cookies(page)
+	await page.wait_for_timeout(2500)
+	rows = await page.evaluate(
+		r"""
+		(args) => {
+		  const maxCards = (args && args.limit) || 80;
+		  const disallowedLogins = new Set([
+			'directory','drops','inventory','downloads','jobs','products','prime','turbo',
+			'wallet','settings','search','videos','friends','subscriptions','store','activate','apply'
+		  ]);
+		  const out = [];
+		  const cards = Array.from(document.querySelectorAll('article')).slice(0, maxCards);
+		  for (const card of cards) {
+			const streamerAnchor = card.querySelector('a[data-a-target="preview-card-title-link"], a[data-a-target="preview-card-image-link"]')
+			  || Array.from(card.querySelectorAll('a[href^="/"]')).find(a => {
+				const hrefCandidate = (a.getAttribute('href') || '').trim();
+				return /^\/[a-z0-9_]+(?:\?|$)/i.test(hrefCandidate);
+			  });
+			if (!streamerAnchor) continue;
+			const href = (streamerAnchor.getAttribute('href') || '').trim();
+			if (!href) continue;
+			const login = href.replace(/^\//, '').split('/')[0].trim().toLowerCase();
+			if (!login) continue;
+			if (disallowedLogins.has(login)) continue;
+			const tags = Array.from(card.querySelectorAll('[data-a-target="tag"], a[data-a-target="tag"], span'))
+			  .map(n => (n.textContent || '').trim().toLowerCase())
+			  .filter(Boolean);
+			const hasDrops = tags.some(t => t.includes('drops'));
+			const viewers = (card.querySelector('[data-a-target="animated-channel-viewers-count"], [data-a-target*="viewers"]')?.textContent || '').trim();
+			const game = (card.querySelector('a[data-a-target="preview-card-game-link"]')?.textContent || '').trim();
+			out.push({
+			  streamer: login,
+			  stream_url: href.startsWith('/') ? `https://www.twitch.tv${href}` : href,
+			  viewers_text: viewers,
+			  game,
+			  has_drops: hasDrops
+			});
+		  }
+		  return out;
+		}
+		""",
+		{"limit": int(limit)}
+	)
+	# Deduplicate by streamer, keep highest viewer score.
+	best_by_streamer = {}
+	for row in rows or []:
+		streamer = (row.get("streamer") or "").strip().lower()
+		if not streamer:
+			continue
+		score = _viewer_count_score(row.get("viewers_text") or "")
+		prev = best_by_streamer.get(streamer)
+		row_has_drops = bool(row.get("has_drops"))
+		prev_has_drops = bool(prev.get("has_drops")) if prev else False
+		if (
+			not prev
+			or (row_has_drops and not prev_has_drops)
+			or (row_has_drops == prev_has_drops and score > prev.get("viewer_score", 0))
+		):
+			item = dict(row)
+			item["viewer_score"] = score
+			best_by_streamer[streamer] = item
+	streamers = sorted(
+		best_by_streamer.values(),
+		key=lambda s: (0 if s.get("has_drops") else 1, -(s.get("viewer_score") or 0), s.get("streamer") or "")
+	)
+	return streamers
+
+async def fetch_live_drops_streamers_for_game(context, game_url: str, limit: int = 80) -> list[dict]:
+	page = await context.new_page()
+	try:
+		return await _extract_live_drops_streamers_from_game_page(page, game_url=game_url, limit=limit, use_exit_guard=True)
+	finally:
+		try:
+			await page.close()
+		except Exception:
+			pass
+
+async def fetch_drops_enabled_games(context, limit: int = 120) -> list[dict]:
+	page = await context.new_page()
+	try:
+		return await _extract_drop_games_from_directory_page(page, limit=limit)
+	finally:
+		try:
+			await page.close()
+		except Exception:
+			pass
+
+async def fetch_drops_enabled_games_public(limit: int = 120) -> list[dict]:
+	"""One-off scrape for the dashboard refresh button."""
+	async with async_playwright() as p:
+		browser = await p.chromium.launch(headless=True)
+		page = await browser.new_page(locale="en-US")
+		try:
+			return await _extract_drop_games_from_directory_page(page, limit=limit)
+		finally:
+			try:
+				await browser.close()
+			except Exception:
+				pass
+
+async def fetch_game_streamers_public(game_url: str, limit: int = 80) -> list[dict]:
+	"""One-off scrape for live drop-enabled streamers in a selected game category."""
+	target_url = _normalize_game_directory_url(game_url)
+	if not target_url:
+		return []
+	async with async_playwright() as p:
+		browser = await p.chromium.launch(headless=True)
+		page = await browser.new_page(locale="en-US")
+		try:
+			return await _extract_live_drops_streamers_from_game_page(
+				page,
+				game_url=target_url,
+				limit=limit,
+				use_exit_guard=False
+			)
+		finally:
+			try:
+				await browser.close()
+			except Exception:
+				pass
+
 # ---- Drops workflow helpers ----
 
 async def get_inventory_progress_map(inv_page):
@@ -2555,7 +3176,7 @@ def generate_search_variations(base_name: str) -> list[str]:
 	name = (base_name or "").strip().lower()
 	if not name:
 		return []
-	variations = [name]
+	variations = [name, _normalize_match_text(name)]
 	
 	# Add custom name mappings from separate mappings file
 	try:
@@ -2564,6 +3185,7 @@ def generate_search_variations(base_name: str) -> list[str]:
 			mapped_name = mappings[name].lower()
 			if mapped_name not in variations:
 				variations.append(mapped_name)
+				variations.append(_normalize_match_text(mapped_name))
 				logging.info(f"[NAME-MAPPING] Added mapping for '{name}' -> '{mapped_name}'")
 	except Exception as e:
 		logging.warning(f"[NAME-MAPPING] Error accessing name mappings: {e}")
@@ -2578,13 +3200,22 @@ def generate_search_variations(base_name: str) -> list[str]:
 				p = part.strip()
 				if len(p) > 3:
 					variations.append(p)
+	# Add compact forms so `x choco` also matches `xchoco`
+	for existing in list(variations):
+		norm = _normalize_match_text(existing)
+		compact = norm.replace(" ", "")
+		if norm and norm not in variations:
+			variations.append(norm)
+		if len(compact) >= 4 and compact not in variations:
+			variations.append(compact)
 	# Deduplicate
 	seen = set()
 	out = []
 	for v in variations:
-		if v and v not in seen:
-			seen.add(v)
-			out.append(v)
+		key = _normalize_match_text(v) or (v or "").strip().lower()
+		if key and key not in seen:
+			seen.add(key)
+			out.append(key)
 	return out
 
 async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | None:
@@ -2852,6 +3483,84 @@ async def pick_live_rust_stream_with_drops(context, preferred_streamers=None):
 	finally:
 		await page.close()
 
+async def pick_live_stream_from_enabled_games(context, enabled_games: list[dict]) -> dict | None:
+	"""Pick the strongest live drops-enabled stream from selected games/preferences."""
+	candidates = []
+	for game_entry in enabled_games or []:
+		game_name = (game_entry.get("game") or "").strip()
+		game_url = (game_entry.get("game_url") or "").strip()
+		if not game_url:
+			continue
+		try:
+			streamers = await fetch_live_drops_streamers_for_game(context, game_url, limit=80)
+		except Exception as e:
+			logging.debug(f"Failed loading streamers for {game_name or game_url}: {e}")
+			continue
+		for stream in streamers:
+			streamer = (stream.get("streamer") or "").strip()
+			stream_url = (stream.get("stream_url") or "").strip()
+			if not streamer or not stream_url:
+				continue
+			if not is_streamer_allowed_for_game_preference(game_entry, streamer, streamer_url=stream_url):
+				continue
+			candidate = {
+				"game": game_name or stream.get("game") or game_entry.get("game_key") or "Unknown Game",
+				"game_url": game_url,
+				"game_key": game_entry.get("game_key") or derive_game_key(game_url, game_name),
+				"streamer": streamer,
+				"stream_url": stream_url,
+				"has_drops": bool(stream.get("has_drops")),
+				"viewer_score": int(stream.get("viewer_score") or 0),
+				"viewers_text": stream.get("viewers_text") or ""
+			}
+			candidates.append(candidate)
+	if not candidates:
+		return None
+	candidates.sort(
+		key=lambda c: (0 if c.get("has_drops") else 1, -(c.get("viewer_score") or 0), c.get("streamer") or "")
+	)
+	return candidates[0]
+
+async def watch_selected_games_cycle(context, inv_page, enabled_games: list[dict]) -> bool:
+	"""Watch selected non-Rust games with optional streamer filters."""
+	target = await pick_live_stream_from_enabled_games(context, enabled_games)
+	if not target:
+		logging.info("No live drops-enabled stream found for selected games. Retrying shortly.")
+		await asyncio.sleep(20)
+		return False
+	stream_page = await context.new_page()
+	try:
+		await goto_with_exit(stream_page, target["stream_url"], timeout=120000, wait_until="domcontentloaded")
+		await maybe_accept_cookies(stream_page)
+		update_current_working_item({
+			"type": "game",
+			"item": target.get("game"),
+			"streamer": target.get("streamer"),
+			"url": target.get("stream_url"),
+			"status": "selected game mode"
+		})
+		send_notification("Twitch Drops", f"Watching {target.get('streamer')} for {target.get('game')}")
+		await ensure_stream_playing(stream_page)
+		await set_low_quality(stream_page)
+		# Short watch slice; workflow loop will repick based on current live status/preferences.
+		for _ in range(4):
+			if EXIT_EVENT.is_set():
+				return True
+			try:
+				progress_map = await get_inventory_progress_map(inv_page)
+				if progress_map:
+					update_cached_drops_data(None, progress_map)
+			except Exception as e:
+				logging.debug(f"Selected-game progress refresh failed: {e}")
+			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
+		return True
+	finally:
+		try:
+			await stream_page.close()
+		except Exception:
+			pass
+		update_current_working_item(None)
+
 async def ensure_stream_playing(stream_page):
 	try:
 		await stream_page.wait_for_selector('button[data-a-target="player-play-pause-button"]', timeout=30000)
@@ -3110,12 +3819,12 @@ async def watch_streamer(stream_page, inv_page, streamer_name: str):
 	url = stream_page.url
 	logging.info(f"Watching stream: {url}")
 
-async def poll_until_reward_complete(context, inv_page, streamer_name: str):
+async def poll_until_reward_complete(context, inv_page, streamer_name: str, item_name: str = "", streamer_url: str | None = None):
 	total_wait_seconds = MAX_WATCH_HOURS_PER_REWARD * 3600
 	waited = 0
 	last_percent = None
-	target_lower = (streamer_name or "").strip().lower()
-	logging.info(f"Tracking streamer '{streamer_name}' by inventory title match")
+	target_drop = {"streamer": streamer_name, "item": item_name, "url": streamer_url or ""}
+	logging.info(f"Tracking streamer '{streamer_name}' item '{item_name}' by inventory title match")
 	while waited < total_wait_seconds:
 		if EXIT_EVENT.is_set():
 			logging.info("Exit requested; stopping progress polling.")
@@ -3132,117 +3841,27 @@ async def poll_until_reward_complete(context, inv_page, streamer_name: str):
 		try:
 			await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 			await maybe_accept_cookies(inv_page)
-			# Do not auto-claim; user will claim manually
-			# ensure progressbars rendered (if present)
-			try:
-				await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=15000)
-			except Exception:
-				await inv_page.wait_for_timeout(800)
-				try:
-					await inv_page.wait_for_selector('[role="progressbar"][aria-valuenow]', timeout=8000)
-				except Exception:
-					pass
 			await inv_page.wait_for_timeout(600)
-			data = await inv_page.evaluate(
-				r"""
-								(args) => {
-				  const targetLower = (args && args.targetLower) || '';
-				  const results = [];
-				  const findTitleFrom = (container) => {
-					let node = container;
-					while (node) {
-					  let prev = node.previousElementSibling;
-					  while (prev) {
-						const p = prev.querySelector('p');
-						if (p && p.textContent && p.textContent.trim()) {
-						  return p.textContent.trim();
-						}
-						prev = prev.previousElementSibling;
-					  }
-					  node = node.parentElement;
-					}
-					return null;
-				  };
-				  
-				  // Intelligent matching function
-				  const isIntelligentMatch = (streamerName, title) => {
-					const streamerLower = streamerName.toLowerCase();
-					const titleLower = title.toLowerCase();
-					
-					// First try exact substring match
-					if (titleLower.includes(streamerLower)) {
-					  return true;
-					}
-					
-					// Try partial matching - check if streamer name contains significant parts of title
-					const streamerClean = streamerLower.replace(/tv|streamer|channel/g, '');
-					const titleClean = titleLower.replace(/tv|streamer|channel/g, '');
-					
-					// Check if cleaned title is contained in cleaned streamer name
-					if (titleClean.length >= 4 && streamerClean.includes(titleClean)) {
-					  return true;
-					}
-					// Check if cleaned streamer name is contained in cleaned title
-					if (streamerClean.length >= 4 && titleClean.includes(streamerClean)) {
-					  return true;
-					}
-					
-					// Try word-based matching
-					const streamerWords = streamerLower.split(/\s+/).filter(w => w.length > 2);
-					const titleWords = titleLower.split(/\s+/).filter(w => w.length > 2);
-					
-					for (const streamerWord of streamerWords) {
-					  for (const titleWord of titleWords) {
-						if (streamerWord.length >= 4 && titleWord.length >= 4) {
-						  if (streamerWord.includes(titleWord) || titleWord.includes(streamerWord)) {
-							return true;
-						  }
-						}
-					  }
-					}
-					
-					return false;
-				  };
-				  
-				  document.querySelectorAll('[role="progressbar"][aria-valuenow]').forEach(pb => {
-					const percent = parseInt(pb.getAttribute('aria-valuenow') || '0', 10);
-					const container = pb.parentElement;
-					const title = findTitleFrom(container);
-					if (title && isIntelligentMatch(targetLower, title)) {
-					  results.push({ title, percent });
-					}
-				  });
-				  return results;
-				}
-				""",
-				{"targetLower": target_lower}
-			)
-			if data:
-				best = data[0]
-				percent = best.get('percent')
-				title = best.get('title') or streamer_name
-				logging.info(f"[{title}] Progress: {percent}%")
+			progress_map = await get_inventory_progress_map(inv_page)
+			percent, title, score = match_streamer_drop_progress(target_drop, progress_map)
+			if percent is not None and title:
+				logging.info(f"[{title}] Progress: {percent}% (score={score})")
 				last_percent = percent if isinstance(percent, int) else last_percent
-				
-				# Update cache with current progress
 				try:
-					progress_map = {title: percent}
-					update_cached_drops_data(None, progress_map)
+					update_cached_drops_data(None, {title: percent})
 				except Exception as e:
 					logging.debug(f"Failed to update cache during progress tracking: {e}")
-				
 				if isinstance(percent, int) and percent >= 100:
-					# Completed; do not auto-claim
 					return True
 			else:
-				logging.info(f"No inventory entry found for streamer '{streamer_name}'.")
+				logging.info(f"No inventory entry found for streamer '{streamer_name}' / '{item_name}'.")
 			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
 			waited += INVENTORY_POLL_INTERVAL_SECONDS
 		except Exception as e:
 			logging.warning(f"Poll inventory issue: {e}")
 			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
 			waited += INVENTORY_POLL_INTERVAL_SECONDS
-	logging.info("Max watch time reached without detecting completion.")
+	logging.info(f"Max watch time reached without detecting completion (last percent={last_percent}).")
 	return False
 
 async def poll_until_title_complete(context, inv_page, target_title_substr: str) -> bool:
@@ -3398,6 +4017,29 @@ async def run_drops_workflow(context, test_mode=False):
 			if EXIT_EVENT.is_set():
 				logging.info("Exit requested; stopping workflow loop.")
 				return
+			# Refresh drop-enabled games cache periodically for the new dashboard section.
+			try:
+				force_refresh = GAMES_REFRESH_REQUESTED.is_set()
+				if should_refresh_games_cache(force=force_refresh):
+					games = await fetch_drops_enabled_games(context, limit=160)
+					update_cached_games_data(games=games, source="twitch_directory", error=None)
+				if force_refresh:
+					GAMES_REFRESH_REQUESTED.clear()
+			except Exception as game_err:
+				logging.warning(f"Game discovery refresh failed: {game_err}")
+				update_cached_games_data(games=None, source="twitch_directory", error=str(game_err))
+				GAMES_REFRESH_REQUESTED.clear()
+
+			# Optional watch-target selection mode from dashboard.
+			watch_prefs = get_watch_preferences_snapshot()
+			enabled_game_prefs = get_enabled_game_preferences(watch_prefs)
+			rust_game_pref = next((g for g in enabled_game_prefs if is_rust_game_preference(g)), None)
+			non_rust_enabled_games = [g for g in enabled_game_prefs if not is_rust_game_preference(g)]
+			if enabled_game_prefs and rust_game_pref is None:
+				logging.info("Watch target mode active without Rust selected; using selected games stream cycle.")
+				await watch_selected_games_cycle(context, inv_page, enabled_game_prefs)
+				continue
+
 			fp = await fetch_facepunch_drops(context)
 			# If the campaign hasn't started yet, notify and exit early (unless in test mode)
 			try:
@@ -3475,44 +4117,22 @@ async def run_drops_workflow(context, test_mode=False):
 
 			# Helper to check if a streamer appears in recently_claimed using intelligent matching
 			def is_streamer_recently_claimed(streamer: str) -> int | None:
-				logging.info(f"[CLAIMED-CHECK] Checking if '{streamer}' is recently claimed using intelligent matching...")
-				name_vars = generate_search_variations(streamer)
-				logging.info(f"[CLAIMED-CHECK] Generated {len(name_vars)} search variations for '{streamer}': {name_vars}")
-				recently_claimed_list = recently_claimed or []
-				logging.info(f"[CLAIMED-CHECK] Checking against {len(recently_claimed_list)} recently claimed items")
-				
-				# Use intelligent matching approach - check each variation against each claimed item
-				for i, it in enumerate(recently_claimed_list):
-					n = (it.get('name') or '').lower()
-					days = it.get('days')
-					logging.info(f"[CLAIMED-CHECK] Item {i+1}: '{n}' (claimed {days} days ago)")
-					
-					# Try each search variation against this claimed item
-					for j, v in enumerate(name_vars):
-						if v and v in n:
-							logging.info(f"[CLAIMED-CHECK] MATCH FOUND! Variation '{v}' found in '{n}' - streamer '{streamer}' was claimed {days} days ago")
-							return int(days) if isinstance(days, int) else 0
-						else:
-							logging.info(f"[CLAIMED-CHECK] No match: variation '{v}' not found in '{n}'")
-					
-					# Also try reverse matching - check if claimed item name is in streamer variation
-					for j, v in enumerate(name_vars):
-						if v and n in v:
-							logging.info(f"[CLAIMED-CHECK] REVERSE MATCH FOUND! Claimed item '{n}' found in variation '{v}' - streamer '{streamer}' was claimed {days} days ago")
-							return int(days) if isinstance(days, int) else 0
-						else:
-							logging.info(f"[CLAIMED-CHECK] No reverse match: claimed item '{n}' not found in variation '{v}'")
-				
-				logging.info(f"[CLAIMED-CHECK] No matches found for '{streamer}' - not recently claimed")
-				return None
+				match = find_recently_claimed_match(streamer, recently_claimed)
+				if not match:
+					return None
+				days = match.get("days")
+				try:
+					return int(days)
+				except Exception:
+					return 0
 
 			# Build candidates only for streamer-specific items present in inventory (<100%)
 			candidates = []
 			live_any = []
-			inventory_entries = [((t or '').lower(), p) for t, p in (progress_map or {}).items()]
+			inventory_entries = list((progress_map or {}).items())
 			logging.info(f"[INVENTORY-ENTRIES] Processing {len(inventory_entries)} inventory entries:")
-			for title_lower, percent in inventory_entries:
-				logging.info(f"[INVENTORY-ENTRIES] '{title_lower}' = {percent}%")
+			for title, percent in inventory_entries:
+				logging.info(f"[INVENTORY-ENTRIES] '{(title or '').lower()}' = {percent}%")
 			
 			# Debug lists for better visibility
 			streamer_drops_with_progress = []
@@ -3531,34 +4151,23 @@ async def run_drops_workflow(context, test_mode=False):
 				if not bool(st.get('is_live')):
 					logging.info(f"[STREAMER-EVAL] Skipping '{name}': not live")
 					continue
+				if rust_game_pref and not is_streamer_allowed_for_game_preference(
+					rust_game_pref,
+					name,
+					streamer_url=st.get('url')
+				):
+					logging.info(f"[STREAMER-EVAL] Skipping '{name}': not selected in watch preferences")
+					continue
 				name_lower = name.lower()
 				if name_lower in completed_streamers:
 					logging.info(f"[STREAMER-EVAL] Skipping '{name}': already in completed_streamers set")
 					continue
-				# Find matching inventory entry and its percent using intelligent matching
-				match_pct = None
-				logging.info(f"[STREAMER-EVAL] Checking '{name}' against {len(inventory_entries)} inventory entries")
-				# First try exact substring match (original behavior)
-				for t_lower, pct in inventory_entries:
-					if name_lower in t_lower and isinstance(pct, int):
-						match_pct = pct
-						logging.info(f"[STREAMER-EVAL] Found exact match for '{name}': '{t_lower}' = {pct}%")
-						break
-				
-				# If no exact match, try intelligent matching
-				if match_pct is None:
-					logging.info(f"[STREAMER-EVAL] No exact match for '{name}', trying intelligent matching")
-					# Convert inventory_entries back to dict format for intelligent matching
-					inventory_dict = {title: pct for title, pct in inventory_entries if isinstance(pct, int)}
-					logging.info(f"[STREAMER-EVAL] Inventory dict for intelligent matching contains {len(inventory_dict)} items:")
-					for title, pct in inventory_dict.items():
-						logging.info(f"[STREAMER-EVAL]   '{title}' = {pct}%")
-					intelligent_pct, intelligent_title = intelligent_streamer_matching(name, inventory_dict)
-					if intelligent_pct is not None:
-						match_pct = intelligent_pct
-						logging.info(f"[STREAMER-EVAL] Found intelligent match for '{name}': {intelligent_title} ({intelligent_pct}%)")
-					else:
-						logging.info(f"[STREAMER-EVAL] No intelligent match found for '{name}' - not on Twitch inventory")
+				# Find matching inventory entry and its percent using streamer+item matching
+				match_pct, match_title, match_score = match_streamer_drop_progress(st, progress_map)
+				logging.info(
+					f"[STREAMER-EVAL] '{name}' best inventory match: title='{match_title}', "
+					f"pct={match_pct}, score={match_score}"
+				)
 				
 				emit_debug(f"[candidates] {name}: inventory match_pct={match_pct}")
 				
@@ -3582,14 +4191,10 @@ async def run_drops_workflow(context, test_mode=False):
 					# Not on Twitch inventory = unstarted drop
 					# Before considering, check if this was recently claimed (<= 21 days). If so, skip entirely.
 					priority = 2
-					# Use one-time sweep to avoid repeated page work
-					days = is_streamer_recently_claimed(name)
+					claimed_match = find_recently_claimed_match(name, recently_claimed, streamer_url=st.get('url'))
+					days = claimed_match.get("days") if claimed_match else None
 					if days is None:
-						# Fallback direct check if needed
-						try:
-							days = await get_claimed_days_for_streamer(inv_page, name)
-						except Exception:
-							days = None
+						days = is_streamer_recently_claimed(name)
 					if days is not None and days <= 21:
 						logging.info(f"Skipping streamer '{name}': claimed {days} day(s) ago.")
 						continue
@@ -3687,7 +4292,13 @@ async def run_drops_workflow(context, test_mode=False):
 				send_notification("Twitch Drops", f"Now watching {target_name} for '{target_item}'")
 				await ensure_stream_playing(stream_page)
 				await set_low_quality(stream_page)
-				completed = await poll_until_reward_complete(context, inv_page, streamer_name=target_name)
+				completed = await poll_until_reward_complete(
+					context,
+					inv_page,
+					streamer_name=target_name,
+					item_name=target_item,
+					streamer_url=target_url
+				)
 				try:
 					await stream_page.close()
 				except Exception:
@@ -3854,6 +4465,10 @@ async def run_drops_workflow(context, test_mode=False):
 				continue
 
 			# No streamers and no general strategy applicable; wait briefly
+			if non_rust_enabled_games:
+				logging.info("No Rust target available right now; switching to selected non-Rust games.")
+				await watch_selected_games_cycle(context, inv_page, non_rust_enabled_games)
+				continue
 			logging.info("No live streamer drops and no general progress to track. Retrying shortly.")
 			await asyncio.sleep(10)
 			continue
