@@ -2839,6 +2839,10 @@ async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limi
 		r"""
 		(args) => {
 		  const maxCards = (args && args.limit) || 80;
+		  const disallowedLogins = new Set([
+			'directory','drops','inventory','downloads','jobs','products','prime','turbo',
+			'wallet','settings','search','videos','friends','subscriptions','store','activate','apply'
+		  ]);
 		  const out = [];
 		  const cards = Array.from(document.querySelectorAll('article')).slice(0, maxCards);
 		  for (const card of cards) {
@@ -2852,6 +2856,7 @@ async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limi
 			if (!href) continue;
 			const login = href.replace(/^\//, '').split('/')[0].trim().toLowerCase();
 			if (!login) continue;
+			if (disallowedLogins.has(login)) continue;
 			const tags = Array.from(card.querySelectorAll('[data-a-target="tag"], a[data-a-target="tag"], span'))
 			  .map(n => (n.textContent || '').trim().toLowerCase())
 			  .filter(Boolean);
