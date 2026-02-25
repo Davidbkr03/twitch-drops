@@ -41,6 +41,23 @@
     <!-- Side panel -->
     <aside class="side-panel">
 
+      <!-- Twitch Login -->
+      <section class="card" id="twitchLoginCard">
+        <div class="card-header"><h2>Twitch Login</h2></div>
+        <div class="card-body">
+          <p class="hint-text" id="loginHint">Enter your Twitch credentials to auto-login, or click directly in the browser preview.</p>
+          <div class="field">
+            <label>Twitch Username</label>
+            <input type="text" id="twitchUser" placeholder="Username" autocomplete="off">
+          </div>
+          <div class="field">
+            <label>Twitch Password</label>
+            <input type="password" id="twitchPass" placeholder="Password" autocomplete="off">
+          </div>
+          <button class="btn btn-primary btn-sm btn-block" onclick="twitchLogin()">Log in to Twitch</button>
+        </div>
+      </section>
+
       <!-- Drops -->
       <section class="card">
         <div class="card-header"><h2>Drops</h2></div>
@@ -129,6 +146,8 @@
     } else {
       streamBadge.style.display = 'none';
     }
+    var loginCard = document.getElementById('twitchLoginCard');
+    if (loginCard) loginCard.style.display = s.logged_in ? 'none' : '';
     renderDrops(s);
   });
 
@@ -229,6 +248,16 @@
       })
     }).then(function(r){ return r.json(); })
       .then(function(d){ if(d.success) statusMsg.textContent='Settings saved'; });
+  };
+
+  /* -------- twitch login -------- */
+  window.twitchLogin = function() {
+    var u = document.getElementById('twitchUser').value.trim();
+    var p = document.getElementById('twitchPass').value;
+    if (!u || !p) { alert('Enter both username and password'); return; }
+    socket.emit('twitch_login', { username: u, password: p });
+    document.getElementById('twitchPass').value = '';
+    document.getElementById('loginHint').textContent = 'Credentials sent — check the preview…';
   };
 
   /* -------- history -------- */

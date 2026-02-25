@@ -4,9 +4,8 @@ import asyncio
 import logging
 import os
 import threading
-import json
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth, ALL_EVASIONS_DISABLED_KWARGS
@@ -15,27 +14,42 @@ logger = logging.getLogger(__name__)
 
 TWITCH_INVENTORY_URL = "https://www.twitch.tv/drops/inventory"
 TWITCH_RUST_DIRECTORY_URL = "https://www.twitch.tv/directory/game/Rust"
-TWITCH_DROPS_ENABLED_URL = "https://www.twitch.tv/directory/all/tags/dropsenabled"
-FACEPUNCH_DROPS_URL = "https://twitch.facepunch.com/#drops"
+TWITCH_LOGIN_URL = "https://www.twitch.tv/login"
+
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 BROWSER_ARGS = [
-    "--disable-extensions",
-    "--disable-dev-shm-usage",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-popup-blocking",
-    "--disable-background-timer-throttling",
-    "--disable-renderer-backgrounding",
-    "--disable-backgrounding-occluded-windows",
+    "--disable-blink-features=AutomationControlled",
     "--disable-features=BlockThirdPartyCookies,CookieDeprecationMessages",
+    "--disable-features=TranslateUI",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-networking",
     "--disable-ipc-flooding-protection",
     "--disable-hang-monitor",
+    "--disable-prompt-on-repost",
     "--disable-sync",
     "--disable-translate",
-    "--force-device-scale-factor=1",
+    "--disable-component-extensions-with-background-pages",
     "--disable-http-cache",
+    "--disable-dev-shm-usage",
+    "--disable-popup-blocking",
     "--disable-field-trial-config",
     "--disable-back-forward-cache",
+    "--disable-default-apps",
+    "--force-device-scale-factor=1",
+    "--run-all-compositor-stages-before-draw",
+    "--enable-features=NetworkService,NetworkServiceLogging",
+    "--enable-webgl",
+    "--ignore-gpu-blocklist",
+    "--enable-accelerated-2d-canvas",
+    "--enable-gpu-rasterization",
+    "--no-first-run",
+    "--no-default-browser-check",
 ]
 
 VIEWPORT = {"width": 1366, "height": 768}
@@ -174,42 +188,46 @@ class UserAutomator:
                 await self._cleanup()
 
     # ------------------------------------------------------------------
-    # Browser launch
+    # Browser launch — uses real Google Chrome with full stealth
     # ------------------------------------------------------------------
 
     async def _launch_browser(self, p):
+        launch_kwargs = dict(
+            user_data_dir=self.data_dir,
+            headless=True,
+            slow_mo=50,
+            ignore_default_args=["--enable-automation"],
+            args=BROWSER_ARGS,
+            user_agent=CHROME_USER_AGENT,
+            viewport=VIEWPORT,
+            locale="en-US",
+        )
+
         try:
             self.context = await p.chromium.launch_persistent_context(
-                self.data_dir,
-                headless=True,
-                channel="chrome",
-                slow_mo=50,
-                args=BROWSER_ARGS,
-                viewport=VIEWPORT,
-                locale="en-US",
+                channel="chrome", **launch_kwargs
             )
-        except Exception:
+            logger.info("User %s: launched with Google Chrome channel", self.user_id)
+        except Exception as e:
             logger.warning(
-                "User %s: Chrome channel failed, falling back to bundled Chromium",
-                self.user_id,
+                "User %s: Chrome channel failed (%s), falling back to Chromium",
+                self.user_id, e,
             )
-            self.context = await p.chromium.launch_persistent_context(
-                self.data_dir,
-                headless=True,
-                slow_mo=50,
-                args=BROWSER_ARGS,
-                viewport=VIEWPORT,
-                locale="en-US",
-            )
+            self.context = await p.chromium.launch_persistent_context(**launch_kwargs)
 
-        stealth_kwargs = {**ALL_EVASIONS_DISABLED_KWARGS, "navigator_webdriver": True}
-        stealth = Stealth(init_scripts_only=True, **stealth_kwargs)
+        # Full stealth — patches webdriver, plugins, languages, WebGL, etc.
+        stealth = Stealth(init_scripts_only=True)
         await stealth.apply_stealth_async(self.context)
 
+        # Extra webdriver override
         try:
             await self.context.add_init_script(
-                r"(() => { try { Object.defineProperty(navigator, 'webdriver', "
-                r"{ get: () => undefined }); } catch(e){} })();"
+                """(() => {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+                })();"""
             )
         except Exception:
             pass
@@ -219,6 +237,17 @@ class UserAutomator:
             if self.context.pages
             else await self.context.new_page()
         )
+
+        # Log actual UA for debugging
+        try:
+            ua = await self.page.evaluate("navigator.userAgent")
+            wd = await self.page.evaluate(
+                "'webdriver' in navigator ? navigator.webdriver : 'not present'"
+            )
+            logger.info("User %s UA: %s | webdriver: %s", self.user_id, ua, wd)
+        except Exception:
+            pass
+
         self._update_status(message="Browser launched")
 
     # ------------------------------------------------------------------
@@ -287,21 +316,110 @@ class UserAutomator:
             logger.debug("User %s input error", self.user_id, exc_info=True)
 
     # ------------------------------------------------------------------
+    # Auto-login: fill Twitch login form programmatically
+    # ------------------------------------------------------------------
+
+    async def auto_login(self, username: str, password: str):
+        """Navigate to Twitch login and fill credentials automatically."""
+        self._update_status(message="Logging in to Twitch…")
+
+        await self._goto(TWITCH_LOGIN_URL)
+        await asyncio.sleep(3)
+        await self._accept_cookies()
+
+        try:
+            # Wait for login form
+            await self.page.wait_for_selector(
+                'input[autocomplete="username"], #login-username', timeout=15000
+            )
+            await asyncio.sleep(1)
+
+            # Fill username
+            username_input = await self.page.query_selector(
+                'input[autocomplete="username"]'
+            )
+            if not username_input:
+                username_input = await self.page.query_selector("#login-username")
+            if username_input:
+                await username_input.click()
+                await asyncio.sleep(0.3)
+                await username_input.fill("")
+                await username_input.type(username, delay=50)
+
+            await asyncio.sleep(0.5)
+
+            # Fill password
+            password_input = await self.page.query_selector(
+                'input[autocomplete="current-password"]'
+            )
+            if not password_input:
+                password_input = await self.page.query_selector("#password-input")
+            if password_input:
+                await password_input.click()
+                await asyncio.sleep(0.3)
+                await password_input.fill("")
+                await password_input.type(password, delay=50)
+
+            await asyncio.sleep(0.5)
+
+            # Click login button
+            login_btn = await self.page.query_selector(
+                'button[data-a-target="passport-login-button"]'
+            )
+            if not login_btn:
+                login_btn = await self.page.query_selector(
+                    'button:has-text("Log In")'
+                )
+            if login_btn:
+                await login_btn.click()
+                self._update_status(message="Credentials submitted — waiting…")
+                await asyncio.sleep(5)
+            else:
+                self._update_status(message="Could not find login button")
+                return False
+
+            # Check if login succeeded
+            for _ in range(30):
+                if self._stop.is_set():
+                    return False
+                if await self._is_logged_in():
+                    self._update_status(logged_in=True, message="Logged in!")
+                    return True
+                # Check for 2FA or error
+                error_el = await self.page.query_selector(
+                    '[data-a-target="passport-error"]'
+                )
+                if error_el:
+                    err_text = await error_el.text_content()
+                    self._update_status(
+                        message=f"Login error: {(err_text or '').strip()[:100]}"
+                    )
+                    return False
+                await asyncio.sleep(2)
+
+            self._update_status(message="Login timeout — check for 2FA in preview")
+            return False
+        except Exception:
+            logger.exception("User %s auto-login error", self.user_id)
+            self._update_status(message="Auto-login failed — use preview to log in manually")
+            return False
+
+    # ------------------------------------------------------------------
     # Main automation loop
     # ------------------------------------------------------------------
 
     async def _automation_loop(self):
         self._update_status(message="Navigating to Twitch…")
         await self._goto(TWITCH_INVENTORY_URL)
+        await asyncio.sleep(3)
         await self._accept_cookies()
-        await asyncio.sleep(2)
 
         logged_in = await self._is_logged_in()
         self._update_status(logged_in=logged_in)
 
         if not logged_in:
             self._update_status(
-                message="Please log in to Twitch using the browser preview"
+                message="Not logged in — use the login form or interact with the preview"
             )
             logged_in = await self._wait_for_login()
             if not logged_in:
@@ -336,9 +454,7 @@ class UserAutomator:
             )
             if menu:
                 return True
-            return (
-                "twitch.tv/drops/inventory" in url and "/login" not in url
-            )
+            return "twitch.tv/drops/inventory" in url and "/login" not in url
         except Exception:
             return False
 
@@ -421,7 +537,6 @@ class UserAutomator:
             last_check=datetime.now(timezone.utc).isoformat(),
             message=f"Checked drops — {len(in_progress)} active, {len(claimed)} claimed",
         )
-
         self._persist_drops(in_progress, claimed)
 
     def _persist_drops(self, in_progress: list, claimed: list):
@@ -469,7 +584,12 @@ class UserAutomator:
     async def _find_and_watch_stream(self):
         if self.status.get("watching"):
             try:
-                if self.page.url and "twitch.tv/" in self.page.url and "/directory" not in self.page.url:
+                if (
+                    self.page.url
+                    and "twitch.tv/" in self.page.url
+                    and "/directory" not in self.page.url
+                    and "/drops" not in self.page.url
+                ):
                     self._update_status(message="Watching stream…")
                     return
             except Exception:
@@ -484,14 +604,11 @@ class UserAutomator:
                 'a[data-a-target="preview-card-image-link"]'
             )
             if not cards:
-                cards = await self.page.query_selector_all(
-                    'article a[href*="/"]'
-                )
+                cards = await self.page.query_selector_all('article a[href*="/"]')
 
             if cards:
                 await cards[0].click()
                 await asyncio.sleep(5)
-
                 await self._accept_mature_content()
                 await self._set_low_quality()
 
