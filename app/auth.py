@@ -18,7 +18,7 @@ def login():
         if user and bcrypt.check_password_hash(user.password_hash, password):
             login_user(user, remember=True)
             next_page = request.args.get("next")
-            return redirect(next_page or url_for("main.dashboard"))
+            return redirect(next_page or url_for("main.dashboard"), code=303)
         flash("Invalid username or password.", "error")
     return render_template("login.html")
 
@@ -51,7 +51,7 @@ def register():
             db.session.add(settings)
             db.session.commit()
             login_user(user, remember=True)
-            return redirect(url_for("main.dashboard"))
+            return redirect(url_for("main.dashboard"), code=303)
     return render_template("register.html")
 
 
