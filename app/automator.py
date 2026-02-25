@@ -364,63 +364,117 @@ class UserAutomator:
             )
             await asyncio.sleep(1)
 
+            # Fill username
+            self._update_status(message=f"Filling username: {username}")
             for sel in ['input[autocomplete="username"]', '#login-username']:
                 el = await self.page.query_selector(sel)
                 if el:
-                    await el.click(); await asyncio.sleep(0.2)
+                    await el.click(); await asyncio.sleep(0.3)
                     await el.fill(""); await el.type(username, delay=40)
                     break
 
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
 
+            # Fill password
+            self._update_status(message="Filling password…")
             for sel in ['input[autocomplete="current-password"]', '#password-input']:
                 el = await self.page.query_selector(sel)
                 if el:
-                    await el.click(); await asyncio.sleep(0.2)
+                    await el.click(); await asyncio.sleep(0.3)
                     await el.fill(""); await el.type(password, delay=40)
                     break
 
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
 
+            # Click login button
             btn = (
                 await self.page.query_selector('button[data-a-target="passport-login-button"]')
                 or await self.page.query_selector('button:has-text("Log In")')
             )
             if btn:
                 await btn.click()
-                self._update_status(message="Credentials submitted — waiting…")
+                self._update_status(message="Credentials submitted — waiting for response…")
                 await asyncio.sleep(5)
             else:
                 self._update_status(message="Login button not found")
                 return False
 
-            for _ in range(30):
+            # Poll for result: success, error, or 2FA
+            for i in range(60):
                 if self._stop.is_set():
                     return False
+
+                # Success?
                 if await self._is_logged_in():
+                    logger.info("User %s: Twitch login succeeded", self.user_id)
                     return True
+
+                # Password error?
                 err = await self.page.query_selector('[data-a-target="passport-error"]')
                 if err:
-                    txt = (await err.text_content() or "").strip()[:100]
+                    txt = (await err.text_content() or "").strip()[:120]
                     self._update_status(message=f"Login error: {txt}")
+                    logger.warning("User %s: Twitch login error: %s", self.user_id, txt)
                     return False
+
+                # 2FA / email verification code prompt?
+                twofa = await self.page.query_selector(
+                    'input[data-a-target="tw-input"], '
+                    'input[aria-label*="code" i], '
+                    'input[aria-label*="token" i], '
+                    'input[placeholder*="code" i]'
+                )
+                if twofa:
+                    self._update_status(
+                        message="2FA / email verification required — enter the code in the browser preview"
+                    )
+                    logger.info("User %s: 2FA prompt detected, waiting for user", self.user_id)
+                    # Wait longer for user to enter 2FA via the preview
+                    for _ in range(300):
+                        if self._stop.is_set():
+                            return False
+                        if await self._is_logged_in():
+                            logger.info("User %s: login succeeded after 2FA", self.user_id)
+                            return True
+                        await asyncio.sleep(2)
+                    self._update_status(message="2FA timeout")
+                    return False
+
                 await asyncio.sleep(2)
 
-            self._update_status(message="Login timeout — may need 2FA via preview")
+            self._update_status(message="Login timeout")
             return False
         except Exception:
             logger.exception("User %s auto-login error", self.user_id)
-            self._update_status(message="Auto-login failed")
+            self._update_status(message="Auto-login failed — use the browser preview")
             return False
 
     # ---- login helpers ----
 
     async def _is_logged_in(self) -> bool:
+        """Robust check: logged in = no Login/Sign Up buttons visible."""
         try:
             url = self.page.url
             if "/login" in url or "id.twitch.tv" in url:
                 return False
-            return await self.page.query_selector('[data-a-target="user-menu-toggle"]') is not None
+            # The definitive test: if a Sign Up button exists, user is anonymous
+            signup = await self.page.query_selector(
+                '[data-a-target="login-button"], button:has-text("Sign Up")'
+            )
+            if signup:
+                return False
+            # Double-check: user display name only exists when logged in
+            display = await self.page.query_selector(
+                '[data-a-target="user-display-name"]'
+            )
+            if display:
+                return True
+            # Fallback: if no signup button AND no display name, page might
+            # still be loading. Check for the user menu avatar image.
+            avatar = await self.page.query_selector(
+                'figure[class*="ScAvatar"] img, img[alt*="avatar" i]'
+            )
+            return avatar is not None
         except Exception:
             return False
 
