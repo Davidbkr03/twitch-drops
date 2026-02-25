@@ -56,3 +56,6 @@ Uses Chrome DevTools Protocol `Page.startScreencast` instead of periodic screens
 - The PostgreSQL data persists via the `postgres_data` Docker volume.
 - After `docker compose down`, data is retained in volumes. Use `docker compose down -v` to wipe.
 - The app uses `async_mode='threading'` for Flask-SocketIO to bridge async Playwright with sync Flask.
+- Chrome runs in **headed mode on Xvfb** (virtual display :99) to bypass Twitch's headless browser detection. The entrypoint starts Xvfb automatically.
+- Stale `Singleton*` lock files are cleaned before each browser launch to prevent "Opening in existing browser session" errors.
+- Google Chrome Stable is installed in the Docker image; Playwright Chromium is the fallback. `--no-sandbox` is required in Docker.
