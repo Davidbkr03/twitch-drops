@@ -17,6 +17,7 @@ TWITCH_RUST_DIRECTORY_URL = "https://www.twitch.tv/directory/game/Rust"
 TWITCH_LOGIN_URL = "https://www.twitch.tv/login"
 
 BROWSER_ARGS = [
+    "--no-sandbox",
     "--disable-blink-features=AutomationControlled",
     "--disable-features=BlockThirdPartyCookies,CookieDeprecationMessages",
     "--disable-features=TranslateUI",
@@ -189,6 +190,16 @@ class UserAutomator:
     async def _launch_browser(self, p):
         # Run in HEADED mode on Xvfb virtual display.
         # This completely avoids Twitch's headless browser fingerprinting.
+
+        # Clean stale lock files from previous sessions so Chrome doesn't
+        # think another instance owns this profile.
+        import glob
+        for lock in glob.glob(os.path.join(self.data_dir, "Singleton*")):
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
         launch_kwargs = dict(
             user_data_dir=self.data_dir,
             headless=False,
