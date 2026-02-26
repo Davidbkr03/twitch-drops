@@ -86,6 +86,29 @@ def api_twitch_account():
     return jsonify({"success": True})
 
 
+@main_bp.route("/api/import-token", methods=["POST"])
+@login_required
+def api_import_token():
+    data = request.get_json(silent=True) or {}
+    token = (data.get("auth_token") or "").strip()
+    if not token:
+        return jsonify({"success": False, "error": "Token required"}), 400
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if not s:
+        s = UserSettings(user_id=current_user.id)
+        db.session.add(s)
+    s.twitch_auth_token = token
+    db.session.commit()
+    # If automation is running, apply immediately
+    mgr = AutomationManager.get()
+    if mgr:
+        a = mgr.get_automator(current_user.id)
+        if a and a._loop and a._loop.is_running():
+            import asyncio
+            asyncio.run_coroutine_threadsafe(a.import_cookies(token), a._loop)
+    return jsonify({"success": True})
+
+
 @main_bp.route("/api/settings", methods=["GET", "POST"])
 @login_required
 def api_settings():

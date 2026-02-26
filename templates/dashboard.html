@@ -49,17 +49,21 @@
         </div>
         <div class="card-body">
           <div class="field">
-            <label>Twitch Username</label>
-            <input type="text" id="twitchUser"
-                   value="{{ settings.twitch_username or '' if settings else '' }}"
-                   placeholder="Your Twitch username">
+            <label>Auth Token</label>
+            <input type="text" id="authToken" placeholder="Paste your auth-token here"
+                   value="">
           </div>
-          <div class="field">
-            <label>Twitch Password</label>
-            <input type="password" id="twitchPass" placeholder="{% if settings and settings.twitch_password %}••••••••{% else %}Enter password{% endif %}">
-          </div>
-          <button class="btn btn-primary btn-sm btn-block" onclick="saveTwitchAccount()">Save &amp; Login</button>
-          <p class="hint-text" id="twitchHint">Saved credentials are pre-filled on the Twitch login page. Click Log In in the preview for first-time login — after that, sessions persist automatically.</p>
+          <button class="btn btn-primary btn-sm btn-block" onclick="importToken()">Connect Twitch</button>
+          <details class="token-help">
+            <summary>How to get your auth token</summary>
+            <ol>
+              <li>Log into <a href="https://www.twitch.tv" target="_blank">twitch.tv</a> on your normal browser</li>
+              <li>Press <kbd>F12</kbd> to open DevTools → <strong>Application</strong> tab</li>
+              <li>Under <strong>Cookies → https://www.twitch.tv</strong>, find <code>auth-token</code></li>
+              <li>Copy the <strong>Value</strong> and paste it above</li>
+            </ol>
+          </details>
+          <p class="hint-text" id="twitchHint">The auth token lets the bot use your Twitch session directly — no login page needed. Tokens persist across restarts.</p>
         </div>
       </section>
 
@@ -255,27 +259,23 @@
     });
   };
 
-  /* ---- save twitch account ---- */
-  window.saveTwitchAccount = function() {
-    var u = document.getElementById('twitchUser').value.trim();
-    var p = document.getElementById('twitchPass').value;
-    if (!u) { alert('Enter your Twitch username'); return; }
-    var body = { twitch_username: u };
-    if (p) body.twitch_password = p;
-    fetch('/api/twitch-account', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+  /* ---- import auth token ---- */
+  window.importToken = function() {
+    var token = document.getElementById('authToken').value.trim();
+    if (!token) { alert('Paste your Twitch auth-token first'); return; }
+    document.getElementById('twitchHint').textContent = 'Importing token…';
+    fetch('/api/import-token', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({auth_token: token})
     }).then(function(r){return r.json()}).then(function(d) {
       if (d.success) {
-        document.getElementById('twitchHint').textContent = 'Saved! Credentials will be used on next start.';
-        twitchStatusBadge.textContent = 'Saved';
+        document.getElementById('twitchHint').textContent = 'Token saved! Start or restart automation to connect.';
+        twitchStatusBadge.textContent = 'Token saved';
         twitchStatusBadge.className = 'badge badge-sm badge-warn';
-        // If automation is running, trigger login now
-        if (running && p) {
-          socket.emit('twitch_login', {username: u, password: p});
-          document.getElementById('twitchHint').textContent = 'Logging in…';
-        }
-        document.getElementById('twitchPass').value = '';
-        document.getElementById('twitchPass').placeholder = '••••••••';
+        document.getElementById('authToken').value = '';
+        document.getElementById('authToken').placeholder = '••••••••••••••';
+      } else {
+        document.getElementById('twitchHint').textContent = 'Error: ' + (d.error || 'Unknown');
       }
     });
   };
@@ -316,10 +316,12 @@
     statusMsg.textContent = s.message||(running?'Running':'Stopped');
     startBtn.disabled = running; stopBtn.disabled = !running;
     if (running) overlay.style.display = 'none';
-    if (s.twitch_user) {
-      document.getElementById('twitchUser').value = s.twitch_user;
-      twitchStatusBadge.textContent = s.logged_in ? 'Logged in' : 'Saved';
-      twitchStatusBadge.className = 'badge badge-sm ' + (s.logged_in ? 'badge-success' : 'badge-warn');
+    if (s.logged_in) {
+      twitchStatusBadge.textContent = 'Logged in';
+      twitchStatusBadge.className = 'badge badge-sm badge-success';
+    } else if (s.twitch_saved || s.twitch_user) {
+      twitchStatusBadge.textContent = 'Token saved';
+      twitchStatusBadge.className = 'badge badge-sm badge-warn';
     }
   });
 
