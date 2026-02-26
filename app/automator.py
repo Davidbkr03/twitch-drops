@@ -787,7 +787,9 @@ class UserAutomator:
                 except Exception:
                     pass
 
-            # Scrape full inventory: campaigns with items, progress, and game info
+            # Scrape full inventory: find each progress bar's container which
+            # holds the reward image (twitch-quests-assets/REWARD/...) and
+            # the progress text.
             inventory = await self.page.evaluate(r"""
                 () => {
                     const items = [];
@@ -795,17 +797,36 @@ class UserAutomator:
                     const bars = document.querySelectorAll('[role="progressbar"]');
                     bars.forEach(pb => {
                         const pct = parseInt(pb.getAttribute('aria-valuenow') || '0');
-                        // Walk up to find context
-                        let el = pb;
-                        for (let i = 0; i < 6; i++) { el = el?.parentElement; }
-                        if (!el) return;
-                        // Image
+                        // Walk up until we find a container with BOTH an img and this progressbar
+                        let container = pb;
+                        for (let i = 0; i < 12; i++) {
+                            container = container?.parentElement;
+                            if (!container) break;
+                            if (container.querySelector('img') &&
+                                container.querySelector('[role="progressbar"]')) break;
+                        }
+                        if (!container) return;
+
+                        // Reward image — prefer twitch-quests-assets URLs (actual item art)
                         let image = '';
-                        const img = el.querySelector('img[src*="static-cdn"], img[src*="jtvnw"]');
-                        if (img) image = img.src;
-                        // Texts near this progress bar
+                        const imgs = container.querySelectorAll('img');
+                        for (const img of imgs) {
+                            const src = img.src || '';
+                            if (src.includes('twitch-quests-assets') || src.includes('REWARD')) {
+                                image = src; break;
+                            }
+                        }
+                        if (!image) {
+                            for (const img of imgs) {
+                                if ((img.naturalWidth || img.width) > 30) {
+                                    image = img.src || ''; break;
+                                }
+                            }
+                        }
+
+                        // Item name / time text
                         const texts = [];
-                        el.querySelectorAll('p, span').forEach(t => {
+                        container.querySelectorAll('p, span').forEach(t => {
                             const v = (t.textContent || '').trim();
                             if (v && v.length > 2 && v.length < 100 && !/^\d+%$/.test(v)
                                 && !['Drops','In Progress','Inventory'].includes(v)) {
@@ -813,14 +834,12 @@ class UserAutomator:
                             }
                         });
                         const name = texts.find(t => /of \d+ hour/i.test(t)) || texts[0] || '';
-                        const key = name + '_' + pct;
+                        const key = image + '_' + pct;
                         if (seen.has(key)) return;
                         seen.add(key);
                         items.push({ name, progress: pct, image });
                     });
 
-                    // Find campaign names by looking at the full page text
-                    // Campaign names are usually in larger text above progress bars
                     const campaignNames = [];
                     document.querySelectorAll('p, h3, h4, h5').forEach(el => {
                         const t = (el.textContent || '').trim();
