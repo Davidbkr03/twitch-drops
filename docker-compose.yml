@@ -1,0 +1,33 @@
+services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-twitch}:${POSTGRES_PASSWORD:-twitch}@db:5432/${POSTGRES_DB:-twitch_drops}
+    volumes:
+      - browser_data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-twitch}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-twitch}
+      - POSTGRES_DB=${POSTGRES_DB:-twitch_drops}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-twitch}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  browser_data:

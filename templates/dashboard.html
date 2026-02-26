@@ -1,0 +1,432 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Twitch Drop Automator{% endblock %}
+{% block head %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+
+  <!-- Toolbar -->
+  <section class="dash-toolbar">
+    <div class="toolbar-left">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-text" id="statusMsg">Connecting…</span>
+    </div>
+    <div class="toolbar-right">
+      <span class="watch-time" id="watchTime"></span>
+      <button class="btn btn-success" id="startBtn" onclick="doStart()">▶ Start</button>
+      <button class="btn btn-danger"  id="stopBtn"  onclick="doStop()" disabled>■ Stop</button>
+    </div>
+  </section>
+
+  <div class="dash-grid">
+
+    <!-- Screencast -->
+    <section class="card card-screencast">
+      <div class="card-header">
+        <h2>Browser Preview</h2>
+        <span class="badge" id="streamBadge" style="display:none"></span>
+      </div>
+      <div class="screencast-wrap">
+        <canvas id="screencast" tabindex="1"></canvas>
+        <div class="sc-overlay" id="scOverlay">
+          <p>Press <strong>Start</strong> to begin.<br>
+          First time? Save your Twitch credentials, then click Log In in the preview.</p>
+        </div>
+      </div>
+      <div class="preview-controls">
+        <span class="hint">Click inside to interact &middot; Focus to type</span>
+        <button class="btn btn-sm btn-outline" id="previewToggle" onclick="togglePreview()">Hide Preview</button>
+      </div>
+    </section>
+
+    <!-- Sidebar -->
+    <aside class="side-panel">
+
+      <!-- Twitch Account -->
+      <section class="card" id="twitchAccountCard">
+        <div class="card-header">
+          <h2>Twitch Account</h2>
+          <span class="badge badge-sm" id="twitchStatus">Not linked</span>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            <label>Auth Token</label>
+            <input type="text" id="authToken" placeholder="Paste your auth-token here"
+                   value="">
+          </div>
+          <button class="btn btn-primary btn-sm btn-block" onclick="importToken()">Connect Twitch</button>
+          <details class="token-help">
+            <summary>How to get your auth token</summary>
+            <ol>
+              <li>Log into <a href="https://www.twitch.tv" target="_blank">twitch.tv</a> on your normal browser</li>
+              <li>Press <kbd>F12</kbd> to open DevTools → <strong>Application</strong> tab</li>
+              <li>Under <strong>Cookies → https://www.twitch.tv</strong>, find <code>auth-token</code></li>
+              <li>Copy the <strong>Value</strong> and paste it above</li>
+            </ol>
+          </details>
+          <p class="hint-text" id="twitchHint">The auth token lets the bot use your Twitch session directly — no login page needed. Tokens persist across restarts.</p>
+        </div>
+      </section>
+
+      <!-- Watch Targets (games + streamers) -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Games &amp; Streamers</h2>
+          <button class="btn btn-sm btn-outline" onclick="discoverGames()" id="discoverBtn">Browse</button>
+        </div>
+        <div class="card-body">
+          <div id="watchTargets"><p class="empty">No games selected.</p></div>
+          <div id="gameDiscovery" style="display:none">
+            <p class="hint-text">Select games with active drops:</p>
+            <div id="gameList" class="game-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Active Drops -->
+      <section class="card">
+        <div class="card-header"><h2>Active Drops</h2></div>
+        <div class="card-body" id="dropsBody">
+          <p class="empty">No active drops.</p>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section class="card">
+        <div class="card-header"><h2>Settings</h2></div>
+        <div class="card-body">
+          <div class="field">
+            <label><input type="checkbox" id="autoClaim" {% if settings and settings.auto_claim %}checked{% endif %}> Auto-claim completed drops</label>
+          </div>
+          <div class="field">
+            <label>Check interval (seconds)</label>
+            <input type="number" id="checkInterval" min="10" max="600"
+                   value="{{ settings.check_interval if settings else 60 }}">
+          </div>
+          <div class="field">
+            <label>Preview quality</label>
+            <select id="scQuality">
+              <option value="30" {% if settings and settings.screencast_quality == 30 %}selected{% endif %}>Low</option>
+              <option value="50" {% if not settings or settings.screencast_quality == 50 %}selected{% endif %}>Medium</option>
+              <option value="70" {% if settings and settings.screencast_quality == 70 %}selected{% endif %}>High</option>
+            </select>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="saveSettings()">Save Settings</button>
+        </div>
+      </section>
+
+      <!-- Claim History -->
+      <section class="card">
+        <div class="card-header"><h2>Claim History</h2></div>
+        <div class="card-body" id="historyBody">
+          <p class="empty">No history yet.</p>
+        </div>
+      </section>
+
+    </aside>
+  </div>
+</div>
+
+<script>
+(function() {
+  var socket = io();
+  var canvas = document.getElementById('screencast');
+  var ctx    = canvas.getContext('2d');
+  var overlay = document.getElementById('scOverlay');
+  var statusDot = document.getElementById('statusDot');
+  var statusMsg = document.getElementById('statusMsg');
+  var streamBadge = document.getElementById('streamBadge');
+  var startBtn = document.getElementById('startBtn');
+  var stopBtn  = document.getElementById('stopBtn');
+  var watchTimeEl = document.getElementById('watchTime');
+  var twitchStatusBadge = document.getElementById('twitchStatus');
+  var running = false;
+
+  /* ---- screencast ---- */
+  var frameImg = new Image();
+  var framePending = false;
+  socket.on('screencast_frame', function(d) {
+    if (!previewOn || framePending) return;
+    framePending = true;
+    frameImg.onload = function() {
+      canvas.width = frameImg.width; canvas.height = frameImg.height;
+      ctx.drawImage(frameImg, 0, 0);
+      overlay.style.display = 'none';
+      framePending = false;
+    };
+    frameImg.onerror = function() { framePending = false; };
+    frameImg.src = 'data:image/jpeg;base64,' + d.data;
+  });
+
+  /* ---- status updates ---- */
+  socket.on('automation_status', function(s) {
+    running = s.running;
+    statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
+    var msg = s.message || (running ? 'Running' : 'Stopped');
+    statusMsg.textContent = msg;
+    statusMsg.className = 'status-text' + (msg.indexOf('2FA') >= 0 || msg.indexOf('verification') >= 0 ? ' status-alert' : '');
+    startBtn.disabled = running;
+    stopBtn.disabled  = !running;
+
+    // Stream badge
+    if (s.stream_name) {
+      streamBadge.textContent = s.stream_name;
+      streamBadge.style.display = '';
+    } else {
+      streamBadge.style.display = 'none';
+    }
+
+    // Twitch account status
+    if (s.logged_in) {
+      twitchStatusBadge.textContent = 'Logged in';
+      twitchStatusBadge.className = 'badge badge-sm badge-success';
+    } else if (s.twitch_saved) {
+      twitchStatusBadge.textContent = 'Saved';
+      twitchStatusBadge.className = 'badge badge-sm badge-warn';
+    } else {
+      twitchStatusBadge.textContent = 'Not linked';
+      twitchStatusBadge.className = 'badge badge-sm';
+    }
+
+    // Watch time
+    if (s.watch_seconds && s.watch_seconds > 0) {
+      watchTimeEl.textContent = fmtTime(s.watch_seconds);
+    } else {
+      watchTimeEl.textContent = '';
+    }
+
+    if (s.completed_games) {
+      var changed = JSON.stringify(completedGames) !== JSON.stringify(s.completed_games);
+      completedGames = s.completed_games;
+      if (changed) loadWatchTargets();
+    }
+    renderDrops(s);
+  });
+
+  function fmtTime(sec) {
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = sec % 60;
+    var parts = [];
+    if (h) parts.push(h + 'h');
+    parts.push(m + 'm');
+    if (!h) parts.push(s + 's');
+    return parts.join(' ');
+  }
+
+  /* ---- drops with progress bars ---- */
+  function renderDrops(s) {
+    var html = '';
+    if (s.drops_in_progress && s.drops_in_progress.length) {
+      s.drops_in_progress.forEach(function(d) {
+        var pct = d.progress || 0;
+        var imgHtml = d.image ? '<img src="'+esc(d.image)+'" class="drop-thumb" alt="">' : '';
+        html += '<div class="drop-item">' +
+          '<div class="drop-item-top">' +
+            imgHtml +
+            '<span class="drop-name">' + esc(d.name || 'Drop') + '</span>' +
+            '<span class="drop-pct">' + pct + '%</span>' +
+          '</div>' +
+          '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
+        '</div>';
+      });
+    }
+    if (s.drops_claimed && s.drops_claimed.length) {
+      s.drops_claimed.slice(-5).reverse().forEach(function(d) {
+        html += '<div class="drop-item claimed">' +
+          '<span class="drop-name">✓ ' + esc(d.name || 'Drop') + '</span>' +
+        '</div>';
+      });
+    }
+    if (!html) html = '<p class="empty">No active drops.</p>';
+    document.getElementById('dropsBody').innerHTML = html;
+  }
+
+  /* ---- input forwarding ---- */
+  canvas.addEventListener('mousedown', function(e) {
+    if (!running) return;
+    canvas.focus();
+    var r = canvas.getBoundingClientRect();
+    socket.emit('browser_input', {
+      type:'click',
+      x: Math.round((e.clientX - r.left) * canvas.width / r.width),
+      y: Math.round((e.clientY - r.top)  * canvas.height / r.height)
+    });
+  });
+  canvas.addEventListener('keydown', function(e) {
+    if (!running) return;
+    e.preventDefault();
+    if (e.key.length === 1) socket.emit('browser_input', {type:'type', text:e.key});
+    else {
+      var m = {'Backspace':'Backspace','Tab':'Tab','Enter':'Enter','Escape':'Escape',
+        'ArrowUp':'ArrowUp','ArrowDown':'ArrowDown','ArrowLeft':'ArrowLeft','ArrowRight':'ArrowRight',
+        'Delete':'Delete',' ':'Space'}[e.key];
+      if (m) socket.emit('browser_input', {type:'press', key:m});
+    }
+  });
+  canvas.addEventListener('wheel', function(e) {
+    if (!running) return;
+    e.preventDefault();
+    socket.emit('browser_input', {type:'scroll', deltaX:e.deltaX, deltaY:e.deltaY});
+  }, {passive:false});
+
+  /* ---- preview toggle ---- */
+  var previewOn = true;
+  window.togglePreview = function() {
+    previewOn = !previewOn;
+    document.getElementById('screencast').style.display = previewOn ? '' : 'none';
+    document.getElementById('previewToggle').textContent = previewOn ? 'Hide Preview' : 'Show Preview';
+    if (!previewOn) {
+      // Show a message in the overlay area
+      var wrap = document.querySelector('.screencast-wrap');
+      if (wrap) wrap.style.background = previewOn ? '#000' : 'var(--card)';
+    }
+  };
+
+  /* ---- controls ---- */
+  window.doStart = function() {
+    fetch('/api/start',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+      if(d.success){ startBtn.disabled=true; stopBtn.disabled=false; overlay.innerHTML='<p>Starting…</p>'; }
+    });
+  };
+  window.doStop = function() {
+    fetch('/api/stop',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+      if(d.success){ startBtn.disabled=false; stopBtn.disabled=true; overlay.style.display=''; overlay.innerHTML='<p>Stopped.</p>'; }
+    });
+  };
+
+  /* ---- import auth token ---- */
+  window.importToken = function() {
+    var token = document.getElementById('authToken').value.trim();
+    if (!token) { alert('Paste your Twitch auth-token first'); return; }
+    document.getElementById('twitchHint').textContent = 'Importing token…';
+    fetch('/api/import-token', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({auth_token: token})
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) {
+        document.getElementById('twitchHint').textContent = 'Token saved! Start or restart automation to connect.';
+        twitchStatusBadge.textContent = 'Token saved';
+        twitchStatusBadge.className = 'badge badge-sm badge-warn';
+        document.getElementById('authToken').value = '';
+        document.getElementById('authToken').placeholder = '••••••••••••••';
+      } else {
+        document.getElementById('twitchHint').textContent = 'Error: ' + (d.error || 'Unknown');
+      }
+    });
+  };
+
+  /* ---- games & streamers ---- */
+  var completedGames = [];
+  function loadWatchTargets() {
+    fetch('/api/watch-targets').then(function(r){return r.json()}).then(function(list) {
+      var el = document.getElementById('watchTargets');
+      if (!list.length) { el.innerHTML = '<p class="empty">No games selected.</p>'; return; }
+      var html = '';
+      list.forEach(function(t) {
+        var done = completedGames.indexOf(t.game_name) >= 0;
+        html += '<div class="drop-row' + (done ? ' completed' : '') + '">' +
+          '<span class="drop-name">' + (done ? '✅ ' : '') + esc(t.game_name) +
+          (t.streamer ? ' → ' + esc(t.streamer) : '') +
+          (done ? ' <small>(complete)</small>' : '') + '</span>' +
+          '<button class="btn-x" onclick="removeTarget('+t.id+')">&times;</button>' +
+        '</div>';
+      });
+      el.innerHTML = html;
+    });
+  }
+  loadWatchTargets();
+
+  window.discoverGames = function() {
+    var disc = document.getElementById('gameDiscovery');
+    if (disc.style.display !== 'none') { disc.style.display = 'none'; return; }
+    disc.style.display = '';
+    var gl = document.getElementById('gameList');
+    gl.innerHTML = '<p class="empty">Loading games…</p>';
+    fetch('/api/discover-games', {method:'POST'}).then(function(r){return r.json()}).then(function(d) {
+      if (!d.success) { gl.innerHTML = '<p class="empty">'+esc(d.error||'Error')+'</p>'; return; }
+      if (!d.games.length) { gl.innerHTML = '<p class="empty">No games with drops found.</p>'; return; }
+      var html = '';
+      d.games.forEach(function(g) {
+        html += '<div class="game-row" data-url="'+esc(g.url)+'" data-name="'+esc(g.name)+'">' +
+          '<span class="game-name">' + esc(g.name) + '</span>' +
+          '<span class="game-viewers">' + esc(g.viewers || '') + '</span>' +
+          '<button class="btn btn-sm btn-success" onclick="addGame(this)">+</button>' +
+        '</div>';
+      });
+      gl.innerHTML = html;
+    });
+  };
+
+  window.addGame = function(btn) {
+    var row = btn.closest('.game-row');
+    var name = row.dataset.name;
+    var url = row.dataset.url;
+    fetch('/api/watch-targets', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({game_name: name, game_url: url})
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) { btn.textContent = '✓'; btn.disabled = true; loadWatchTargets(); }
+    });
+  };
+
+  window.removeTarget = function(id) {
+    fetch('/api/watch-targets', {
+      method:'DELETE', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id})
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) loadWatchTargets();
+    });
+  };
+
+  /* ---- save settings ---- */
+  window.saveSettings = function() {
+    fetch('/api/settings', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        auto_claim: document.getElementById('autoClaim').checked,
+        check_interval: parseInt(document.getElementById('checkInterval').value),
+        screencast_quality: parseInt(document.getElementById('scQuality').value)
+      })
+    }).then(function(r){return r.json()}).then(function(d){
+      if(d.success) statusMsg.textContent='Settings saved';
+    });
+  };
+
+  /* ---- history ---- */
+  function loadHistory() {
+    fetch('/api/drops').then(function(r){return r.json()}).then(function(list) {
+      if (!list.length) return;
+      var html = '';
+      list.slice(0,20).forEach(function(d) {
+        html += '<div class="drop-row '+(d.status==='claimed'?'claimed':'')+'">' +
+          '<span class="drop-name">'+ esc(d.name||'Drop')+'</span>' +
+          '<span class="drop-pct">'+(d.status==='claimed'?'Claimed':(d.progress||0)+'%')+'</span></div>';
+      });
+      document.getElementById('historyBody').innerHTML = html;
+    });
+  }
+  loadHistory(); setInterval(loadHistory, 30000);
+
+  /* ---- init ---- */
+  fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
+    running = s.running;
+    statusDot.className = 'status-dot '+(running?'on':'off');
+    statusMsg.textContent = s.message||(running?'Running':'Stopped');
+    startBtn.disabled = running; stopBtn.disabled = !running;
+    if (running) overlay.style.display = 'none';
+    if (s.logged_in) {
+      twitchStatusBadge.textContent = 'Logged in';
+      twitchStatusBadge.className = 'badge badge-sm badge-success';
+    } else if (s.twitch_saved || s.twitch_user) {
+      twitchStatusBadge.textContent = 'Token saved';
+      twitchStatusBadge.className = 'badge badge-sm badge-warn';
+    }
+  });
+
+  function esc(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+})();
+</script>
+{% endblock %}

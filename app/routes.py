@@ -1,0 +1,282 @@
+import asyncio
+
+from flask import Blueprint, render_template, jsonify, request
+from flask_login import login_required, current_user
+from flask_socketio import join_room, leave_room
+
+from app.extensions import db, socketio
+from app.models import UserSettings, DropLog
+from app.automator import AutomationManager, UserAutomator
+
+main_bp = Blueprint("main", __name__)
+
+
+# ------------------------------------------------------------------
+# Pages
+# ------------------------------------------------------------------
+
+@main_bp.route("/")
+@login_required
+def dashboard():
+    settings = UserSettings.query.filter_by(user_id=current_user.id).first()
+    return render_template("dashboard.html", settings=settings)
+
+
+# ------------------------------------------------------------------
+# REST API
+# ------------------------------------------------------------------
+
+@main_bp.route("/api/status")
+@login_required
+def api_status():
+    mgr = AutomationManager.get()
+    status = mgr.get_status(current_user.id) if mgr else {"running": False}
+    # Supplement with DB info
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if s and s.twitch_username:
+        status["twitch_user"] = s.twitch_username
+        status["twitch_saved"] = True
+    return jsonify(status)
+
+
+@main_bp.route("/api/start", methods=["POST"])
+@login_required
+def api_start():
+    mgr = AutomationManager.get()
+    if not mgr:
+        return jsonify({"success": False, "error": "Manager not ready"}), 503
+    ok = mgr.start_for_user(current_user.id)
+    return jsonify({"success": ok})
+
+
+@main_bp.route("/api/stop", methods=["POST"])
+@login_required
+def api_stop():
+    mgr = AutomationManager.get()
+    if not mgr:
+        return jsonify({"success": False, "error": "Manager not ready"}), 503
+    ok = mgr.stop_for_user(current_user.id)
+    return jsonify({"success": ok})
+
+
+@main_bp.route("/api/twitch-account", methods=["GET", "POST"])
+@login_required
+def api_twitch_account():
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if not s:
+        s = UserSettings(user_id=current_user.id)
+        db.session.add(s)
+        db.session.commit()
+
+    if request.method == "GET":
+        return jsonify({
+            "twitch_username": s.twitch_username or "",
+            "has_password": bool(s.twitch_password),
+        })
+
+    data = request.get_json(silent=True) or {}
+    u = (data.get("twitch_username") or "").strip()
+    p = data.get("twitch_password") or ""
+    if not u:
+        return jsonify({"success": False, "error": "Username required"}), 400
+    s.twitch_username = u
+    if p:
+        s.twitch_password = p
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@main_bp.route("/api/import-token", methods=["POST"])
+@login_required
+def api_import_token():
+    data = request.get_json(silent=True) or {}
+    token = (data.get("auth_token") or "").strip()
+    if not token:
+        return jsonify({"success": False, "error": "Token required"}), 400
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if not s:
+        s = UserSettings(user_id=current_user.id)
+        db.session.add(s)
+    s.twitch_auth_token = token
+    db.session.commit()
+    # If automation is running, apply immediately
+    mgr = AutomationManager.get()
+    if mgr:
+        a = mgr.get_automator(current_user.id)
+        if a and a._loop and a._loop.is_running():
+            import asyncio
+            asyncio.run_coroutine_threadsafe(a.import_cookies(token), a._loop)
+    return jsonify({"success": True})
+
+
+@main_bp.route("/api/discover-games", methods=["POST"])
+@login_required
+def api_discover_games():
+    mgr = AutomationManager.get()
+    if not mgr:
+        return jsonify({"success": False, "error": "Not ready"}), 503
+    a = mgr.get_automator(current_user.id)
+    if not a or not a.context:
+        return jsonify({"success": False, "error": "Start automation first so the browser is available"}), 400
+    import asyncio
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            UserAutomator.discover_games(a.context), a._loop
+        )
+        games = future.result(timeout=30)
+        return jsonify({"success": True, "games": games})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@main_bp.route("/api/discover-streamers", methods=["POST"])
+@login_required
+def api_discover_streamers():
+    data = request.get_json(silent=True) or {}
+    game_url = data.get("game_url", "")
+    if not game_url:
+        return jsonify({"success": False, "error": "game_url required"}), 400
+    mgr = AutomationManager.get()
+    if not mgr:
+        return jsonify({"success": False, "error": "Not ready"}), 503
+    a = mgr.get_automator(current_user.id)
+    if not a or not a.context:
+        return jsonify({"success": False, "error": "Start automation first"}), 400
+    import asyncio
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            UserAutomator.discover_streamers(a.context, game_url), a._loop
+        )
+        streamers = future.result(timeout=30)
+        return jsonify({"success": True, "streamers": streamers})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@main_bp.route("/api/watch-targets", methods=["GET", "POST", "DELETE"])
+@login_required
+def api_watch_targets():
+    from app.models import WatchTarget
+    if request.method == "GET":
+        rows = WatchTarget.query.filter_by(user_id=current_user.id).all()
+        return jsonify([{
+            "id": r.id, "game_name": r.game_name, "game_url": r.game_url,
+            "streamer": r.streamer, "enabled": r.enabled,
+        } for r in rows])
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        game_name = (data.get("game_name") or "").strip()
+        if not game_name:
+            return jsonify({"success": False, "error": "game_name required"}), 400
+        wt = WatchTarget(
+            user_id=current_user.id,
+            game_name=game_name,
+            game_url=(data.get("game_url") or "").strip() or None,
+            streamer=(data.get("streamer") or "").strip() or None,
+        )
+        db.session.add(wt)
+        db.session.commit()
+        return jsonify({"success": True, "id": wt.id})
+
+    if request.method == "DELETE":
+        data = request.get_json(silent=True) or {}
+        tid = data.get("id")
+        if tid:
+            WatchTarget.query.filter_by(id=tid, user_id=current_user.id).delete()
+            db.session.commit()
+        return jsonify({"success": True})
+
+
+@main_bp.route("/api/settings", methods=["GET", "POST"])
+@login_required
+def api_settings():
+    s = UserSettings.query.filter_by(user_id=current_user.id).first()
+    if not s:
+        s = UserSettings(user_id=current_user.id)
+        db.session.add(s)
+        db.session.commit()
+
+    if request.method == "GET":
+        return jsonify({
+            "auto_claim": s.auto_claim,
+            "check_interval": s.check_interval,
+            "screencast_quality": s.screencast_quality,
+            "screencast_max_fps": s.screencast_max_fps,
+        })
+
+    data = request.get_json(silent=True) or {}
+    if "auto_claim" in data:
+        s.auto_claim = bool(data["auto_claim"])
+    if "check_interval" in data:
+        s.check_interval = max(10, int(data["check_interval"]))
+    if "screencast_quality" in data:
+        s.screencast_quality = max(10, min(100, int(data["screencast_quality"])))
+    if "screencast_max_fps" in data:
+        s.screencast_max_fps = max(1, min(10, int(data["screencast_max_fps"])))
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@main_bp.route("/api/drops")
+@login_required
+def api_drops():
+    logs = (
+        DropLog.query.filter_by(user_id=current_user.id)
+        .order_by(DropLog.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return jsonify([{
+        "id": d.id, "name": d.drop_name, "game": d.game,
+        "status": d.status, "progress": d.progress,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+        "claimed_at": d.claimed_at.isoformat() if d.claimed_at else None,
+    } for d in logs])
+
+
+# ------------------------------------------------------------------
+# Socket.IO
+# ------------------------------------------------------------------
+
+@socketio.on("connect")
+def on_connect():
+    if current_user.is_authenticated:
+        join_room(f"user_{current_user.id}")
+        mgr = AutomationManager.get()
+        if mgr:
+            socketio.emit("automation_status", mgr.get_status(current_user.id), room=f"user_{current_user.id}")
+
+
+@socketio.on("disconnect")
+def on_disconnect():
+    if current_user.is_authenticated:
+        leave_room(f"user_{current_user.id}")
+
+
+@socketio.on("browser_input")
+def on_browser_input(data):
+    if not current_user.is_authenticated:
+        return
+    mgr = AutomationManager.get()
+    if not mgr:
+        return
+    a = mgr.get_automator(current_user.id)
+    if a and a._loop and a._loop.is_running():
+        asyncio.run_coroutine_threadsafe(a.handle_input(data), a._loop)
+
+
+@socketio.on("twitch_login")
+def on_twitch_login(data):
+    if not current_user.is_authenticated:
+        return
+    mgr = AutomationManager.get()
+    if not mgr:
+        return
+    a = mgr.get_automator(current_user.id)
+    u = (data.get("username") or "").strip()
+    p = data.get("password") or ""
+    if not u or not p:
+        return
+    if a and a._loop and a._loop.is_running():
+        asyncio.run_coroutine_threadsafe(a.auto_login(u, p), a._loop)
