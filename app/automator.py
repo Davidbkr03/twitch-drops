@@ -758,69 +758,69 @@ class UserAutomator:
     async def _check_and_claim_drops(self):
         self._update_status(message="Checking drops…")
         await self._goto(TWITCH_INVENTORY_URL)
-        await asyncio.sleep(4)
+        await asyncio.sleep(5)
 
         claimed: list[dict] = []
         in_progress: list[dict] = []
 
-        # ---- claim ready drops ----
         try:
-            btns = await self.page.query_selector_all(
-                'button[data-test-selector="DropsCampaignInProgressRewardPresentation__Action"]'
-            )
-            if not btns:
-                btns = await self.page.query_selector_all('button:has-text("Claim")')
-            for btn in btns:
+            # Claim any ready drops
+            claim_btns = await self.page.query_selector_all('button:has-text("Claim")')
+            for btn in claim_btns:
                 try:
-                    label = ""
-                    parent = await btn.evaluate_handle("el => el.closest('[class*=\"Reward\"]')")
-                    if parent:
-                        label = (await parent.text_content() or "")[:120].strip()
                     await btn.click()
                     await asyncio.sleep(1.5)
-                    claimed.append({"name": label or "Drop", "time": datetime.now(timezone.utc).isoformat()})
+                    claimed.append({"name": "Drop claimed", "time": datetime.now(timezone.utc).isoformat()})
                 except Exception:
                     pass
+
+            # Scrape progress from inventory — each progressbar has item context
+            items = await self.page.evaluate(r"""
+                () => {
+                    const out = [];
+                    const seen = new Set();
+                    document.querySelectorAll('[role="progressbar"]').forEach(pb => {
+                        const pct = parseInt(pb.getAttribute('aria-valuenow') || '0');
+                        // Walk up to find the individual item container
+                        let el = pb.parentElement;
+                        for (let i = 0; i < 5; i++) {
+                            if (!el) break;
+                            el = el.parentElement;
+                        }
+                        if (!el) return;
+                        // Get item image (reward thumbnail)
+                        const imgs = el.querySelectorAll('img');
+                        let itemImg = '';
+                        imgs.forEach(img => {
+                            const s = img.src || '';
+                            if (s && !itemImg && img.width > 20) itemImg = s;
+                        });
+                        // Get item name from nearby text
+                        const texts = [];
+                        el.querySelectorAll('p, span').forEach(t => {
+                            const v = (t.textContent || '').trim();
+                            if (v && v.length > 2 && v.length < 80 && !/^\d+%$/.test(v)
+                                && v !== 'Drops' && v !== 'In Progress') {
+                                texts.push(v);
+                            }
+                        });
+                        const name = texts[0] || 'Drop ' + (out.length + 1);
+                        const key = name + '_' + pct;
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        out.push({ name, progress: pct, image: itemImg });
+                    });
+                    return out;
+                }
+            """)
+            for item in (items or []):
+                in_progress.append({
+                    "name": item.get("name", "Drop"),
+                    "progress": item.get("progress", 0),
+                    "image": item.get("image", ""),
+                })
         except Exception:
             pass
-
-        # ---- scrape progress ----
-        try:
-            cards = await self.page.query_selector_all(
-                '[data-test-selector="DropsCampaignInProgressRewardPresentation"],'
-                '[class*="InProgressReward"]'
-            )
-            for card in cards:
-                try:
-                    text = (await card.text_content() or "").strip()
-                    pct = 0
-                    m = re.search(r"(\d+)\s*%", text)
-                    if m:
-                        pct = int(m.group(1))
-                    name = text[:120]
-                    img = await card.query_selector("img")
-                    if img:
-                        alt = await img.get_attribute("alt")
-                        if alt:
-                            name = alt.strip()
-                    in_progress.append({"name": name, "progress": pct})
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # ---- fallback: scan page for percentage text ----
-        if not in_progress:
-            try:
-                body_text = await self.page.text_content("body") or ""
-                for m in re.finditer(r"(\d{1,3})%", body_text):
-                    pct = int(m.group(1))
-                    if 0 < pct < 100:
-                        in_progress.append({"name": "Drop progress", "progress": pct})
-                    if len(in_progress) >= 5:
-                        break
-            except Exception:
-                pass
 
         all_claimed = self.status.get("drops_claimed", []) + claimed
         self._update_status(
