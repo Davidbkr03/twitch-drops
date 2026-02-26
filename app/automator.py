@@ -356,15 +356,50 @@ class UserAutomator:
         logged_in = await self._is_logged_in()
         self._update_status(logged_in=logged_in)
 
-        # 3. Auto-login if not logged in and credentials are saved
-        if not logged_in and twitch_user and twitch_pass:
-            self._update_status(message=f"Logging in as {twitch_user}…")
-            logged_in = await self._do_auto_login(twitch_user, twitch_pass)
-            self._update_status(logged_in=logged_in)
-
-        # 4. If still not logged in, wait for manual login or credentials via UI
+        # 3. If not logged in, navigate to login page and pre-fill credentials
         if not logged_in:
-            self._update_status(message="Waiting for Twitch login — save credentials above or use the preview")
+            await self._goto(TWITCH_LOGIN_URL)
+            await asyncio.sleep(3)
+
+            # Dismiss cookie banner to let Kasada settle
+            try:
+                proceed = await self.page.query_selector(
+                    'button:has-text("Proceed"), #onetrust-accept-btn-handler'
+                )
+                if proceed:
+                    await proceed.click()
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+
+            await asyncio.sleep(2)
+
+            if twitch_user and twitch_pass:
+                self._update_status(message="Pre-filling credentials — click Log In in the preview")
+                try:
+                    await self.page.wait_for_selector(
+                        'input[autocomplete="username"]', timeout=10000
+                    )
+                    import random
+                    u_el = await self.page.query_selector('input[autocomplete="username"]')
+                    if u_el:
+                        await u_el.click()
+                        await asyncio.sleep(0.3 + random.random() * 0.3)
+                        await u_el.press("Control+a")
+                        await u_el.type(twitch_user, delay=50 + random.randint(0, 30))
+                    await asyncio.sleep(0.3 + random.random() * 0.3)
+                    p_el = await self.page.query_selector('input[autocomplete="current-password"]')
+                    if p_el:
+                        await p_el.click()
+                        await asyncio.sleep(0.3 + random.random() * 0.3)
+                        await p_el.press("Control+a")
+                        await p_el.type(twitch_pass, delay=50 + random.randint(0, 30))
+                except Exception:
+                    pass
+
+            self._update_status(
+                message="Click Log In in the browser preview to complete first-time login"
+            )
             logged_in = await self._wait_for_login()
             if not logged_in:
                 return

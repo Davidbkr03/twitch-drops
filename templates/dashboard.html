@@ -31,8 +31,8 @@
       <div class="screencast-wrap">
         <canvas id="screencast" tabindex="1"></canvas>
         <div class="sc-overlay" id="scOverlay">
-          <p>Press <strong>Start</strong> to begin automation.<br>
-          You can also interact with the browser here.</p>
+          <p>Press <strong>Start</strong> to begin.<br>
+          First time? Save your Twitch credentials, then click Log In in the preview.</p>
         </div>
       </div>
       <p class="hint">Click inside the preview to interact &middot; Focus it to type</p>
@@ -59,7 +59,7 @@
             <input type="password" id="twitchPass" placeholder="{% if settings and settings.twitch_password %}••••••••{% else %}Enter password{% endif %}">
           </div>
           <button class="btn btn-primary btn-sm btn-block" onclick="saveTwitchAccount()">Save &amp; Login</button>
-          <p class="hint-text" id="twitchHint">Credentials are stored so the bot auto-logs in on every start.</p>
+          <p class="hint-text" id="twitchHint">Saved credentials are pre-filled on the Twitch login page. Click Log In in the preview for first-time login — after that, sessions persist automatically.</p>
         </div>
       </section>
 
