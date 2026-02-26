@@ -59,39 +59,72 @@ _STEALTH_JS = """(() => {
     try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch(e){}
 
     // 2. Fake WebGL renderer — SwiftShader is a dead giveaway
-    const _gp  = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(p) {
-        if (p === 37445) return 'Google Inc. (NVIDIA)';
-        if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-        return _gp.call(this, p);
+    const fakeVendor = 'Google Inc. (NVIDIA)';
+    const fakeRenderer = 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+    const patchGL = (proto) => {
+        if (!proto) return;
+        const orig = proto.getParameter;
+        proto.getParameter = function(p) {
+            if (p === 37445) return fakeVendor;
+            if (p === 37446) return fakeRenderer;
+            return orig.call(this, p);
+        };
     };
-    if (typeof WebGL2RenderingContext !== 'undefined') {
-        const _gp2 = WebGL2RenderingContext.prototype.getParameter;
-        WebGL2RenderingContext.prototype.getParameter = function(p) {
-            if (p === 37445) return 'Google Inc. (NVIDIA)';
-            if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-            return _gp2.call(this, p);
-        };
-    }
+    try { patchGL(WebGLRenderingContext.prototype); } catch(e){}
+    try { patchGL(WebGL2RenderingContext.prototype); } catch(e){}
 
-    // 3. Provide chrome.runtime to look like a real Chrome install
-    if (window.chrome) {
-        window.chrome.runtime = {
-            OnInstalledReason: {},
-            OnRestartRequiredReason: {},
-            PlatformArch: {},
-            PlatformOs: {},
-            RequestUpdateCheckStatus: {},
-            connect: function() { return { onDisconnect: { addListener: function(){} },
-                onMessage: { addListener: function(){} }, postMessage: function(){} }; },
-            sendMessage: function(){},
-            id: undefined,
-        };
-    }
-
-    // 4. Consistent Notification permission
+    // 3. Canvas fingerprint noise — add subtle per-session noise to toDataURL
     try {
-        Object.defineProperty(Notification, 'permission', { get: () => 'default' });
+        const _toBlob = HTMLCanvasElement.prototype.toBlob;
+        const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+        const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
+        const noise = () => (Math.random() - 0.5) * 2;
+        CanvasRenderingContext2D.prototype.getImageData = function() {
+            const data = _getImageData.apply(this, arguments);
+            if (data.width > 16 && data.height > 16) {
+                for (let i = 0; i < Math.min(data.data.length, 40); i += 4) {
+                    data.data[i]   = Math.max(0, Math.min(255, data.data[i]   + noise()));
+                    data.data[i+1] = Math.max(0, Math.min(255, data.data[i+1] + noise()));
+                    data.data[i+2] = Math.max(0, Math.min(255, data.data[i+2] + noise()));
+                }
+            }
+            return data;
+        };
+    } catch(e){}
+
+    // 4. Provide chrome.runtime to look like a real Chrome install
+    try {
+        if (window.chrome) {
+            window.chrome.runtime = {
+                OnInstalledReason: { CHROME_UPDATE:'chrome_update', INSTALL:'install',
+                    SHARED_MODULE_UPDATE:'shared_module_update', UPDATE:'update' },
+                OnRestartRequiredReason: { APP_UPDATE:'app_update', OS_UPDATE:'os_update', PERIODIC:'periodic' },
+                PlatformArch: { ARM:'arm', ARM64:'arm64', X86_32:'x86-32', X86_64:'x86-64' },
+                PlatformOs: { ANDROID:'android', CROS:'cros', LINUX:'linux', MAC:'mac', WIN:'win' },
+                RequestUpdateCheckStatus: { NO_UPDATE:'no_update', THROTTLED:'throttled',
+                    UPDATE_AVAILABLE:'update_available' },
+                connect: function() { return { onDisconnect:{addListener:function(){}},
+                    onMessage:{addListener:function(){}}, postMessage:function(){} }; },
+                sendMessage: function(a,b,c) { if(typeof c==='function') c(); },
+                getManifest: function() { return {}; },
+                getURL: function(p) { return ''; },
+                id: undefined,
+            };
+        }
+    } catch(e){}
+
+    // 5. Consistent Notification permission
+    try { Object.defineProperty(Notification, 'permission', { get: () => 'default' }); } catch(e){}
+
+    // 6. AudioContext fingerprint noise
+    try {
+        const origGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
+        AnalyserNode.prototype.getFloatFrequencyData = function(arr) {
+            origGetFloatFreq.call(this, arr);
+            for (let i = 0; i < Math.min(arr.length, 10); i++) {
+                arr[i] += (Math.random() - 0.5) * 0.01;
+            }
+        };
     } catch(e){}
 })();"""
 
@@ -169,6 +202,7 @@ class UserAutomator:
 
         self._watch_start: float | None = None
         self._total_watch_secs: float = 0
+        self._passport_429: int = 0
 
         self.status: dict = {
             "running": False,
@@ -239,33 +273,54 @@ class UserAutomator:
             self._update_status(running=False, message="Stopped")
 
     async def _async_main(self):
+        tried_compat = False
         async with async_playwright() as p:
-            try:
-                await self._launch_browser(p)
-                await self._start_screencast()
-                await self._full_automation()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("User %s flow error", self.user_id)
-            finally:
-                await self._cleanup()
+            while not self._stop.is_set():
+                self._passport_429 = 0
+                try:
+                    await self._launch_browser(p, compat_mode=tried_compat)
+                    await self._start_screencast()
+                    await self._full_automation()
+                    break
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    logger.exception("User %s flow error", self.user_id)
+                    if self._passport_429 >= 3 and not tried_compat:
+                        tried_compat = True
+                        self._update_status(message="Retrying with compatibility mode…")
+                        logger.info("User %s: switching to compat mode after %d 429s",
+                                    self.user_id, self._passport_429)
+                        await self._cleanup()
+                        await asyncio.sleep(5)
+                        continue
+                    break
+                finally:
+                    await self._cleanup()
 
     # ---- browser launch ----
 
-    async def _launch_browser(self, p):
+    async def _launch_browser(self, p, compat_mode: bool = False):
         for lock in glob.glob(os.path.join(self.data_dir, "Singleton*")):
             try:
                 os.remove(lock)
             except OSError:
                 pass
 
+        args = list(BROWSER_ARGS)
+        ignore_defaults = ["--enable-automation"]
+        if compat_mode:
+            # Compat mode: remove anti-automation flags (paradoxically helps
+            # because Kasada may flag the ABSENCE of default args).
+            args = [a for a in args if a != "--disable-blink-features=AutomationControlled"]
+            ignore_defaults = None
+
         kw = dict(
             user_data_dir=self.data_dir,
             headless=False,
             slow_mo=50,
-            ignore_default_args=["--enable-automation"],
-            args=BROWSER_ARGS,
+            ignore_default_args=ignore_defaults,
+            args=args,
             viewport=VIEWPORT,
             locale="en-US",
         )
@@ -274,12 +329,25 @@ class UserAutomator:
         except Exception:
             self.context = await p.chromium.launch_persistent_context(**kw)
 
+        # Apply stealth via Playwright init scripts (covers main page frames)
         stealth = Stealth(init_scripts_only=True, navigator_webdriver=True)
         await stealth.apply_stealth_async(self.context)
 
-        await self.context.add_init_script(_STEALTH_JS)
-
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+
+        # Apply stealth via CDP — this injects into ALL frames including
+        # cross-origin Kasada iframes that context.add_init_script misses.
+        try:
+            cdp = await self.context.new_cdp_session(self.page)
+            await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+                "source": _STEALTH_JS,
+                "runImmediately": True,
+            })
+            await cdp.detach()
+        except Exception:
+            # Fallback to context-level script
+            await self.context.add_init_script(_STEALTH_JS)
+
         self._update_status(message="Browser launched")
 
     # ---- screencast ----
@@ -342,37 +410,46 @@ class UserAutomator:
     # ==================================================================
 
     async def _full_automation(self):
+        import random
+
+        # Track passport 429s for compat-mode switch
+        def _on_resp(resp):
+            try:
+                if "passport.twitch.tv" in resp.url and resp.status == 429:
+                    self._passport_429 += 1
+            except Exception:
+                pass
+        self.page.on("response", _on_resp)
+
         # 1. Load stored Twitch credentials
         twitch_user, twitch_pass = self._load_twitch_creds()
         if twitch_user:
             self._update_status(twitch_user=twitch_user, twitch_saved=True)
 
-        # 2. Navigate to Twitch and check login
+        # 2. Navigate to inventory — Twitch will redirect to login if needed
         self._update_status(message="Navigating to Twitch…")
         await self._goto(TWITCH_INVENTORY_URL)
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
         await self._accept_cookies()
+
+        # Wait for page to settle (Kasada iframes load here)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
 
         logged_in = await self._is_logged_in()
         self._update_status(logged_in=logged_in)
 
-        # 3. If not logged in, navigate to login page and pre-fill credentials
+        # 3. If not logged in, pre-fill credentials on whatever login page we're on
         if not logged_in:
-            await self._goto(TWITCH_LOGIN_URL)
-            await asyncio.sleep(3)
+            # Check if we got redirected to login
+            if "/login" not in (self.page.url or ""):
+                await self._goto(TWITCH_LOGIN_URL)
+                await asyncio.sleep(3)
 
-            # Dismiss cookie banner to let Kasada settle
-            try:
-                proceed = await self.page.query_selector(
-                    'button:has-text("Proceed"), #onetrust-accept-btn-handler'
-                )
-                if proceed:
-                    await proceed.click()
-                    await asyncio.sleep(1)
-            except Exception:
-                pass
-
-            await asyncio.sleep(2)
+            await self._accept_cookies()
+            await asyncio.sleep(2 + random.random() * 2)
 
             if twitch_user and twitch_pass:
                 self._update_status(message="Pre-filling credentials — click Log In in the preview")
@@ -380,20 +457,20 @@ class UserAutomator:
                     await self.page.wait_for_selector(
                         'input[autocomplete="username"]', timeout=10000
                     )
-                    import random
+                    await asyncio.sleep(0.5 + random.random())
                     u_el = await self.page.query_selector('input[autocomplete="username"]')
                     if u_el:
                         await u_el.click()
-                        await asyncio.sleep(0.3 + random.random() * 0.3)
+                        await asyncio.sleep(0.2 + random.random() * 0.3)
                         await u_el.press("Control+a")
-                        await u_el.type(twitch_user, delay=50 + random.randint(0, 30))
-                    await asyncio.sleep(0.3 + random.random() * 0.3)
+                        await u_el.type(twitch_user, delay=55 + random.randint(0, 45))
+                    await asyncio.sleep(0.3 + random.random() * 0.4)
                     p_el = await self.page.query_selector('input[autocomplete="current-password"]')
                     if p_el:
                         await p_el.click()
-                        await asyncio.sleep(0.3 + random.random() * 0.3)
+                        await asyncio.sleep(0.2 + random.random() * 0.3)
                         await p_el.press("Control+a")
-                        await p_el.type(twitch_pass, delay=50 + random.randint(0, 30))
+                        await p_el.type(twitch_pass, delay=55 + random.randint(0, 45))
                 except Exception:
                     pass
 
