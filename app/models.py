@@ -44,6 +44,19 @@ class UserSettings(db.Model):
     )
 
 
+class WatchTarget(db.Model):
+    """Games + optional specific streamers a user wants to watch for drops."""
+    __tablename__ = "watch_targets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    game_name = db.Column(db.String(200), nullable=False)
+    game_url = db.Column(db.String(500), nullable=True)
+    streamer = db.Column(db.String(100), nullable=True)
+    enabled = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class DropLog(db.Model):
     __tablename__ = "drop_logs"
 

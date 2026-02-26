@@ -33,6 +33,11 @@ cur = conn.cursor()
 cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_username VARCHAR(100)')
 cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_password VARCHAR(256)')
 cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_auth_token TEXT')
+cur.execute('''CREATE TABLE IF NOT EXISTS watch_targets (
+    id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+    game_name VARCHAR(200) NOT NULL, game_url VARCHAR(500),
+    streamer VARCHAR(100), enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW())''')
 conn.commit()
 conn.close()
 print('Schema migration OK')

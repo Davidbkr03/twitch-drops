@@ -6,7 +6,7 @@ from flask_socketio import join_room, leave_room
 
 from app.extensions import db, socketio
 from app.models import UserSettings, DropLog
-from app.automator import AutomationManager
+from app.automator import AutomationManager, UserAutomator
 
 main_bp = Blueprint("main", __name__)
 
@@ -107,6 +107,85 @@ def api_import_token():
             import asyncio
             asyncio.run_coroutine_threadsafe(a.import_cookies(token), a._loop)
     return jsonify({"success": True})
+
+
+@main_bp.route("/api/discover-games", methods=["POST"])
+@login_required
+def api_discover_games():
+    mgr = AutomationManager.get()
+    if not mgr:
+        return jsonify({"success": False, "error": "Not ready"}), 503
+    a = mgr.get_automator(current_user.id)
+    if not a or not a.context:
+        return jsonify({"success": False, "error": "Start automation first so the browser is available"}), 400
+    import asyncio
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            UserAutomator.discover_games(a.context), a._loop
+        )
+        games = future.result(timeout=30)
+        return jsonify({"success": True, "games": games})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@main_bp.route("/api/discover-streamers", methods=["POST"])
+@login_required
+def api_discover_streamers():
+    data = request.get_json(silent=True) or {}
+    game_url = data.get("game_url", "")
+    if not game_url:
+        return jsonify({"success": False, "error": "game_url required"}), 400
+    mgr = AutomationManager.get()
+    if not mgr:
+        return jsonify({"success": False, "error": "Not ready"}), 503
+    a = mgr.get_automator(current_user.id)
+    if not a or not a.context:
+        return jsonify({"success": False, "error": "Start automation first"}), 400
+    import asyncio
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            UserAutomator.discover_streamers(a.context, game_url), a._loop
+        )
+        streamers = future.result(timeout=30)
+        return jsonify({"success": True, "streamers": streamers})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@main_bp.route("/api/watch-targets", methods=["GET", "POST", "DELETE"])
+@login_required
+def api_watch_targets():
+    from app.models import WatchTarget
+    if request.method == "GET":
+        rows = WatchTarget.query.filter_by(user_id=current_user.id).all()
+        return jsonify([{
+            "id": r.id, "game_name": r.game_name, "game_url": r.game_url,
+            "streamer": r.streamer, "enabled": r.enabled,
+        } for r in rows])
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        game_name = (data.get("game_name") or "").strip()
+        if not game_name:
+            return jsonify({"success": False, "error": "game_name required"}), 400
+        wt = WatchTarget(
+            user_id=current_user.id,
+            game_name=game_name,
+            game_url=(data.get("game_url") or "").strip() or None,
+            streamer=(data.get("streamer") or "").strip() or None,
+        )
+        db.session.add(wt)
+        db.session.commit()
+        return jsonify({"success": True, "id": wt.id})
+
+    if request.method == "DELETE":
+        data = request.get_json(silent=True) or {}
+        tid = data.get("id")
+        if tid:
+            WatchTarget.query.filter_by(id=tid, user_id=current_user.id).delete()
+            db.session.commit()
+        return jsonify({"success": True})
 
 
 @main_bp.route("/api/settings", methods=["GET", "POST"])
