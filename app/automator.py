@@ -1070,10 +1070,15 @@ class UserAutomator:
                 wait_until="domcontentloaded", timeout=30000,
             )
             await asyncio.sleep(3)
-            # Scroll to load more
-            for _ in range(3):
+            # Scroll until no new content loads (lazy-load handling)
+            prev_height = 0
+            for _ in range(20):
+                cur_height = await page.evaluate("document.body.scrollHeight")
+                if cur_height == prev_height:
+                    break
+                prev_height = cur_height
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
 
             games = await page.evaluate(r"""
                 () => {
@@ -1109,6 +1114,15 @@ class UserAutomator:
             url = game_url if game_url.startswith("http") else f"https://www.twitch.tv{game_url}"
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
+            # Scroll to load all streamers
+            prev_height = 0
+            for _ in range(15):
+                cur_height = await page.evaluate("document.body.scrollHeight")
+                if cur_height == prev_height:
+                    break
+                prev_height = cur_height
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1.5)
             streamers = await page.evaluate(r"""
                 () => {
                     const out = [];
