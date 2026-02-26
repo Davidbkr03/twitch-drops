@@ -128,6 +128,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .game-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .game-viewers{color:var(--muted);font-size:.75rem;white-space:nowrap}
 .btn-x{background:none;border:none;color:var(--danger);font-size:1rem;cursor:pointer;padding:0 .3rem;line-height:1}
+.drop-row.completed .drop-name{color:var(--muted);text-decoration:line-through}
+.drop-row.completed small{color:var(--success);text-decoration:none;font-style:italic}
 .token-help summary{cursor:pointer;color:var(--primary);font-weight:600}
 .token-help ol{margin:.4rem 0 0 1.2rem;line-height:1.6}
 .token-help code{background:var(--surface);padding:.1rem .3rem;border-radius:3px;font-size:.75rem}
