@@ -761,6 +761,18 @@ class UserAutomator:
         await self._goto(TWITCH_INVENTORY_URL)
         await asyncio.sleep(5)
 
+        # Scroll the full page to trigger lazy-loading of all drop items
+        prev_height = 0
+        for _ in range(15):
+            cur_height = await self.page.evaluate("document.body.scrollHeight")
+            if cur_height == prev_height:
+                break
+            prev_height = cur_height
+            await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(1)
+        await self.page.evaluate("window.scrollTo(0, 0)")
+        await asyncio.sleep(0.5)
+
         claimed: list[dict] = []
         in_progress: list[dict] = []
 
