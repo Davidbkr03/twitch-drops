@@ -35,7 +35,10 @@
           First time? Save your Twitch credentials, then click Log In in the preview.</p>
         </div>
       </div>
-      <p class="hint">Click inside the preview to interact &middot; Focus it to type</p>
+      <div class="preview-controls">
+        <span class="hint">Click inside to interact &middot; Focus to type</span>
+        <button class="btn btn-sm btn-outline" id="previewToggle" onclick="togglePreview()">Hide Preview</button>
+      </div>
     </section>
 
     <!-- Sidebar -->
@@ -145,7 +148,7 @@
   var frameImg = new Image();
   var framePending = false;
   socket.on('screencast_frame', function(d) {
-    if (framePending) return;
+    if (!previewOn || framePending) return;
     framePending = true;
     frameImg.onload = function() {
       canvas.width = frameImg.width; canvas.height = frameImg.height;
@@ -214,8 +217,10 @@
     if (s.drops_in_progress && s.drops_in_progress.length) {
       s.drops_in_progress.forEach(function(d) {
         var pct = d.progress || 0;
+        var imgHtml = d.image ? '<img src="'+esc(d.image)+'" class="drop-thumb" alt="">' : '';
         html += '<div class="drop-item">' +
           '<div class="drop-item-top">' +
+            imgHtml +
             '<span class="drop-name">' + esc(d.name || 'Drop') + '</span>' +
             '<span class="drop-pct">' + pct + '%</span>' +
           '</div>' +
@@ -261,6 +266,19 @@
     e.preventDefault();
     socket.emit('browser_input', {type:'scroll', deltaX:e.deltaX, deltaY:e.deltaY});
   }, {passive:false});
+
+  /* ---- preview toggle ---- */
+  var previewOn = true;
+  window.togglePreview = function() {
+    previewOn = !previewOn;
+    document.getElementById('screencast').style.display = previewOn ? '' : 'none';
+    document.getElementById('previewToggle').textContent = previewOn ? 'Hide Preview' : 'Show Preview';
+    if (!previewOn) {
+      // Show a message in the overlay area
+      var wrap = document.querySelector('.screencast-wrap');
+      if (wrap) wrap.style.background = previewOn ? '#000' : 'var(--card)';
+    }
+  };
 
   /* ---- controls ---- */
   window.doStart = function() {
