@@ -15,7 +15,7 @@ from playwright_stealth import Stealth
 logger = logging.getLogger(__name__)
 
 TWITCH_INVENTORY_URL = "https://www.twitch.tv/drops/inventory"
-TWITCH_RUST_DIRECTORY_URL = "https://www.twitch.tv/directory/game/Rust"
+TWITCH_DROPS_ENABLED_URL = "https://www.twitch.tv/directory/all/tags/dropsenabled"
 TWITCH_LOGIN_URL = "https://www.twitch.tv/login"
 
 BROWSER_ARGS = [
@@ -857,80 +857,210 @@ class UserAutomator:
             logger.debug("persist error", exc_info=True)
 
     # ==================================================================
-    # Stream watching with offline detection
+    # Smart stream watching — uses user's game selections
     # ==================================================================
 
     async def _watch_loop_cycle(self):
-        """Find a stream, watch it, detect offline, switch."""
+        """Check current stream, switch if offline, find best target."""
 
-        # If already on a stream page, check if it's still live
         if self.status.get("watching"):
-            still_live = await self._is_stream_live()
-            if still_live:
+            if await self._is_stream_live():
                 self._update_watch_time()
                 self._update_status(message=f"Watching: {self.status.get('stream_name', '?')}")
                 await self._sleep(self._get_check_interval())
                 return
-            else:
-                self._stop_watch_timer()
-                self._update_status(watching=None, stream_name=None, message="Stream went offline — finding another…")
-                await asyncio.sleep(3)
+            self._stop_watch_timer()
+            self._update_status(watching=None, stream_name=None,
+                                message="Stream went offline — finding another…")
+            await asyncio.sleep(3)
 
-        # Find a new stream
-        await self._find_and_start_stream()
+        await self._find_best_stream()
         await self._sleep(self._get_check_interval())
 
     async def _is_stream_live(self) -> bool:
         try:
             url = self.page.url or ""
-            if "/directory" in url or "/drops" in url or "/login" in url:
+            if any(x in url for x in ["/directory", "/drops", "/login"]):
                 return False
-            # Check for offline indicator
-            offline = await self.page.query_selector('[data-a-target="player-overlay-content-gate"]')
+            offline = await self.page.query_selector(
+                '[data-a-target="player-overlay-content-gate"]'
+            )
             if offline:
                 return False
-            # Check for the live indicator or video player
-            live = await self.page.query_selector(
-                '[data-a-target="player-state-overlay"], video, .video-player'
-            )
+            live = await self.page.query_selector('video, .video-player')
             return live is not None
         except Exception:
             return False
 
-    async def _find_and_start_stream(self):
-        self._update_status(message="Finding a stream with drops…")
-        await self._goto(TWITCH_RUST_DIRECTORY_URL)
-        await asyncio.sleep(4)
+    async def _find_best_stream(self):
+        """Pick the best stream from the user's selected games."""
+        targets = self._load_watch_targets()
+        if not targets:
+            # No games selected — fall back to drops-enabled directory
+            self._update_status(message="No games selected — browsing all drops")
+            targets = [{"game_url": TWITCH_DROPS_ENABLED_URL}]
 
-        try:
-            cards = await self.page.query_selector_all('a[data-a-target="preview-card-image-link"]')
-            if not cards:
-                cards = await self.page.query_selector_all('article a[href*="/"]')
+        # Try each game in the user's list
+        for target in targets:
+            if self._stop.is_set():
+                return
+            game_url = target.get("game_url") or ""
+            game_name = target.get("game_name") or "Unknown"
+            preferred_streamer = target.get("streamer")
 
-            if cards:
-                await cards[0].click()
-                await asyncio.sleep(5)
-                await self._accept_mature_content()
-                await self._set_low_quality()
+            if preferred_streamer:
+                # Specific streamer requested — go directly
+                self._update_status(message=f"Checking {preferred_streamer}…")
+                stream_url = f"https://www.twitch.tv/{preferred_streamer}"
+                await self._goto(stream_url)
+                await asyncio.sleep(4)
+                if await self._is_stream_live():
+                    await self._start_watching(preferred_streamer, stream_url, game_name)
+                    return
+                continue
 
-                name = ""
-                try:
-                    el = await self.page.query_selector('[data-a-target="stream-title"], h1')
-                    if el:
-                        name = (await el.text_content() or "").strip()
-                except Exception:
-                    pass
-                name = name or self.page.url.split("/")[-1]
+            # Browse game's directory for any live streamer with drops
+            self._update_status(message=f"Finding drops stream for {game_name}…")
+            url = game_url if game_url.startswith("http") else f"https://www.twitch.tv{game_url}"
+            await self._goto(url)
+            await asyncio.sleep(4)
 
-                self._start_watch_timer()
-                self._update_status(
-                    watching=self.page.url, stream_name=name,
-                    message=f"Watching: {name}",
+            try:
+                cards = await self.page.query_selector_all(
+                    'a[data-a-target="preview-card-image-link"]'
                 )
-            else:
-                self._update_status(watching=None, stream_name=None, message="No streams found — will retry")
+                if not cards:
+                    cards = await self.page.query_selector_all('article a[href*="/"]')
+                if cards:
+                    await cards[0].click()
+                    await asyncio.sleep(5)
+                    name = ""
+                    try:
+                        el = await self.page.query_selector(
+                            '[data-a-target="stream-title"], h1'
+                        )
+                        if el:
+                            name = (await el.text_content() or "").strip()
+                    except Exception:
+                        pass
+                    name = name or self.page.url.split("/")[-1]
+                    await self._start_watching(name, self.page.url, game_name)
+                    return
+            except Exception:
+                pass
+
+        self._update_status(watching=None, stream_name=None,
+                            message="No live streams found — will retry")
+
+    async def _start_watching(self, name: str, url: str, game: str):
+        await self._accept_mature_content()
+        await self._set_low_quality()
+        self._start_watch_timer()
+        self._update_status(
+            watching=url, stream_name=name,
+            message=f"Watching: {name} ({game})",
+        )
+
+    def _load_watch_targets(self) -> list[dict]:
+        try:
+            with self.app.app_context():
+                from app.models import WatchTarget
+                rows = WatchTarget.query.filter_by(
+                    user_id=self.user_id, enabled=True
+                ).all()
+                return [
+                    {"game_name": r.game_name, "game_url": r.game_url,
+                     "streamer": r.streamer}
+                    for r in rows
+                ]
         except Exception:
-            self._update_status(message="Error finding stream — will retry")
+            return []
+
+    # ---- game discovery (class method, no browser needed) ----
+
+    @staticmethod
+    async def discover_games(context) -> list[dict]:
+        """Scrape twitch.tv/directory/all/tags/dropsenabled for games with active drops."""
+        page = await context.new_page()
+        try:
+            await page.goto(
+                "https://www.twitch.tv/directory/all/tags/dropsenabled",
+                wait_until="domcontentloaded", timeout=30000,
+            )
+            await asyncio.sleep(3)
+            # Scroll to load more
+            for _ in range(3):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1)
+
+            games = await page.evaluate(r"""
+                () => {
+                    const out = [];
+                    const seen = new Set();
+                    document.querySelectorAll('article').forEach(card => {
+                        const gameEl = card.querySelector(
+                            'a[data-a-target="preview-card-game-link"], ' +
+                            'a[href*="/directory/category/"], a[href*="/directory/game/"]'
+                        );
+                        if (!gameEl) return;
+                        const name = (gameEl.textContent || '').trim();
+                        const href = (gameEl.getAttribute('href') || '').trim();
+                        if (!name || seen.has(name)) return;
+                        seen.add(name);
+                        const viewers = (card.querySelector(
+                            '[data-a-target="animated-channel-viewers-count"]'
+                        ) || {}).textContent || '';
+                        out.push({ name, url: href, viewers: viewers.trim() });
+                    });
+                    return out;
+                }
+            """)
+            return games or []
+        finally:
+            await page.close()
+
+    @staticmethod
+    async def discover_streamers(context, game_url: str) -> list[dict]:
+        """Scrape live streamers with drops for a specific game."""
+        page = await context.new_page()
+        try:
+            url = game_url if game_url.startswith("http") else f"https://www.twitch.tv{game_url}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            streamers = await page.evaluate(r"""
+                () => {
+                    const out = [];
+                    const seen = new Set();
+                    document.querySelectorAll('article').forEach(card => {
+                        const a = card.querySelector(
+                            'a[data-a-target="preview-card-title-link"], ' +
+                            'a[data-a-target="preview-card-image-link"]'
+                        );
+                        if (!a) return;
+                        const href = (a.getAttribute('href') || '').trim();
+                        const login = href.replace(/^\//, '').split('/')[0].toLowerCase();
+                        if (!login || seen.has(login)) return;
+                        seen.add(login);
+                        const tags = Array.from(
+                            card.querySelectorAll('[data-a-target="tag"], span')
+                        ).map(n => (n.textContent||'').trim().toLowerCase());
+                        const hasDrops = tags.some(t => t.includes('drops'));
+                        const viewers = (card.querySelector(
+                            '[data-a-target="animated-channel-viewers-count"]'
+                        ) || {}).textContent || '';
+                        out.push({
+                            name: login,
+                            url: 'https://www.twitch.tv/' + login,
+                            viewers: viewers.trim(),
+                            drops: hasDrops
+                        });
+                    });
+                    return out;
+                }
+            """)
+            return streamers or []
+        finally:
+            await page.close()
 
     # ---- watch time tracking ----
 

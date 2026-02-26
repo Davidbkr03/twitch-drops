@@ -118,6 +118,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .empty{color:var(--muted);font-size:.82rem;text-align:center;padding:.5rem 0}
 .hint-text{color:var(--muted);font-size:.78rem;margin-top:.5rem}
 .token-help{margin-top:.5rem;font-size:.78rem;color:var(--muted)}
+
+/* Game list */
+.game-list{max-height:250px;overflow-y:auto;margin-top:.4rem}
+.game-row{display:flex;align-items:center;gap:.4rem;padding:.35rem 0;border-bottom:1px solid var(--border);font-size:.82rem}
+.game-row:last-child{border-bottom:none}
+.game-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.game-viewers{color:var(--muted);font-size:.75rem;white-space:nowrap}
+.btn-x{background:none;border:none;color:var(--danger);font-size:1rem;cursor:pointer;padding:0 .3rem;line-height:1}
 .token-help summary{cursor:pointer;color:var(--primary);font-weight:600}
 .token-help ol{margin:.4rem 0 0 1.2rem;line-height:1.6}
 .token-help code{background:var(--surface);padding:.1rem .3rem;border-radius:3px;font-size:.75rem}

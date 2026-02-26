@@ -67,6 +67,21 @@
         </div>
       </section>
 
+      <!-- Watch Targets (games + streamers) -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Games &amp; Streamers</h2>
+          <button class="btn btn-sm btn-outline" onclick="discoverGames()" id="discoverBtn">Browse</button>
+        </div>
+        <div class="card-body">
+          <div id="watchTargets"><p class="empty">No games selected.</p></div>
+          <div id="gameDiscovery" style="display:none">
+            <p class="hint-text">Select games with active drops:</p>
+            <div id="gameList" class="game-list"></div>
+          </div>
+        </div>
+      </section>
+
       <!-- Active Drops -->
       <section class="card">
         <div class="card-header"><h2>Active Drops</h2></div>
@@ -277,6 +292,65 @@
       } else {
         document.getElementById('twitchHint').textContent = 'Error: ' + (d.error || 'Unknown');
       }
+    });
+  };
+
+  /* ---- games & streamers ---- */
+  function loadWatchTargets() {
+    fetch('/api/watch-targets').then(function(r){return r.json()}).then(function(list) {
+      var el = document.getElementById('watchTargets');
+      if (!list.length) { el.innerHTML = '<p class="empty">No games selected.</p>'; return; }
+      var html = '';
+      list.forEach(function(t) {
+        html += '<div class="drop-row">' +
+          '<span class="drop-name">' + esc(t.game_name) + (t.streamer ? ' → ' + esc(t.streamer) : '') + '</span>' +
+          '<button class="btn-x" onclick="removeTarget('+t.id+')">&times;</button>' +
+        '</div>';
+      });
+      el.innerHTML = html;
+    });
+  }
+  loadWatchTargets();
+
+  window.discoverGames = function() {
+    var disc = document.getElementById('gameDiscovery');
+    if (disc.style.display !== 'none') { disc.style.display = 'none'; return; }
+    disc.style.display = '';
+    var gl = document.getElementById('gameList');
+    gl.innerHTML = '<p class="empty">Loading games…</p>';
+    fetch('/api/discover-games', {method:'POST'}).then(function(r){return r.json()}).then(function(d) {
+      if (!d.success) { gl.innerHTML = '<p class="empty">'+esc(d.error||'Error')+'</p>'; return; }
+      if (!d.games.length) { gl.innerHTML = '<p class="empty">No games with drops found.</p>'; return; }
+      var html = '';
+      d.games.forEach(function(g) {
+        html += '<div class="game-row" data-url="'+esc(g.url)+'" data-name="'+esc(g.name)+'">' +
+          '<span class="game-name">' + esc(g.name) + '</span>' +
+          '<span class="game-viewers">' + esc(g.viewers || '') + '</span>' +
+          '<button class="btn btn-sm btn-success" onclick="addGame(this)">+</button>' +
+        '</div>';
+      });
+      gl.innerHTML = html;
+    });
+  };
+
+  window.addGame = function(btn) {
+    var row = btn.closest('.game-row');
+    var name = row.dataset.name;
+    var url = row.dataset.url;
+    fetch('/api/watch-targets', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({game_name: name, game_url: url})
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) { btn.textContent = '✓'; btn.disabled = true; loadWatchTargets(); }
+    });
+  };
+
+  window.removeTarget = function(id) {
+    fetch('/api/watch-targets', {
+      method:'DELETE', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id})
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) loadWatchTargets();
     });
   };
 
