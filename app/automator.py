@@ -203,6 +203,7 @@ class UserAutomator:
         self._watch_start: float | None = None
         self._total_watch_secs: float = 0
         self._passport_429: int = 0
+        self._completed_games: set[str] = set()  # games with all rewards claimed
 
         self.status: dict = {
             "running": False,
@@ -774,62 +775,100 @@ class UserAutomator:
                 except Exception:
                     pass
 
-            # Scrape progress from inventory — each progressbar has item context
-            items = await self.page.evaluate(r"""
+            # Scrape full inventory: campaigns with items, progress, and game info
+            inventory = await self.page.evaluate(r"""
                 () => {
-                    const out = [];
+                    const items = [];
                     const seen = new Set();
-                    document.querySelectorAll('[role="progressbar"]').forEach(pb => {
+                    const bars = document.querySelectorAll('[role="progressbar"]');
+                    bars.forEach(pb => {
                         const pct = parseInt(pb.getAttribute('aria-valuenow') || '0');
-                        // Walk up to find the individual item container
-                        let el = pb.parentElement;
-                        for (let i = 0; i < 5; i++) {
-                            if (!el) break;
-                            el = el.parentElement;
-                        }
+                        // Walk up to find context
+                        let el = pb;
+                        for (let i = 0; i < 6; i++) { el = el?.parentElement; }
                         if (!el) return;
-                        // Get item image (reward thumbnail)
-                        const imgs = el.querySelectorAll('img');
-                        let itemImg = '';
-                        imgs.forEach(img => {
-                            const s = img.src || '';
-                            if (s && !itemImg && img.width > 20) itemImg = s;
-                        });
-                        // Get item name from nearby text
+                        // Image
+                        let image = '';
+                        const img = el.querySelector('img[src*="static-cdn"], img[src*="jtvnw"]');
+                        if (img) image = img.src;
+                        // Texts near this progress bar
                         const texts = [];
                         el.querySelectorAll('p, span').forEach(t => {
                             const v = (t.textContent || '').trim();
-                            if (v && v.length > 2 && v.length < 80 && !/^\d+%$/.test(v)
-                                && v !== 'Drops' && v !== 'In Progress') {
+                            if (v && v.length > 2 && v.length < 100 && !/^\d+%$/.test(v)
+                                && !['Drops','In Progress','Inventory'].includes(v)) {
                                 texts.push(v);
                             }
                         });
-                        const name = texts[0] || 'Drop ' + (out.length + 1);
+                        const name = texts.find(t => /of \d+ hour/i.test(t)) || texts[0] || '';
                         const key = name + '_' + pct;
                         if (seen.has(key)) return;
                         seen.add(key);
-                        out.push({ name, progress: pct, image: itemImg });
+                        items.push({ name, progress: pct, image });
                     });
-                    return out;
+
+                    // Find campaign names by looking at the full page text
+                    // Campaign names are usually in larger text above progress bars
+                    const campaignNames = [];
+                    document.querySelectorAll('p, h3, h4, h5').forEach(el => {
+                        const t = (el.textContent || '').trim();
+                        if (t.length > 5 && t.length < 80 &&
+                            (t.includes('Drop') || t.includes('Campaign') || t.includes('Rush') ||
+                             t.includes('Reward') || t.includes('Event'))) {
+                            if (!campaignNames.includes(t)) campaignNames.push(t);
+                        }
+                    });
+
+                    return { items, campaignNames };
                 }
             """)
-            for item in (items or []):
+
+            for item in (inventory.get("items") or []):
                 in_progress.append({
                     "name": item.get("name", "Drop"),
                     "progress": item.get("progress", 0),
                     "image": item.get("image", ""),
                 })
+
+            # Detect completed games: check selected games against active campaigns
+            campaign_names = inventory.get("campaignNames", [])
+            active_progress = [i for i in in_progress if i["progress"] < 100]
+            self._detect_completed_games(campaign_names, active_progress)
+
         except Exception:
-            pass
+            logger.debug("Drop check error", exc_info=True)
 
         all_claimed = self.status.get("drops_claimed", []) + claimed
         self._update_status(
             drops_in_progress=in_progress,
             drops_claimed=all_claimed[-20:],
+            completed_games=list(self._completed_games),
             last_check=datetime.now(timezone.utc).isoformat(),
-            message=f"Drops: {len(in_progress)} active, {len(claimed)} just claimed",
+            message=f"Drops: {len(in_progress)} active, {len(claimed)} claimed",
         )
         self._persist_drops(in_progress, claimed)
+
+    def _detect_completed_games(self, campaign_names: list, active_items: list):
+        """Check which selected games have no active drops left."""
+        targets = self._load_watch_targets()
+        active_text = " ".join(i.get("name", "") for i in active_items).lower()
+        campaign_text = " ".join(campaign_names).lower()
+
+        for target in targets:
+            game = target.get("game_name", "")
+            if not game:
+                continue
+            game_lower = game.lower()
+            # A game is "active" if its name appears in campaign names or progress items
+            game_words = game_lower.split()
+            is_active = any(
+                w in campaign_text or w in active_text
+                for w in game_words if len(w) > 3
+            )
+            if not is_active and game_lower not in active_text:
+                self._completed_games.add(game)
+            else:
+                self._completed_games.discard(game)
 
     def _persist_drops(self, in_progress: list, claimed: list):
         try:
@@ -893,15 +932,27 @@ class UserAutomator:
             return False
 
     async def _find_best_stream(self):
-        """Pick the best stream from the user's selected games."""
+        """Pick the best stream from the user's selected games, skipping completed ones."""
         targets = self._load_watch_targets()
         if not targets:
-            # No games selected — fall back to drops-enabled directory
             self._update_status(message="No games selected — browsing all drops")
             targets = [{"game_url": TWITCH_DROPS_ENABLED_URL}]
 
-        # Try each game in the user's list
-        for target in targets:
+        # Filter out completed games
+        active_targets = [
+            t for t in targets
+            if t.get("game_name", "") not in self._completed_games
+        ]
+        if not active_targets and targets:
+            self._update_status(
+                message="All selected games complete! Add more games or wait for new campaigns."
+            )
+            await self._sleep(60)
+            # Re-check in case new campaigns appear
+            self._completed_games.clear()
+            return
+
+        for target in (active_targets or targets):
             if self._stop.is_set():
                 return
             game_url = target.get("game_url") or ""

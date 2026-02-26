@@ -197,6 +197,11 @@
       watchTimeEl.textContent = '';
     }
 
+    if (s.completed_games) {
+      var changed = JSON.stringify(completedGames) !== JSON.stringify(s.completed_games);
+      completedGames = s.completed_games;
+      if (changed) loadWatchTargets();
+    }
     renderDrops(s);
   });
 
@@ -314,14 +319,18 @@
   };
 
   /* ---- games & streamers ---- */
+  var completedGames = [];
   function loadWatchTargets() {
     fetch('/api/watch-targets').then(function(r){return r.json()}).then(function(list) {
       var el = document.getElementById('watchTargets');
       if (!list.length) { el.innerHTML = '<p class="empty">No games selected.</p>'; return; }
       var html = '';
       list.forEach(function(t) {
-        html += '<div class="drop-row">' +
-          '<span class="drop-name">' + esc(t.game_name) + (t.streamer ? ' → ' + esc(t.streamer) : '') + '</span>' +
+        var done = completedGames.indexOf(t.game_name) >= 0;
+        html += '<div class="drop-row' + (done ? ' completed' : '') + '">' +
+          '<span class="drop-name">' + (done ? '✅ ' : '') + esc(t.game_name) +
+          (t.streamer ? ' → ' + esc(t.streamer) : '') +
+          (done ? ' <small>(complete)</small>' : '') + '</span>' +
           '<button class="btn-x" onclick="removeTarget('+t.id+')">&times;</button>' +
         '</div>';
       });
