@@ -32,6 +32,7 @@ conn = psycopg2.connect(os.environ.get('DATABASE_URL', 'postgresql://twitch:twit
 cur = conn.cursor()
 cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_username VARCHAR(100)')
 cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_password VARCHAR(256)')
+cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_auth_token TEXT')
 conn.commit()
 conn.close()
 print('Schema migration OK')

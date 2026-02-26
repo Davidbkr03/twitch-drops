@@ -441,7 +441,20 @@ class UserAutomator:
         logged_in = await self._is_logged_in()
         self._update_status(logged_in=logged_in)
 
-        # 3. If not logged in, pre-fill credentials on whatever login page we're on
+        # 3. Try cookie-based login first (if auth_token is stored)
+        if not logged_in:
+            try:
+                with self.app.app_context():
+                    from app.models import UserSettings
+                    s = UserSettings.query.filter_by(user_id=self.user_id).first()
+                    if s and s.twitch_auth_token:
+                        self._update_status(message="Logging in with saved auth token…")
+                        logged_in = await self.import_cookies(s.twitch_auth_token)
+                        self._update_status(logged_in=logged_in)
+            except Exception:
+                pass
+
+        # 4. If still not logged in, pre-fill credentials on login page
         if not logged_in:
             # Check if we got redirected to login
             if "/login" not in (self.page.url or ""):
@@ -704,6 +717,39 @@ class UserAutomator:
                     db.session.commit()
         except Exception:
             logger.debug("cred save error", exc_info=True)
+
+    # ---- cookie import ----
+
+    async def import_cookies(self, auth_token: str):
+        """Import a Twitch auth-token cookie so the bot is logged in
+        without ever visiting the login page (bypasses Kasada entirely)."""
+        if not self.context:
+            return False
+        try:
+            await self.context.add_cookies([
+                {
+                    "name": "auth-token",
+                    "value": auth_token.strip(),
+                    "domain": ".twitch.tv",
+                    "path": "/",
+                    "httpOnly": False,
+                    "secure": True,
+                    "sameSite": "None",
+                },
+            ])
+            # Verify by navigating to Twitch
+            await self._goto(TWITCH_INVENTORY_URL)
+            await asyncio.sleep(4)
+            if await self._is_logged_in():
+                self._update_status(logged_in=True, message="Logged in via auth token!")
+                logger.info("User %s: cookie import succeeded", self.user_id)
+                return True
+            else:
+                self._update_status(message="Auth token didn't work — it may be expired")
+                return False
+        except Exception:
+            logger.exception("User %s: cookie import error", self.user_id)
+            return False
 
     # ==================================================================
     # Drop checking & claiming
