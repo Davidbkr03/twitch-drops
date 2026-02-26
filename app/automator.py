@@ -394,100 +394,139 @@ class UserAutomator:
         return ok
 
     async def _do_auto_login(self, username: str, password: str) -> bool:
-        await self._goto(TWITCH_LOGIN_URL)
-        await asyncio.sleep(3)
-        await self._accept_cookies()
+        import random
 
-        try:
-            await self.page.wait_for_selector(
-                'input[autocomplete="username"], #login-username', timeout=15000
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            if self._stop.is_set():
+                return False
+            self._update_status(
+                message=f"Login attempt {attempt}/{max_attempts}…"
+                if attempt > 1 else f"Logging in as {username}…"
             )
-            await asyncio.sleep(1)
 
-            # Fill username
-            self._update_status(message=f"Filling username: {username}")
-            for sel in ['input[autocomplete="username"]', '#login-username']:
-                el = await self.page.query_selector(sel)
-                if el:
-                    await el.click(); await asyncio.sleep(0.3)
-                    await el.fill(""); await el.type(username, delay=40)
-                    break
+            await self._goto(TWITCH_LOGIN_URL)
+            await asyncio.sleep(2)
 
-            await asyncio.sleep(0.5)
+            # Dismiss cookie banner first — lets Kasada fingerprint scripts
+            # settle before we interact with the login form.
+            try:
+                proceed = await self.page.query_selector(
+                    'button:has-text("Proceed"), #onetrust-accept-btn-handler'
+                )
+                if proceed:
+                    await proceed.click()
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
 
-            # Fill password
-            self._update_status(message="Filling password…")
-            for sel in ['input[autocomplete="current-password"]', '#password-input']:
-                el = await self.page.query_selector(sel)
-                if el:
-                    await el.click(); await asyncio.sleep(0.3)
-                    await el.fill(""); await el.type(password, delay=40)
-                    break
+            # Wait for Kasada/fingerprint iframes to finish initial load
+            await asyncio.sleep(3 + random.random() * 2)
 
-            await asyncio.sleep(0.5)
+            try:
+                await self.page.wait_for_selector(
+                    'input[autocomplete="username"], #login-username', timeout=15000
+                )
+            except Exception:
+                continue
 
-            # Click login button
+            await asyncio.sleep(0.5 + random.random())
+
+            # Type username with human-like timing
+            self._update_status(message="Entering credentials…")
+            u_el = (
+                await self.page.query_selector('input[autocomplete="username"]')
+                or await self.page.query_selector('#login-username')
+            )
+            if u_el:
+                await u_el.click()
+                await asyncio.sleep(0.2 + random.random() * 0.3)
+                await u_el.press("Control+a")
+                await u_el.type(username, delay=50 + random.randint(0, 40))
+
+            await asyncio.sleep(0.3 + random.random() * 0.5)
+
+            p_el = (
+                await self.page.query_selector('input[autocomplete="current-password"]')
+                or await self.page.query_selector('#password-input')
+            )
+            if p_el:
+                await p_el.click()
+                await asyncio.sleep(0.2 + random.random() * 0.3)
+                await p_el.press("Control+a")
+                await p_el.type(password, delay=50 + random.randint(0, 40))
+
+            await asyncio.sleep(0.4 + random.random() * 0.5)
+
+            # Click login
             btn = (
                 await self.page.query_selector('button[data-a-target="passport-login-button"]')
                 or await self.page.query_selector('button:has-text("Log In")')
             )
-            if btn:
-                await btn.click()
-                self._update_status(message="Credentials submitted — waiting for response…")
-                await asyncio.sleep(5)
-            else:
+            if not btn:
                 self._update_status(message="Login button not found")
+                continue
+            await btn.click()
+            self._update_status(message="Waiting for Twitch…")
+
+            # Poll for result — spinner might hang due to Kasada 429
+            spinner_seconds = 0
+            result = await self._poll_login_result(timeout_sec=30)
+
+            if result == "success":
+                logger.info("User %s: Twitch login succeeded", self.user_id)
+                return True
+            elif result == "error":
                 return False
-
-            # Poll for result: success, error, or 2FA
-            for i in range(60):
-                if self._stop.is_set():
-                    return False
-
-                # Success?
-                if await self._is_logged_in():
-                    logger.info("User %s: Twitch login succeeded", self.user_id)
-                    return True
-
-                # Password error?
-                err = await self.page.query_selector('[data-a-target="passport-error"]')
-                if err:
-                    txt = (await err.text_content() or "").strip()[:120]
-                    self._update_status(message=f"Login error: {txt}")
-                    logger.warning("User %s: Twitch login error: %s", self.user_id, txt)
-                    return False
-
-                # 2FA / email verification code prompt?
-                twofa = await self.page.query_selector(
-                    'input[data-a-target="tw-input"], '
-                    'input[aria-label*="code" i], '
-                    'input[aria-label*="token" i], '
-                    'input[placeholder*="code" i]'
+            elif result == "2fa":
+                self._update_status(
+                    message="Verification code required — enter it in the browser preview"
                 )
-                if twofa:
-                    self._update_status(
-                        message="2FA / email verification required — enter the code in the browser preview"
-                    )
-                    logger.info("User %s: 2FA prompt detected, waiting for user", self.user_id)
-                    # Wait longer for user to enter 2FA via the preview
-                    for _ in range(300):
-                        if self._stop.is_set():
-                            return False
-                        if await self._is_logged_in():
-                            logger.info("User %s: login succeeded after 2FA", self.user_id)
-                            return True
-                        await asyncio.sleep(2)
-                    self._update_status(message="2FA timeout")
-                    return False
+                for _ in range(300):
+                    if self._stop.is_set():
+                        return False
+                    if await self._is_logged_in():
+                        return True
+                    await asyncio.sleep(2)
+                self._update_status(message="Verification timeout")
+                return False
+            else:
+                # "timeout" — spinner hung, Kasada likely blocked it
+                logger.warning("User %s: login attempt %d timed out (Kasada 429), retrying",
+                               self.user_id, attempt)
+                self._update_status(message=f"Login stalled — retrying ({attempt}/{max_attempts})…")
+                await asyncio.sleep(3)
 
-                await asyncio.sleep(2)
+        self._update_status(message="Login failed after retries — try using the browser preview to log in manually")
+        return False
 
-            self._update_status(message="Login timeout")
-            return False
-        except Exception:
-            logger.exception("User %s auto-login error", self.user_id)
-            self._update_status(message="Auto-login failed — use the browser preview")
-            return False
+    async def _poll_login_result(self, timeout_sec: int = 30) -> str:
+        """Poll the login page after clicking Log In.
+        Returns: 'success', 'error', '2fa', or 'timeout'.
+        """
+        for _ in range(timeout_sec):
+            if self._stop.is_set():
+                return "timeout"
+
+            if await self._is_logged_in():
+                return "success"
+
+            err = await self.page.query_selector('[data-a-target="passport-error"]')
+            if err:
+                txt = (await err.text_content() or "").strip()[:120]
+                self._update_status(message=f"Login error: {txt}")
+                return "error"
+
+            # Real 2FA: a new visible input appears for the verification code
+            # and the login form fields are hidden/replaced
+            u_el = await self.page.query_selector('input[autocomplete="username"]')
+            if not u_el:
+                # Login form disappeared — likely moved to 2FA/verification page
+                return "2fa"
+
+            await asyncio.sleep(1)
+
+        return "timeout"
 
     # ---- login helpers ----
 
