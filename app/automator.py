@@ -51,6 +51,50 @@ BROWSER_ARGS = [
 
 VIEWPORT = {"width": 1366, "height": 768}
 
+# Comprehensive stealth patches injected into every page.
+# Twitch specifically checks WebGL renderer (SwiftShader = virtual env)
+# and chrome.runtime (absent in automated Chrome).
+_STEALTH_JS = """(() => {
+    // 1. Hide webdriver flag
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch(e){}
+
+    // 2. Fake WebGL renderer — SwiftShader is a dead giveaway
+    const _gp  = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Google Inc. (NVIDIA)';
+        if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return _gp.call(this, p);
+    };
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        const _gp2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Google Inc. (NVIDIA)';
+            if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return _gp2.call(this, p);
+        };
+    }
+
+    // 3. Provide chrome.runtime to look like a real Chrome install
+    if (window.chrome) {
+        window.chrome.runtime = {
+            OnInstalledReason: {},
+            OnRestartRequiredReason: {},
+            PlatformArch: {},
+            PlatformOs: {},
+            RequestUpdateCheckStatus: {},
+            connect: function() { return { onDisconnect: { addListener: function(){} },
+                onMessage: { addListener: function(){} }, postMessage: function(){} }; },
+            sendMessage: function(){},
+            id: undefined,
+        };
+    }
+
+    // 4. Consistent Notification permission
+    try {
+        Object.defineProperty(Notification, 'permission', { get: () => 'default' });
+    } catch(e){}
+})();"""
+
 
 # ======================================================================
 # Manager
@@ -232,12 +276,8 @@ class UserAutomator:
 
         stealth = Stealth(init_scripts_only=True, navigator_webdriver=True)
         await stealth.apply_stealth_async(self.context)
-        try:
-            await self.context.add_init_script(
-                "(() => { try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){} })();"
-            )
-        except Exception:
-            pass
+
+        await self.context.add_init_script(_STEALTH_JS)
 
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         self._update_status(message="Browser launched")
