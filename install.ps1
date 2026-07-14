@@ -174,16 +174,20 @@ $venvPip = Join-Path $venvDir 'Scripts\pip.exe'
 # 7) Install dependencies
 Write-Info "Upgrading pip…"
 & $venvPy -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { Write-Err "Failed to upgrade pip."; exit 1 }
 if (Test-Path (Join-Path $InstallDir 'requirements.txt')) {
 	Write-Info "Installing requirements…"
 	& $venvPip install -r (Join-Path $InstallDir 'requirements.txt')
+	if ($LASTEXITCODE -ne 0) { Write-Err "Failed to install Python requirements."; exit 1 }
 } else {
-	Write-Warn "requirements.txt not found. Skipping."
+	Write-Err "requirements.txt not found."
+	exit 1
 }
 
 # 8) Install Playwright browsers
 Write-Info "Installing Playwright browsers…"
-& $venvPy -m playwright install
+& $venvPy -m playwright install chromium
+if ($LASTEXITCODE -ne 0) { Write-Err "Failed to install the Playwright Chromium browser."; exit 1 }
 
 # 9) Ask to enable startup
 $startupChoice = 'N'
@@ -227,12 +231,11 @@ if (-not (Test-Path $batPath)) {
 }
 if (Test-Path $batPath) {
 	Start-Process -FilePath $batPath -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
-	Write-Host "Tip: To log in the first time, right-click the tray icon and untick 'Headless mode'." -ForegroundColor Yellow
-	Write-Host "The app will restart and open a browser window. After login, you can re-enable headless." -ForegroundColor Yellow
+	Write-Host "Open http://localhost:5000 and use 'Start Guided Login' when Twitch authentication is required." -ForegroundColor Yellow
 } else {
 	Write-Warn "Could not find run_automator.bat to launch automatically."
 }
 
 Write-Host "\nInstall complete." -ForegroundColor Green
 Write-Host "- Folder: $InstallDir"
-Write-Host "- To run later: double-click 'run_automator.bat' in the install folder." 
+Write-Host "- To run later: double-click 'run_automator.bat' in the install folder."

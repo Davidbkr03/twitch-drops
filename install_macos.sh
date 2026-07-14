@@ -208,8 +208,7 @@ echo "[INFO] Launching Twitch Drop Automator…"
 "${RUNNER}"
 
 cat <<'EON'
-Tip: To log in the first time, right-click the tray icon and untick 'Headless mode'.
-The app will restart and open a browser window. After login, you can re-enable headless.
+Open http://localhost:5000 and use "Start Guided Login" when Twitch authentication is required.
 EON
 
 echo "Install complete."

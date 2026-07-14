@@ -13,7 +13,6 @@ import subprocess
 import time
 from datetime import datetime, timezone, timedelta
 import base64
-import io
 import argparse
 from urllib.parse import urlparse
 from flask import Flask, render_template, jsonify, request
@@ -467,12 +466,12 @@ def get_current_version():
 								  capture_output=True, text=True, cwd=BASE_DIR, timeout=5)
 			if result.returncode == 0:
 				return result.stdout.strip().lstrip('v')
-		except:
+		except Exception:
 			pass
 		
 		# Default version if nothing else works
 		return "1.0.0"
-	except:
+	except Exception:
 		return "1.0.0"
 
 def get_current_commit_hash():
@@ -483,7 +482,7 @@ def get_current_commit_hash():
 							  capture_output=True, text=True, cwd=BASE_DIR, timeout=5)
 		if result.returncode == 0:
 			return result.stdout.strip()[:8]  # Return short hash
-	except:
+	except Exception:
 		pass
 	
 	# Fallback: try to get from git log
@@ -493,7 +492,7 @@ def get_current_commit_hash():
 							  capture_output=True, text=True, cwd=BASE_DIR, timeout=5)
 		if result.returncode == 0:
 			return result.stdout.strip()[:8]
-	except:
+	except Exception:
 		pass
 	
 	# If no git info available, return a placeholder
@@ -511,7 +510,7 @@ def compare_versions(version1, version2):
 			return -1
 		else:
 			return 0
-	except:
+	except Exception:
 		# Fallback simple comparison
 		try:
 			v1_parts = [int(x) for x in version1.split('.')]
@@ -528,7 +527,7 @@ def compare_versions(version1, version2):
 				elif v1_parts[i] < v2_parts[i]:
 					return -1
 			return 0
-		except:
+		except Exception:
 			return 0
 
 def update_current_working_item(item_info):
@@ -872,7 +871,6 @@ def update_cached_drops_data(facepunch_data, inventory_progress, recently_claime
 			for title, percent in general_progress_map.items():
 				for term in search_terms:
 					# Use word boundaries to avoid partial matches (e.g., "fridge" shouldn't match "Abe Fridge")
-					import re
 					if re.search(r'\b' + re.escape(term.lower()) + r'\b', title.lower()):
 						progress = percent
 						progress_title = title
@@ -1218,6 +1216,9 @@ def start_system_tray(block: bool = False):
 	image = _generate_tray_icon_image()
 	menu = pystray.Menu(
 		pystray.MenuItem("Open Web Interface", lambda icon, item: open_web_interface()),
+		pystray.MenuItem("Headless mode", on_toggle_headless, checked=is_headless_checked),
+		pystray.MenuItem("Hide console on startup", on_toggle_hide_console, checked=is_hide_console_checked),
+		pystray.Menu.SEPARATOR,
 		pystray.MenuItem("Quit", on_quit)
 	)
 	icon = pystray.Icon("TwitchDropAutomator", image, "Twitch Drop Automator", menu=menu)
@@ -1512,8 +1513,6 @@ def create_web_app():
 		"""API endpoint to check for updates"""
 		try:
 			import requests
-			import re
-			import hashlib
 			
 			# Get current version from the script
 			current_version = get_current_version()
@@ -2088,8 +2087,37 @@ async def maybe_accept_cookies(page):
 	except Exception:
 		pass
 
+
+def _cleanup_stale_browser_profile_locks(user_data_dir: str) -> list[str]:
+	"""Best-effort cleanup of Chrome profile locks left by an unclean exit.
+
+	An active Chrome process keeps these files locked on Windows, so failed
+	deletions are intentionally ignored. The returned names make the behavior
+	easy to verify without coupling callers to filesystem details.
+	"""
+	removed = []
+	try:
+		if not os.path.isdir(user_data_dir):
+			return removed
+		for name in os.listdir(user_data_dir):
+			if not name.startswith("Singleton"):
+				continue
+			path = os.path.join(user_data_dir, name)
+			try:
+				os.remove(path)
+				removed.append(name)
+			except OSError as e:
+				logging.debug(f"Browser profile lock still active or unavailable ({name}): {e}")
+	except OSError as e:
+		logging.debug(f"Could not inspect browser profile locks: {e}")
+	if removed:
+		logging.info(f"Removed stale browser profile locks: {', '.join(sorted(removed))}")
+	return removed
+
+
 async def launch_context(p, compat_mode: bool):
 	headless_pref = get_headless_preference()
+	_cleanup_stale_browser_profile_locks(USER_DATA_DIR)
     # Integrity capture removed per user request
 	args = [
 		"--disable-extensions",
@@ -2722,10 +2750,23 @@ async def fetch_facepunch_drops(context):
 			pass
 
 		logging.info(f"Facepunch drops parsed. General: {len(general)}, Streamer: {len(streamer_specific)}")
-		return {"general": general, "streamer": streamer_specific, "not_started": bool(not_started), "start_epoch_ms": start_epoch_ms}
+		return {
+			"general": general,
+			"streamer": streamer_specific,
+			"not_started": bool(not_started),
+			"start_epoch_ms": start_epoch_ms,
+			"fetch_failed": False,
+		}
 	except Exception as e:
 		logging.warning(f"Facepunch parsing failed: {e}")
-		return {"general": [], "streamer": [], "not_started": False, "start_epoch_ms": None}
+		return {
+			"general": [],
+			"streamer": [],
+			"not_started": False,
+			"start_epoch_ms": None,
+			"fetch_failed": True,
+			"fetch_error": str(e),
+		}
 	finally:
 		try:
 			await page.close()
@@ -2959,7 +3000,7 @@ async def fetch_game_streamers_public(game_url: str, limit: int = 80) -> list[di
 async def get_inventory_progress_map(inv_page):
 	progress = {}
 	try:
-		logging.info(f"[INVENTORY-SCAN] Starting inventory scan...")
+		logging.info("[INVENTORY-SCAN] Starting inventory scan...")
 		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 		await maybe_accept_cookies(inv_page)
 		await inv_page.wait_for_timeout(600)
@@ -3010,7 +3051,7 @@ async def get_general_drops_progress_map(inv_page):
 	"""Get progress map for general drops only, excluding streamer-specific drops."""
 	progress = {}
 	try:
-		logging.info(f"[GENERAL-DROPS-SCAN] Starting general drops area scan...")
+		logging.info("[GENERAL-DROPS-SCAN] Starting general drops area scan...")
 		await goto_with_exit(inv_page, TWITCH_INVENTORY_URL, timeout=120000, wait_until="domcontentloaded")
 		await maybe_accept_cookies(inv_page)
 		await inv_page.wait_for_timeout(600)
@@ -3231,6 +3272,7 @@ async def get_claimed_days_for_streamer(inv_page, streamer_name: str) -> int | N
 	target_lower = ((streamer_name or "").strip().lower())
 	if not target_lower:
 		return None
+	return await _get_claimed_days_for_streamer_impl(inv_page, streamer_name, target_lower)
 
 async def scrape_recent_claimed_items(inv_page):
 	"""Scrape the Twitch inventory page for claimed items within the last 21 days.
@@ -3333,7 +3375,9 @@ async def scrape_recent_claimed_items(inv_page):
 	except Exception as e:
 		emit_debug(f"[claimed-sweep] Failed: {e}", 'warning')
 		return []
-	
+
+
+async def _get_claimed_days_for_streamer_impl(inv_page, streamer_name: str, target_lower: str) -> int | None:
 	# Create multiple search variations for better matching
 	search_variations = generate_search_variations(target_lower)
 	emit_debug(f"[claimed-check] Variations for '{streamer_name}': {search_variations}")
@@ -3687,7 +3731,7 @@ async def set_low_quality(stream_page):
 			return
 
 		# Click the lowest available quality (Audio Only or lowest p)
-		picked = await stream_page.evaluate(
+		await stream_page.evaluate(
 			r"""
 			() => {
 			  const menu = document.querySelector('div[role="menu"]');
@@ -3760,18 +3804,15 @@ async def recover_browser_context(p, current_context=None):
 		logging.error(f"Failed to recover browser context: {e}")
 		return None, None
 
-async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
-	"""Click all visible 'Claim' buttons on the inventory page.
 
-	Returns the number of claims clicked. When navigate=False, assumes caller is already on the inventory page.
-	"""
+def _attach_claim_console_logging(inv_page) -> bool:
+	"""Attach claim diagnostics once per Playwright page."""
+	if getattr(inv_page, "_tda_claim_console_logging", False):
+		return False
 
-	# Add console logging to capture JavaScript errors (sanitized for Windows compatibility)
 	def handle_console(msg):
 		try:
-			# Sanitize the message text to remove Unicode characters that cause encoding issues
 			sanitized_text = msg.text.encode('ascii', 'ignore').decode('ascii')
-			
 			if msg.type == "error":
 				logging.error(f"[JS ERROR] {sanitized_text}")
 			elif msg.type == "warning":
@@ -3781,10 +3822,28 @@ async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
 			else:
 				logging.info(f"[JS {msg.type.upper()}] {sanitized_text}")
 		except Exception as e:
-			# If there's still an encoding issue, just log a simple message
 			logging.debug(f"Console message handling failed: {e}")
 
-	inv_page.on("console", handle_console)
+	try:
+		setattr(inv_page, "_tda_claim_console_logging", True)
+		inv_page.on("console", handle_console)
+		return True
+	except Exception as e:
+		try:
+			setattr(inv_page, "_tda_claim_console_logging", False)
+		except Exception:
+			pass
+		logging.debug(f"Could not attach claim console logging: {e}")
+		return False
+
+
+async def claim_available_rewards(inv_page, navigate: bool = True) -> int:
+	"""Click all visible 'Claim' buttons on the inventory page.
+
+	Returns the number of claims clicked. When navigate=False, assumes caller is already on the inventory page.
+	"""
+
+	_attach_claim_console_logging(inv_page)
 
 	claimed = 0
 	try:
@@ -3978,7 +4037,7 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 			for st in streamer_targets:
 				name = (st.get('streamer') or '').strip()
 				if not name:
-					logging.info(f"[STREAMER-CHECK] Skipping streamer: empty name")
+					logging.info("[STREAMER-CHECK] Skipping streamer: empty name")
 					continue
 				# Only use Facepunch for live status
 				if not bool(st.get('is_live')):
@@ -3989,7 +4048,7 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 					logging.info(f"[STREAMER-CHECK] Skipping '{name}': already in completed_streamers set")
 					continue
 				# If we haven't already completed this streamer drop historically, switch now
-				days = is_streamer_recently_claimed(name)
+				days = await get_claimed_days_for_streamer(inv_page, name)
 				if days is not None:
 					# Already claimed previously; skip
 					logging.info(f"[STREAMER-CHECK] Skipping '{name}': claimed {days} day(s) ago")
@@ -3997,7 +4056,6 @@ async def poll_general_until_complete_or_streamer_available(context, inv_page, t
 					continue
 
 				logging.info(f"Switching to streamer-specific drop: {name} ({st.get('item')})")
-				await inv_page.close()
 				return (False, True)
 
 			await asyncio.sleep(INVENTORY_POLL_INTERVAL_SECONDS)
@@ -4041,6 +4099,12 @@ async def run_drops_workflow(context, test_mode=False):
 				continue
 
 			fp = await fetch_facepunch_drops(context)
+			if fp.get("fetch_failed"):
+				logging.warning(
+					"Facepunch data could not be refreshed; preserving current state and retrying."
+				)
+				await asyncio.sleep(10)
+				continue
 			# If the campaign hasn't started yet, notify and exit early (unless in test mode)
 			try:
 				if fp and bool(fp.get('not_started')):
@@ -4108,7 +4172,7 @@ async def run_drops_workflow(context, test_mode=False):
 			if ready_to_claim_items:
 				logging.info(f"[READY-TO-CLAIM] Found {len(ready_to_claim_items)} items ready to claim: {ready_to_claim_items}")
 			else:
-				logging.info(f"[READY-TO-CLAIM] No items ready to claim")
+				logging.info("[READY-TO-CLAIM] No items ready to claim")
 
 			# Defer general drop decision until after streamer candidates are considered
 			longest_general = None
@@ -4143,7 +4207,7 @@ async def run_drops_workflow(context, test_mode=False):
 			for st in streamer_targets:
 				name = (st.get('streamer') or '').strip()
 				if not name:
-					logging.info(f"[STREAMER-EVAL] Skipping streamer: empty name")
+					logging.info("[STREAMER-EVAL] Skipping streamer: empty name")
 					continue
 				if bool(st.get('is_live')):
 					live_any.append(st)
@@ -4210,12 +4274,12 @@ async def run_drops_workflow(context, test_mode=False):
 					general_drops_available.append(f"{item_name} ({hours}h)")
 			
 			# Log debug information
-			logging.info(f"=== DROP DEBUG INFO ===")
+			logging.info("=== DROP DEBUG INFO ===")
 			logging.info(f"Streamer drops with progress: {streamer_drops_with_progress}")
 			logging.info(f"Streamer drops with no progress: {streamer_drops_no_progress}")
 			logging.info(f"General drops available: {general_drops_available}")
 			logging.info(f"Total candidates: {len(candidates)}")
-			logging.info(f"========================")
+			logging.info("========================")
 
 			# Cache already updated above with recently claimed data
 
@@ -4669,8 +4733,8 @@ async def is_general_item_claimed_on_inventory(inv_page, item_name: str) -> bool
 async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 	try:
 		if not general_list:
-			logging.info(f"[GENERAL-DROPS-CHECK] No general drops to check - returning True")
-			return True
+			logging.info("[GENERAL-DROPS-CHECK] No general drop data available - completion is unknown")
+			return False
 		logging.info(f"[GENERAL-DROPS-CHECK] Checking {len(general_list)} general drops for completion")
 		# Ensure we are on inventory and scrape current progressbars from general drops area only
 		progress_map = await get_general_drops_progress_map(inv_page)
@@ -4690,7 +4754,7 @@ async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 			item_name = g.get('item') if isinstance(g, dict) else None
 			alias = g.get('alias') if isinstance(g, dict) else None
 			if not item_name and not alias:
-				logging.info(f"[GENERAL-DROPS-CHECK] Skipping general drop: no item name or alias")
+				logging.info("[GENERAL-DROPS-CHECK] Skipping general drop: no item name or alias")
 				continue
 			search_terms = [item_name or '', alias or '']
 			logging.info(f"[GENERAL-DROPS-CHECK] Checking general drop: '{item_name}' (alias: '{alias}')")
@@ -4702,13 +4766,19 @@ async def are_all_general_drops_complete(inv_page, general_list) -> bool:
 					return False
 				logging.info(f"[GENERAL-DROPS-CHECK] General drop '{item_name}' is complete ({pct}%)")
 				continue
-			# Not found in progress map = no progress bar = completed
-			# This means the item is either completed or not started yet
-			# For general drops, if there's no progress bar, we consider it completed
-			# (since general drops should always show a progress bar when active)
-			logging.info(f"[GENERAL-DROPS-CHECK] No progress bar found for '{item_name}' - considering completed")
-			continue
-		logging.info(f"[GENERAL-DROPS-CHECK] All general drops are complete - returning True")
+			# A missing progress bar is ambiguous: Twitch may still be loading, the
+			# campaign may not have started, or selectors may have changed. Only mark
+			# it complete when the claimed-items area confirms the reward.
+			claimed = await is_general_item_claimed_on_inventory(inv_page, item_name or alias or "")
+			if claimed is True:
+				logging.info(f"[GENERAL-DROPS-CHECK] Confirmed '{item_name or alias}' in claimed inventory")
+				continue
+			logging.info(
+				f"[GENERAL-DROPS-CHECK] No progress or claimed confirmation for "
+				f"'{item_name or alias}' - completion is unknown"
+			)
+			return False
+		logging.info("[GENERAL-DROPS-CHECK] All general drops are complete - returning True")
 		return True
 	except Exception as e:
 		logging.warning(f"[GENERAL-DROPS-CHECK] Error checking general drops: {e}")
@@ -4750,7 +4820,7 @@ def ensure_process_visibility_matches_preference():
 				logging.info("Restarting to match console visibility preference…")
 			except Exception:
 				pass
-			subprocess.Popen([preferred, script_path], cwd=BASE_DIR, creationflags=flags)
+			subprocess.Popen([preferred, script_path, *sys.argv[1:]], cwd=BASE_DIR, creationflags=flags)
 			os._exit(0)
 	except Exception:
 		pass

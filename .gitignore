@@ -11,6 +11,7 @@ __pycache__/
 # Logs and state
 *.log
 logs/
+.runtime/
 drops_log.txt
 config.json
 
@@ -25,6 +26,11 @@ user_data_stealth/
 Thumbs.db
 *.swp
 *.swo
+
+# Local agent instructions and workspace state
+AGENTS.md
+.agents/
+.codex/
 
 # Archives and installers
 *.zip
@@ -44,4 +50,3 @@ example_site/
 example_twitch/
 example_twitch_complete/
 example_twitch_claim/
-.gitignore
