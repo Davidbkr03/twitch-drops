@@ -1,14 +1,64 @@
 import asyncio
+import ipaddress
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from urllib.parse import urlsplit
 
-from flask import Blueprint, render_template, jsonify, request
+from flask import Blueprint, current_app, render_template, jsonify, request
 from flask_login import login_required, current_user
 from flask_socketio import join_room, leave_room
 
 from app.extensions import db, socketio
 from app.models import UserSettings, DropLog
-from app.automator import AutomationManager, UserAutomator
+from app.automator import (
+    AutomationManager,
+    UserAutomator,
+    normalize_twitch_game_url,
+)
 
 main_bp = Blueprint("main", __name__)
+DISCOVERY_TIMEOUT_SECONDS = 75
+
+
+def _resolve_discovery_future(future, resource_name):
+    try:
+        return future.result(timeout=DISCOVERY_TIMEOUT_SECONDS), None
+    except FutureTimeoutError:
+        future.cancel()
+        return None, (
+            jsonify({
+                "success": False,
+                "error": f"{resource_name} discovery timed out; try again",
+            }),
+            504,
+        )
+
+
+def _is_local_same_origin_request() -> bool:
+    """Restrict native desktop launches to the machine hosting the app."""
+    try:
+        remote = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return False
+    is_loopback = remote.is_loopback or bool(
+        getattr(remote, "ipv4_mapped", None) and remote.ipv4_mapped.is_loopback
+    )
+    if not is_loopback:
+        return False
+
+    origin = request.headers.get("Origin")
+    if not origin:
+        return False
+    supplied = urlsplit(origin)
+    expected = urlsplit(request.host_url)
+    return (
+        supplied.scheme.lower(),
+        supplied.hostname,
+        supplied.port,
+    ) == (
+        expected.scheme.lower(),
+        expected.hostname,
+        expected.port,
+    )
 
 
 # ------------------------------------------------------------------
@@ -19,7 +69,11 @@ main_bp = Blueprint("main", __name__)
 @login_required
 def dashboard():
     settings = UserSettings.query.filter_by(user_id=current_user.id).first()
-    return render_template("dashboard.html", settings=settings)
+    return render_template(
+        "dashboard.html",
+        settings=settings,
+        native_login_enabled=current_app.config.get("NATIVE_LOGIN_ENABLED", False),
+    )
 
 
 # ------------------------------------------------------------------
@@ -33,7 +87,7 @@ def api_status():
     status = mgr.get_status(current_user.id) if mgr else {"running": False}
     # Supplement with DB info
     s = UserSettings.query.filter_by(user_id=current_user.id).first()
-    if s and s.twitch_username:
+    if s and (s.twitch_username or s.twitch_auth_token):
         status["twitch_user"] = s.twitch_username
         status["twitch_saved"] = True
     return jsonify(status)
@@ -46,6 +100,11 @@ def api_start():
     if not mgr:
         return jsonify({"success": False, "error": "Manager not ready"}), 503
     ok = mgr.start_for_user(current_user.id)
+    if not ok and mgr.native_login_active_for_user(current_user.id):
+        return jsonify({
+            "success": False,
+            "error": "Close the normal Twitch login browser before starting",
+        }), 409
     return jsonify({"success": ok})
 
 
@@ -109,6 +168,25 @@ def api_import_token():
     return jsonify({"success": True})
 
 
+@main_bp.route("/api/native-login", methods=["POST"])
+@login_required
+def api_native_login():
+    if not current_app.config.get("NATIVE_LOGIN_ENABLED", False):
+        return jsonify({
+            "success": False,
+            "error": "Native login is only available on a local desktop install",
+        }), 409
+    if not _is_local_same_origin_request():
+        return jsonify({"success": False, "error": "Local same-origin request required"}), 403
+    mgr = AutomationManager.get()
+    if not mgr:
+        return jsonify({"success": False, "error": "Manager not ready"}), 503
+    success, detail = mgr.open_native_login_for_user(current_user.id)
+    if not success:
+        return jsonify({"success": False, "error": detail}), 409
+    return jsonify({"success": True, "browser": detail})
+
+
 @main_bp.route("/api/discover-games", methods=["POST"])
 @login_required
 def api_discover_games():
@@ -123,7 +201,9 @@ def api_discover_games():
         future = asyncio.run_coroutine_threadsafe(
             UserAutomator.discover_games(a.context), a._loop
         )
-        games = future.result(timeout=30)
+        games, error_response = _resolve_discovery_future(future, "Game")
+        if error_response:
+            return error_response
         return jsonify({"success": True, "games": games})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -133,9 +213,15 @@ def api_discover_games():
 @login_required
 def api_discover_streamers():
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "JSON object required"}), 400
     game_url = data.get("game_url", "")
     if not game_url:
         return jsonify({"success": False, "error": "game_url required"}), 400
+    try:
+        game_url = normalize_twitch_game_url(game_url)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
     mgr = AutomationManager.get()
     if not mgr:
         return jsonify({"success": False, "error": "Not ready"}), 503
@@ -147,7 +233,9 @@ def api_discover_streamers():
         future = asyncio.run_coroutine_threadsafe(
             UserAutomator.discover_streamers(a.context, game_url), a._loop
         )
-        streamers = future.result(timeout=30)
+        streamers, error_response = _resolve_discovery_future(future, "Streamer")
+        if error_response:
+            return error_response
         return jsonify({"success": True, "streamers": streamers})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -166,14 +254,27 @@ def api_watch_targets():
 
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
-        game_name = (data.get("game_name") or "").strip()
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "JSON object required"}), 400
+        raw_game_name = data.get("game_name") or ""
+        if not isinstance(raw_game_name, str):
+            return jsonify({"success": False, "error": "game_name must be a string"}), 400
+        game_name = raw_game_name.strip()
         if not game_name:
             return jsonify({"success": False, "error": "game_name required"}), 400
+        raw_game_url = data.get("game_url") or ""
+        try:
+            game_url = normalize_twitch_game_url(raw_game_url) if raw_game_url else None
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+        raw_streamer = data.get("streamer") or ""
+        if not isinstance(raw_streamer, str):
+            return jsonify({"success": False, "error": "streamer must be a string"}), 400
         wt = WatchTarget(
             user_id=current_user.id,
             game_name=game_name,
-            game_url=(data.get("game_url") or "").strip() or None,
-            streamer=(data.get("streamer") or "").strip() or None,
+            game_url=game_url,
+            streamer=raw_streamer.strip() or None,
         )
         db.session.add(wt)
         db.session.commit()
@@ -206,14 +307,30 @@ def api_settings():
         })
 
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "JSON object required"}), 400
     if "auto_claim" in data:
-        s.auto_claim = bool(data["auto_claim"])
-    if "check_interval" in data:
-        s.check_interval = max(10, int(data["check_interval"]))
-    if "screencast_quality" in data:
-        s.screencast_quality = max(10, min(100, int(data["screencast_quality"])))
-    if "screencast_max_fps" in data:
-        s.screencast_max_fps = max(1, min(10, int(data["screencast_max_fps"])))
+        if not isinstance(data["auto_claim"], bool):
+            return jsonify({"success": False, "error": "auto_claim must be a boolean"}), 400
+        s.auto_claim = data["auto_claim"]
+
+    integer_settings = {
+        "check_interval": (10, 600),
+        "screencast_quality": (10, 100),
+        "screencast_max_fps": (1, 10),
+    }
+    for name, (minimum, maximum) in integer_settings.items():
+        if name not in data:
+            continue
+        value = data[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            return jsonify({"success": False, "error": f"{name} must be an integer"}), 400
+        if not minimum <= value <= maximum:
+            return jsonify({
+                "success": False,
+                "error": f"{name} must be between {minimum} and {maximum}",
+            }), 400
+        setattr(s, name, value)
     db.session.commit()
     return jsonify({"success": True})
 

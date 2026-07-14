@@ -1,3 +1,5 @@
+from urllib.parse import unquote, urlsplit
+
 from flask import Blueprint, render_template, redirect, url_for, flash, request
 from flask_login import login_user, logout_user, login_required, current_user
 
@@ -5,6 +7,23 @@ from app.extensions import db, bcrypt
 from app.models import User, UserSettings
 
 auth_bp = Blueprint("auth", __name__)
+
+
+def _safe_local_redirect(target):
+    """Accept only absolute-path redirects on this application."""
+    if not target:
+        return None
+    decoded = unquote(target)
+    if "\\" in decoded or any(
+        ord(character) < 32 or ord(character) == 127 for character in decoded
+    ):
+        return None
+    parsed = urlsplit(decoded)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
+        return None
+    if decoded.startswith("//"):
+        return None
+    return target
 
 
 @auth_bp.route("/login", methods=["GET", "POST"])
@@ -17,7 +36,7 @@ def login():
         user = User.query.filter_by(username=username).first()
         if user and bcrypt.check_password_hash(user.password_hash, password):
             login_user(user, remember=True)
-            next_page = request.args.get("next")
+            next_page = _safe_local_redirect(request.args.get("next"))
             return redirect(next_page or url_for("main.dashboard"), code=303)
         flash("Invalid username or password.", "error")
     return render_template("login.html")

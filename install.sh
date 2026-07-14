@@ -60,6 +60,7 @@ if [ ! -f .env ]; then
     cat > .env <<EOF
 SECRET_KEY=${SECRET}
 DATA_DIR=/data
+PORT=${PORT}
 POSTGRES_USER=twitch
 POSTGRES_PASSWORD=$(openssl rand -hex 16 2>/dev/null || echo "twitch_$(date +%s)")
 POSTGRES_DB=twitch_drops
@@ -71,7 +72,7 @@ fi
 
 # ── 4. Build and start ────────────────────────────────────────────
 echo "→ Building and starting containers (this may take a few minutes on first run)..."
-sudo docker compose up -d --build
+sudo env PORT="${PORT}" docker compose up -d --build
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"

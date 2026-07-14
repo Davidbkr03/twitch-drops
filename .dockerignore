@@ -9,3 +9,5 @@ user_data_stealth/
 *.bat
 *.ps1
 AGENTS.md
+.agents/
+.codex/

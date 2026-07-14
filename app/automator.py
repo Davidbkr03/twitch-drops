@@ -1,13 +1,16 @@
 """Per-user Twitch drop automation with CDP screencast streaming."""
 
 import asyncio
-import glob
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
@@ -50,6 +53,139 @@ BROWSER_ARGS = [
 ]
 
 VIEWPORT = {"width": 1366, "height": 768}
+DEFAULT_BROWSER_CHANNELS = ("msedge", "chrome")
+
+
+def browser_channel_candidates(configured_channel: str | None = None) -> tuple[str | None, ...]:
+    """Return one forced channel, or branded defaults with Chromium fallback."""
+    if configured_channel and configured_channel.strip():
+        return (configured_channel.strip(),)
+    candidates: list[str | None] = []
+    candidates.extend(DEFAULT_BROWSER_CHANNELS)
+    candidates.append(None)
+    return tuple(dict.fromkeys(candidates))
+
+
+def find_native_browser() -> tuple[str, str, str] | None:
+    """Find a supported installed browser for user-driven Twitch login."""
+    configured = os.environ.get("TWITCH_BROWSER_EXECUTABLE")
+    candidates: list[tuple[str, str | None, str]] = []
+    if configured:
+        configured_channel = "msedge" if "edge" in Path(configured).stem.lower() else "chrome"
+        candidates.append((Path(configured).stem, configured, configured_channel))
+
+    if os.name == "nt":
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        candidates.extend([
+            ("Microsoft Edge", os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"), "msedge"),
+            ("Microsoft Edge", os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"), "msedge"),
+            ("Google Chrome", os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"), "chrome"),
+            ("Google Chrome", os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"), "chrome"),
+            ("Google Chrome", os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"), "chrome"),
+        ])
+    elif os.name == "posix":
+        candidates.extend([
+            ("Microsoft Edge", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "msedge"),
+            ("Google Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "chrome"),
+        ])
+
+    for command, browser_name, channel in (
+        ("msedge", "Microsoft Edge", "msedge"),
+        ("microsoft-edge", "Microsoft Edge", "msedge"),
+        ("google-chrome", "Google Chrome", "chrome"),
+        ("chrome", "Google Chrome", "chrome"),
+    ):
+        candidates.append((browser_name, shutil.which(command), channel))
+
+    for browser_name, executable, channel in candidates:
+        if executable and os.path.isfile(executable):
+            return browser_name, executable, channel
+    return None
+
+
+def launch_native_twitch_login(data_dir: str) -> tuple[str, str, subprocess.Popen]:
+    """Open Twitch in an ordinary browser that persists into the automation profile."""
+    browser = find_native_browser()
+    if not browser:
+        raise RuntimeError("No supported native browser is installed")
+    browser_name, executable, channel = browser
+    os.makedirs(data_dir, exist_ok=True)
+    process = subprocess.Popen(
+        [
+            executable,
+            f"--user-data-dir={os.path.abspath(data_dir)}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-mode",
+            TWITCH_LOGIN_URL,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    return browser_name, channel, process
+
+
+def screencast_emit_interval(max_fps: int) -> float:
+    """Return the minimum delay between preview frames sent to the client."""
+    return 1.0 / max(1, min(10, int(max_fps)))
+
+
+def normalize_drop_name(value: str | None) -> str:
+    """Remove Twitch's progress suffix while preserving the visible reward name."""
+    text = " ".join((value or "").split())
+    text = re.sub(r"(?:^|\s)\d+%\s*(?:of\s+.*)?$", "", text, flags=re.IGNORECASE)
+    return text.strip() or "Drop"
+
+
+def screencast_options(quality: int) -> dict:
+    """Build CDP options that always deliver the first frame of a static page."""
+    return {
+        "format": "jpeg",
+        "quality": max(10, min(100, int(quality))),
+        "maxWidth": VIEWPORT["width"],
+        "maxHeight": VIEWPORT["height"],
+        "everyNthFrame": 1,
+    }
+
+
+def normalize_twitch_game_url(value: str) -> str:
+    """Validate and normalize a Twitch directory URL supplied by a user."""
+    invalid_url = "game_url must be an HTTPS Twitch directory URL"
+    if not isinstance(value, str):
+        raise ValueError("game_url must be a string")
+    raw = value.strip()
+    if not raw:
+        raise ValueError("game_url required")
+
+    try:
+        parsed = urlsplit(urljoin("https://www.twitch.tv", raw))
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(invalid_url) from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"twitch.tv", "www.twitch.tv"}
+        or parsed.username
+        or parsed.password
+        or port not in {None, 443}
+        or "\\" in parsed.path
+    ):
+        raise ValueError(invalid_url)
+
+    allowed_paths = (
+        "/directory/category/",
+        "/directory/game/",
+        "/directory/all/tags/dropsenabled",
+    )
+    if not any(parsed.path.startswith(prefix) for prefix in allowed_paths):
+        raise ValueError("game_url must point to a Twitch game directory")
+
+    return urlunsplit(("https", "www.twitch.tv", parsed.path, parsed.query, ""))
 
 # Comprehensive stealth patches injected into every page.
 # Twitch specifically checks WebGL renderer (SwiftShader = virtual env)
@@ -140,6 +276,15 @@ class AutomationManager:
         self.socketio = socketio
         self.app = app
         self.automators: dict[int, "UserAutomator"] = {}
+        self._native_login_processes: dict[int, subprocess.Popen] = {}
+        self._native_login_channels: dict[int, str] = {}
+        self._native_login_starting: set[int] = set()
+        self._lock = threading.RLock()
+
+    def _data_dir_for_user(self, user_id: int) -> str:
+        return os.path.join(
+            self.app.config.get("BROWSER_DATA_DIR", "/data/browser"), str(user_id)
+        )
 
     @classmethod
     def init(cls, socketio, app):
@@ -151,23 +296,81 @@ class AutomationManager:
         return cls._instance
 
     def start_for_user(self, user_id: int) -> bool:
-        if user_id in self.automators and self.automators[user_id].running:
-            return False
-        data_dir = os.path.join(
-            self.app.config.get("BROWSER_DATA_DIR", "/data/browser"), str(user_id)
-        )
-        os.makedirs(data_dir, exist_ok=True)
-        automator = UserAutomator(user_id, data_dir, self.socketio, self.app)
-        self.automators[user_id] = automator
-        automator.start()
-        return True
+        with self._lock:
+            if (
+                user_id in self._native_login_starting
+                or self._native_login_active_unlocked(user_id)
+            ):
+                return False
+            existing = self.automators.get(user_id)
+            if existing and existing.is_alive():
+                return False
+            data_dir = self._data_dir_for_user(user_id)
+            os.makedirs(data_dir, exist_ok=True)
+            automator = UserAutomator(
+                user_id,
+                data_dir,
+                self.socketio,
+                self.app,
+                browser_channel=self._native_login_channels.get(user_id),
+            )
+            self.automators[user_id] = automator
+            automator.start()
+            return True
 
     def stop_for_user(self, user_id: int) -> bool:
-        automator = self.automators.get(user_id)
-        if automator and automator.running:
-            automator.stop()
+        with self._lock:
+            automator = self.automators.get(user_id)
+            if automator and automator.is_alive():
+                automator.stop()
+                return True
+            return False
+
+    def open_native_login_for_user(self, user_id: int) -> tuple[bool, str]:
+        """Stop automation, release its profile, and open a normal login browser."""
+        with self._lock:
+            if (
+                user_id in self._native_login_starting
+                or self._native_login_active_unlocked(user_id)
+            ):
+                return False, "The native Twitch login browser is already open"
+            self._native_login_starting.add(user_id)
+            automator = self.automators.get(user_id)
+            if automator and automator.is_alive():
+                automator.stop()
+
+        try:
+            if automator and not automator.wait_until_stopped(timeout=15):
+                return False, "Automation browser is still stopping; try again in a moment"
+            browser_name, channel, process = launch_native_twitch_login(
+                self._data_dir_for_user(user_id)
+            )
+        except (OSError, RuntimeError) as exc:
+            return False, str(exc)
+        else:
+            with self._lock:
+                self._native_login_processes[user_id] = process
+                self._native_login_channels[user_id] = channel
+            return True, browser_name
+        finally:
+            with self._lock:
+                self._native_login_starting.discard(user_id)
+
+    def _native_login_active_unlocked(self, user_id: int) -> bool:
+        process = self._native_login_processes.get(user_id)
+        if not process:
+            return False
+        if process.poll() is None:
             return True
+        self._native_login_processes.pop(user_id, None)
         return False
+
+    def native_login_active_for_user(self, user_id: int) -> bool:
+        with self._lock:
+            return (
+                user_id in self._native_login_starting
+                or self._native_login_active_unlocked(user_id)
+            )
 
     def get_automator(self, user_id: int):
         return self.automators.get(user_id)
@@ -175,8 +378,11 @@ class AutomationManager:
     def get_status(self, user_id: int) -> dict:
         automator = self.automators.get(user_id)
         if automator:
-            return automator.get_status()
-        return {"running": False, "logged_in": False, "twitch_saved": False}
+            status = automator.get_status()
+        else:
+            status = {"running": False, "logged_in": False, "twitch_saved": False}
+        status["native_login_active"] = self.native_login_active_for_user(user_id)
+        return status
 
 
 # ======================================================================
@@ -185,20 +391,31 @@ class AutomationManager:
 
 class UserAutomator:
 
-    def __init__(self, user_id: int, data_dir: str, socketio, app):
+    def __init__(
+        self,
+        user_id: int,
+        data_dir: str,
+        socketio,
+        app,
+        browser_channel: str | None = None,
+    ):
         self.user_id = user_id
         self.data_dir = data_dir
         self.socketio = socketio
         self.app = app
+        self.browser_channel = browser_channel
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._main_task: asyncio.Task | None = None
         self._stop = threading.Event()
 
         self.running = False
         self.context = None
         self.page = None
         self.cdp_session = None
+        self._screencast_min_interval = screencast_emit_interval(3)
+        self._last_screencast_emit = 0.0
 
         self._watch_start: float | None = None
         self._total_watch_secs: float = 0
@@ -208,9 +425,11 @@ class UserAutomator:
         self.status: dict = {
             "running": False,
             "logged_in": False,
+            "browser_channel": None,
             "twitch_user": None,
             "twitch_saved": False,
             "watching": None,
+            "watching_game": None,
             "stream_name": None,
             "watch_seconds": 0,
             "message": "Idle",
@@ -233,7 +452,7 @@ class UserAutomator:
             with self.app.app_context():
                 from app.models import UserSettings
                 s = UserSettings.query.filter_by(user_id=self.user_id).first()
-                if s and s.twitch_username:
+                if s and (s.twitch_username or s.twitch_auth_token):
                     twitch_saved = True
         except Exception:
             pass
@@ -242,12 +461,20 @@ class UserAutomator:
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def wait_until_stopped(self, timeout: float) -> bool:
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout)
+        return not self.is_alive()
+
     def stop(self):
         self._stop.set()
-        self.running = False
-        self._update_status(running=False, message="Stopping…")
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._update_status(message="Stopping…")
+        if self._loop and self._loop.is_running() and self._main_task:
+            self._loop.call_soon_threadsafe(self._main_task.cancel)
 
     def get_status(self) -> dict:
         s = dict(self.status)
@@ -260,18 +487,36 @@ class UserAutomator:
     def _thread_main(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        failure = None
         try:
-            self._loop.run_until_complete(self._async_main())
-        except Exception:
+            self._main_task = self._loop.create_task(self._async_main())
+            self._loop.run_until_complete(self._main_task)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            failure = exc
             logger.exception("User %s automation crashed", self.user_id)
         finally:
+            try:
+                self._loop.run_until_complete(self._cleanup())
+            except Exception:
+                logger.debug("User %s final cleanup failed", self.user_id, exc_info=True)
             try:
                 self._loop.run_until_complete(self._loop.shutdown_asyncgens())
             except Exception:
                 pass
             self._loop.close()
+            self._main_task = None
             self.running = False
-            self._update_status(running=False, message="Stopped")
+            if failure:
+                detail = str(failure).strip() or failure.__class__.__name__
+                self._update_status(
+                    running=False,
+                    message=f"Automation error: {detail[:200]}",
+                )
+            else:
+                message = "Stopped" if self._stop.is_set() else self.status.get("message", "Stopped")
+                self._update_status(running=False, message=message)
 
     async def _async_main(self):
         tried_compat = False
@@ -295,19 +540,13 @@ class UserAutomator:
                         await self._cleanup()
                         await asyncio.sleep(5)
                         continue
-                    break
+                    raise
                 finally:
                     await self._cleanup()
 
     # ---- browser launch ----
 
     async def _launch_browser(self, p, compat_mode: bool = False):
-        for lock in glob.glob(os.path.join(self.data_dir, "Singleton*")):
-            try:
-                os.remove(lock)
-            except OSError:
-                pass
-
         args = list(BROWSER_ARGS)
         ignore_defaults = ["--enable-automation"]
         if compat_mode:
@@ -325,10 +564,35 @@ class UserAutomator:
             viewport=VIEWPORT,
             locale="en-US",
         )
-        try:
-            self.context = await p.chromium.launch_persistent_context(channel="chrome", **kw)
-        except Exception:
-            self.context = await p.chromium.launch_persistent_context(**kw)
+        configured_channel = self.browser_channel or os.environ.get("TWITCH_BROWSER_CHANNEL")
+        launch_error = None
+        for channel in browser_channel_candidates(configured_channel):
+            try:
+                launch_kw = dict(kw)
+                if channel:
+                    launch_kw["channel"] = channel
+                self.context = await p.chromium.launch_persistent_context(**launch_kw)
+                logger.info(
+                    "User %s browser launched with %s",
+                    self.user_id,
+                    channel or "bundled Chromium",
+                )
+                browser_name = {
+                    "msedge": "Microsoft Edge",
+                    "chrome": "Google Chrome",
+                    None: "Bundled Chromium",
+                }.get(channel, channel)
+                self._update_status(browser_channel=browser_name)
+                break
+            except Exception as exc:
+                launch_error = exc
+                logger.info(
+                    "User %s browser channel %s unavailable",
+                    self.user_id,
+                    channel or "bundled Chromium",
+                )
+        if self.context is None:
+            raise RuntimeError("No compatible Chromium browser could be launched") from launch_error
 
         # Apply stealth via Playwright init scripts (covers main page frames)
         stealth = Stealth(init_scripts_only=True, navigator_webdriver=True)
@@ -356,30 +620,35 @@ class UserAutomator:
     async def _start_screencast(self):
         if not self.page:
             return
-        quality, every_nth = 50, 3
+        quality, max_fps = 50, 3
         try:
             with self.app.app_context():
                 from app.models import UserSettings
                 s = UserSettings.query.filter_by(user_id=self.user_id).first()
                 if s:
                     quality = max(10, min(100, s.screencast_quality or 50))
-                    every_nth = max(1, min(10, s.screencast_max_fps or 3))
+                    max_fps = max(1, min(10, s.screencast_max_fps or 3))
         except Exception:
             pass
         try:
             self.cdp_session = await self.context.new_cdp_session(self.page)
             self.cdp_session.on("Page.screencastFrame", self._on_frame)
-            await self.cdp_session.send("Page.startScreencast", {
-                "format": "jpeg", "quality": quality,
-                "maxWidth": VIEWPORT["width"], "maxHeight": VIEWPORT["height"],
-                "everyNthFrame": every_nth,
-            })
+            self._screencast_min_interval = screencast_emit_interval(max_fps)
+            self._last_screencast_emit = 0.0
+            await self.cdp_session.send("Page.startScreencast", screencast_options(quality))
         except Exception:
             logger.exception("User %s screencast init failed", self.user_id)
 
     def _on_frame(self, params):
         try:
-            self.socketio.emit("screencast_frame", {"data": params["data"]}, room=f"user_{self.user_id}")
+            now = time.monotonic()
+            if now - self._last_screencast_emit >= self._screencast_min_interval:
+                self._last_screencast_emit = now
+                self.socketio.emit(
+                    "screencast_frame",
+                    {"data": params["data"]},
+                    room=f"user_{self.user_id}",
+                )
             if self.cdp_session and self._loop and self._loop.is_running():
                 asyncio.run_coroutine_threadsafe(
                     self.cdp_session.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]}),
@@ -596,7 +865,6 @@ class UserAutomator:
             self._update_status(message="Waiting for Twitch…")
 
             # Poll for result — spinner might hang due to Kasada 429
-            spinner_seconds = 0
             result = await self._poll_login_result(timeout_sec=30)
 
             if result == "success":
@@ -758,39 +1026,87 @@ class UserAutomator:
 
     async def _check_and_claim_drops(self):
         self._update_status(message="Checking drops…")
-        await self._goto(TWITCH_INVENTORY_URL)
+        if not self.context:
+            raise RuntimeError("Browser context is not available")
+        inventory_page = await self.context.new_page()
+        try:
+            claimed, in_progress = await self._inspect_inventory_page(inventory_page)
+        finally:
+            await inventory_page.close()
+
+        all_claimed = self.status.get("drops_claimed", []) + claimed
+        self._update_status(
+            drops_in_progress=in_progress,
+            drops_claimed=all_claimed[-20:],
+            completed_games=list(self._completed_games),
+            last_check=datetime.now(timezone.utc).isoformat(),
+            message=f"Drops: {len(in_progress)} active, {len(claimed)} claimed",
+        )
+        self._persist_drops(in_progress, claimed)
+
+    async def _inspect_inventory_page(self, page):
+        await page.goto(
+            TWITCH_INVENTORY_URL,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
         await asyncio.sleep(5)
 
-        # Scroll the full page to trigger lazy-loading of all drop items
+        # Scroll the full page to trigger lazy-loading of all drop items.
         prev_height = 0
         for _ in range(15):
-            cur_height = await self.page.evaluate("document.body.scrollHeight")
+            cur_height = await page.evaluate("document.body.scrollHeight")
             if cur_height == prev_height:
                 break
             prev_height = cur_height
-            await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(1)
-        await self.page.evaluate("window.scrollTo(0, 0)")
+        await page.evaluate("window.scrollTo(0, 0)")
         await asyncio.sleep(0.5)
 
         claimed: list[dict] = []
         in_progress: list[dict] = []
-
         try:
-            # Claim any ready drops
-            claim_btns = await self.page.query_selector_all('button:has-text("Claim")')
+            # Claim ready drops only when the user has enabled auto-claim.
+            claim_btns = (
+                await page.query_selector_all('button:has-text("Claim")')
+                if self._get_auto_claim()
+                else []
+            )
             for btn in claim_btns:
                 try:
+                    name = await btn.evaluate(r"""
+                        button => {
+                            let container = button;
+                            for (let i = 0; i < 10; i++) {
+                                container = container?.parentElement;
+                                if (!container) break;
+                                if (container.querySelector('img') &&
+                                    container.querySelector('button')) break;
+                            }
+                            if (!container) return 'Drop claimed';
+                            const texts = Array.from(
+                                container.querySelectorAll('h3, h4, p, span')
+                            ).map(el => (el.textContent || '').trim()).filter(text =>
+                                text.length > 2 && text.length < 120 &&
+                                !/^claim(ed)?$/i.test(text) && !/^\d+%$/.test(text)
+                            );
+                            return texts[0] || 'Drop claimed';
+                        }
+                    """)
                     await btn.click()
                     await asyncio.sleep(1.5)
-                    claimed.append({"name": "Drop claimed", "time": datetime.now(timezone.utc).isoformat()})
+                    claimed.append({
+                        "name": normalize_drop_name(name or "Drop claimed"),
+                        "time": datetime.now(timezone.utc).isoformat(),
+                    })
                 except Exception:
                     pass
 
             # Scrape full inventory: find each progress bar's container which
             # holds the reward image (twitch-quests-assets/REWARD/...) and
             # the progress text.
-            inventory = await self.page.evaluate(r"""
+            inventory = await page.evaluate(r"""
                 () => {
                     const items = [];
                     const seen = new Set();
@@ -824,82 +1140,126 @@ class UserAutomator:
                             }
                         }
 
-                        // Item name / time text
-                        const texts = [];
-                        container.querySelectorAll('p, span').forEach(t => {
-                            const v = (t.textContent || '').trim();
-                            if (v && v.length > 2 && v.length < 100 && !/^\d+%$/.test(v)
-                                && !['Drops','In Progress','Inventory'].includes(v)) {
-                                texts.push(v);
-                            }
-                        });
-                        const name = texts.find(t => /of \d+ hour/i.test(t)) || texts[0] || '';
+                        // Twitch renders this nearest reward container as
+                        // "Reward name/type 1% of 2 hours". Preserve the
+                        // visible text here; Python strips the progress suffix.
+                        const name = (container.innerText || '').trim();
                         const key = image + '_' + pct;
                         if (seen.has(key)) return;
                         seen.add(key);
                         items.push({ name, progress: pct, image });
                     });
 
-                    const campaignNames = [];
-                    document.querySelectorAll('p, h3, h4, h5').forEach(el => {
-                        const t = (el.textContent || '').trim();
-                        if (t.length > 5 && t.length < 80 &&
-                            (t.includes('Drop') || t.includes('Campaign') || t.includes('Rush') ||
-                             t.includes('Reward') || t.includes('Event'))) {
-                            if (!campaignNames.includes(t)) campaignNames.push(t);
+                    const campaigns = [];
+                    const seenCampaigns = new Set();
+                    document.querySelectorAll('a[href*="/directory/category/"]').forEach(anchor => {
+                        let container = anchor;
+                        let categoryPaths = new Set();
+                        let hasEvidence = false;
+                        for (let depth = 0; depth < 10 && container; depth++) {
+                            categoryPaths = new Set(Array.from(container.querySelectorAll(
+                                'a[href*="/directory/category/"]'
+                            )).map(link => {
+                                try { return new URL(link.href, location.origin).pathname; }
+                                catch { return ''; }
+                            }).filter(Boolean));
+                            const hasCompletionLabel = Array.from(container.querySelectorAll(
+                                'p, span, h1, h2, h3, h4, h5, h6'
+                            )).some(el => /^campaign completed!?$/i.test(
+                                (el.textContent || '').trim()
+                            ));
+                            hasEvidence = Boolean(
+                                container.querySelector('[role="progressbar"]') ||
+                                Array.from(container.querySelectorAll('button')).some(button =>
+                                    /^(claim|claimed)\b/i.test((button.textContent || '').trim())
+                                ) || hasCompletionLabel
+                            );
+                            if (hasEvidence && categoryPaths.size === 1) break;
+                            container = container.parentElement;
                         }
+                        if (!container || !hasEvidence || categoryPaths.size !== 1) return;
+
+                        const gamePath = Array.from(categoryPaths)[0];
+                        const completionLabel = Array.from(container.querySelectorAll(
+                            'p, span, h1, h2, h3, h4, h5, h6'
+                        )).some(el => /^campaign completed!?$/i.test(
+                            (el.textContent || '').trim()
+                        ));
+                        const hasIncompleteProgress = Array.from(container.querySelectorAll(
+                            '[role="progressbar"]'
+                        )).some(bar => {
+                            const value = Number.parseFloat(bar.getAttribute('aria-valuenow'));
+                            return Number.isFinite(value) && value < 100;
+                        });
+                        const hasClaimableReward = Array.from(container.querySelectorAll(
+                            'button:not([disabled])'
+                        )).some(button => /^claim\b/i.test(
+                            (button.textContent || '').trim()
+                        ));
+                        const key = `${gamePath}|${completionLabel}|${hasIncompleteProgress}|${hasClaimableReward}`;
+                        if (seenCampaigns.has(key)) return;
+                        seenCampaigns.add(key);
+                        campaigns.push({
+                            gamePath,
+                            complete: completionLabel && !hasIncompleteProgress && !hasClaimableReward,
+                        });
                     });
 
-                    return { items, campaignNames };
+                    return { items, campaigns };
                 }
             """)
 
             for item in (inventory.get("items") or []):
                 in_progress.append({
-                    "name": item.get("name", "Drop"),
+                    "name": normalize_drop_name(item.get("name")),
                     "progress": item.get("progress", 0),
                     "image": item.get("image", ""),
                 })
 
-            # Detect completed games: check selected games against active campaigns
-            campaign_names = inventory.get("campaignNames", [])
-            active_progress = [i for i in in_progress if i["progress"] < 100]
-            self._detect_completed_games(campaign_names, active_progress)
+            self._detect_completed_games(inventory.get("campaigns") or [])
 
         except Exception:
+            self._completed_games.clear()
             logger.debug("Drop check error", exc_info=True)
+        return claimed, in_progress
 
-        all_claimed = self.status.get("drops_claimed", []) + claimed
-        self._update_status(
-            drops_in_progress=in_progress,
-            drops_claimed=all_claimed[-20:],
-            completed_games=list(self._completed_games),
-            last_check=datetime.now(timezone.utc).isoformat(),
-            message=f"Drops: {len(in_progress)} active, {len(claimed)} claimed",
-        )
-        self._persist_drops(in_progress, claimed)
+    def _get_auto_claim(self) -> bool:
+        try:
+            with self.app.app_context():
+                from app.models import UserSettings
 
-    def _detect_completed_games(self, campaign_names: list, active_items: list):
-        """Check which selected games have no active drops left."""
+                settings = UserSettings.query.filter_by(user_id=self.user_id).first()
+                return bool(settings and settings.auto_claim)
+        except Exception:
+            logger.debug("auto-claim setting load failed", exc_info=True)
+            return False
+
+    def _detect_completed_games(self, campaigns: list):
+        """Mark games complete only from affirmative, exact-category campaign records."""
         targets = self._load_watch_targets()
-        active_text = " ".join(i.get("name", "") for i in active_items).lower()
-        campaign_text = " ".join(campaign_names).lower()
-
-        for target in targets:
-            game = target.get("game_name", "")
-            if not game:
+        records_by_path: dict[str, list[bool]] = {}
+        for campaign in campaigns:
+            game_path = str(campaign.get("gamePath") or "").rstrip("/").casefold()
+            if not game_path.startswith("/directory/category/"):
                 continue
-            game_lower = game.lower()
-            # A game is "active" if its name appears in campaign names or progress items
-            game_words = game_lower.split()
-            is_active = any(
-                w in campaign_text or w in active_text
-                for w in game_words if len(w) > 3
-            )
-            if not is_active and game_lower not in active_text:
-                self._completed_games.add(game)
-            else:
-                self._completed_games.discard(game)
+            records_by_path.setdefault(game_path, []).append(campaign.get("complete") is True)
+
+        completed_games = set()
+        for target in targets:
+            game_name = target.get("game_name")
+            game_url = target.get("game_url")
+            if not game_name or not game_url:
+                continue
+            try:
+                game_path = urlsplit(normalize_twitch_game_url(game_url)).path.rstrip("/").casefold()
+            except ValueError:
+                continue
+            records = records_by_path.get(game_path, [])
+            if records and all(records):
+                completed_games.add(game_name)
+
+        self._completed_games.clear()
+        self._completed_games.update(completed_games)
 
     def _persist_drops(self, in_progress: list, claimed: list):
         try:
@@ -907,20 +1267,37 @@ class UserAutomator:
                 from app.models import DropLog
                 from app.extensions import db
                 for d in claimed:
-                    db.session.add(DropLog(
-                        user_id=self.user_id, drop_name=d.get("name", "Unknown"),
-                        game="Rust", status="claimed", claimed_at=datetime.now(timezone.utc),
-                    ))
+                    name = normalize_drop_name(d.get("name"))[:255]
+                    existing = DropLog.query.filter_by(
+                        user_id=self.user_id,
+                        drop_name=name,
+                        status="in_progress",
+                    ).first()
+                    if existing:
+                        existing.status = "claimed"
+                        existing.progress = 100
+                        existing.claimed_at = datetime.now(timezone.utc)
+                    else:
+                        db.session.add(DropLog(
+                            user_id=self.user_id,
+                            drop_name=name,
+                            game=d.get("game"),
+                            status="claimed",
+                            progress=100,
+                            claimed_at=datetime.now(timezone.utc),
+                        ))
                 for d in in_progress:
+                    name = normalize_drop_name(d.get("name"))[:255]
                     ex = DropLog.query.filter_by(
-                        user_id=self.user_id, drop_name=d.get("name", "")[:255], status="in_progress",
+                        user_id=self.user_id, drop_name=name, status="in_progress",
                     ).first()
                     if ex:
                         ex.progress = d.get("progress", 0)
                     else:
                         db.session.add(DropLog(
-                            user_id=self.user_id, drop_name=d.get("name", "")[:255],
-                            game="Rust", status="in_progress", progress=d.get("progress", 0),
+                            user_id=self.user_id, drop_name=name,
+                            game=d.get("game"), status="in_progress",
+                            progress=d.get("progress", 0),
                         ))
                 db.session.commit()
         except Exception:
@@ -934,15 +1311,29 @@ class UserAutomator:
         """Check current stream, switch if offline, find best target."""
 
         if self.status.get("watching"):
-            if await self._is_stream_live():
+            watching_game = self.status.get("watching_game")
+            if watching_game in self._completed_games:
+                self._stop_watch_timer()
+                self._update_status(
+                    watching=None,
+                    watching_game=None,
+                    stream_name=None,
+                    message=f"{watching_game} campaign complete — finding another…",
+                )
+            elif await self._is_stream_live():
                 self._update_watch_time()
                 self._update_status(message=f"Watching: {self.status.get('stream_name', '?')}")
                 await self._sleep(self._get_check_interval())
                 return
-            self._stop_watch_timer()
-            self._update_status(watching=None, stream_name=None,
-                                message="Stream went offline — finding another…")
-            await asyncio.sleep(3)
+            else:
+                self._stop_watch_timer()
+                self._update_status(
+                    watching=None,
+                    watching_game=None,
+                    stream_name=None,
+                    message="Stream went offline — finding another…",
+                )
+                await asyncio.sleep(3)
 
         await self._find_best_stream()
         await self._sleep(self._get_check_interval())
@@ -952,11 +1343,14 @@ class UserAutomator:
             url = self.page.url or ""
             if any(x in url for x in ["/directory", "/drops", "/login"]):
                 return False
-            offline = await self.page.query_selector(
+            content_gate = await self.page.query_selector(
                 '[data-a-target="player-overlay-content-gate"]'
             )
-            if offline:
-                return False
+            if content_gate:
+                gate_text = (await content_gate.text_content() or "").lower()
+                if "offline" in gate_text:
+                    return False
+                await self._accept_mature_content()
             live = await self.page.query_selector('video, .video-player')
             return live is not None
         except Exception:
@@ -967,7 +1361,10 @@ class UserAutomator:
         targets = self._load_watch_targets()
         if not targets:
             self._update_status(message="No games selected — browsing all drops")
-            targets = [{"game_url": TWITCH_DROPS_ENABLED_URL}]
+            targets = [{
+                "game_name": "All Drops",
+                "game_url": TWITCH_DROPS_ENABLED_URL,
+            }]
 
         # Filter out completed games
         active_targets = [
@@ -1003,19 +1400,33 @@ class UserAutomator:
 
             # Browse game's directory for any live streamer with drops
             self._update_status(message=f"Finding drops stream for {game_name}…")
-            url = game_url if game_url.startswith("http") else f"https://www.twitch.tv{game_url}"
+            try:
+                url = normalize_twitch_game_url(game_url)
+            except ValueError:
+                logger.warning("User %s has invalid game URL: %r", self.user_id, game_url)
+                continue
             await self._goto(url)
             await asyncio.sleep(4)
 
             try:
-                cards = await self.page.query_selector_all(
-                    'a[data-a-target="preview-card-image-link"]'
-                )
-                if not cards:
-                    cards = await self.page.query_selector_all('article a[href*="/"]')
-                if cards:
-                    await cards[0].click()
+                drops_directory = "/tags/dropsenabled" in url.lower()
+                candidate_hrefs = await self.page.evaluate(r"""
+                    dropsDirectory => Array.from(document.querySelectorAll(
+                        'a[data-a-target="preview-card-image-link"]'
+                    )).filter(anchor => {
+                        if (dropsDirectory) return true;
+                        const card = anchor.closest('article') || anchor.parentElement;
+                        return /drops\s*enabled/i.test(card?.innerText || '');
+                    }).map(anchor => anchor.getAttribute('href')).filter(Boolean)
+                """, drops_directory)
+                for href in candidate_hrefs:
+                    stream_url = urljoin("https://www.twitch.tv", href)
+                    await self._goto(stream_url)
                     await asyncio.sleep(5)
+                    if not await self._is_stream_live():
+                        await self._goto(url)
+                        await asyncio.sleep(2)
+                        continue
                     name = ""
                     try:
                         el = await self.page.query_selector(
@@ -1025,13 +1436,13 @@ class UserAutomator:
                             name = (await el.text_content() or "").strip()
                     except Exception:
                         pass
-                    name = name or self.page.url.split("/")[-1]
-                    await self._start_watching(name, self.page.url, game_name)
+                    name = name or stream_url.rstrip("/").split("/")[-1]
+                    await self._start_watching(name, stream_url, game_name)
                     return
             except Exception:
                 pass
 
-        self._update_status(watching=None, stream_name=None,
+        self._update_status(watching=None, watching_game=None, stream_name=None,
                             message="No live streams found — will retry")
 
     async def _start_watching(self, name: str, url: str, game: str):
@@ -1039,7 +1450,7 @@ class UserAutomator:
         await self._set_low_quality()
         self._start_watch_timer()
         self._update_status(
-            watching=url, stream_name=name,
+            watching=url, watching_game=game, stream_name=name,
             message=f"Watching: {name} ({game})",
         )
 
@@ -1111,7 +1522,7 @@ class UserAutomator:
         """Scrape live streamers with drops for a specific game."""
         page = await context.new_page()
         try:
-            url = game_url if game_url.startswith("http") else f"https://www.twitch.tv{game_url}"
+            url = normalize_twitch_game_url(game_url)
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
             # Scroll to load all streamers
@@ -1188,12 +1599,14 @@ class UserAutomator:
             sb = await self.page.query_selector('[data-a-target="player-settings-button"]')
             if not sb:
                 return
-            await sb.click(); await asyncio.sleep(0.5)
+            await sb.click()
+            await asyncio.sleep(0.5)
             qb = await self.page.query_selector('[data-a-target="player-settings-menu-item-quality"]')
             if qb:
-                await qb.click(); await asyncio.sleep(0.5)
+                await qb.click()
+                await asyncio.sleep(0.5)
                 opts = await self.page.query_selector_all(
-                    '[data-a-target="player-settings-submenu-quality-option"], input[type="radio"]'
+                    '[data-a-target="player-settings-submenu-quality-option"]'
                 )
                 if opts:
                     await opts[-1].click()
@@ -1212,7 +1625,8 @@ class UserAutomator:
         try:
             btn = await self.page.query_selector("#onetrust-accept-btn-handler")
             if btn:
-                await btn.click(); await asyncio.sleep(0.5)
+                await btn.click()
+                await asyncio.sleep(0.5)
         except Exception:
             pass
 

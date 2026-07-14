@@ -26,13 +26,14 @@
     <section class="card card-screencast">
       <div class="card-header">
         <h2>Browser Preview</h2>
+        <span class="badge badge-sm" id="browserBadge" style="display:none"></span>
         <span class="badge" id="streamBadge" style="display:none"></span>
       </div>
       <div class="screencast-wrap">
         <canvas id="screencast" tabindex="1"></canvas>
         <div class="sc-overlay" id="scOverlay">
           <p>Press <strong>Start</strong> to begin.<br>
-          First time? Save your Twitch credentials, then click Log In in the preview.</p>
+          First time? Sign in through the preview, or connect an auth token.</p>
         </div>
       </div>
       <div class="preview-controls">
@@ -51,6 +52,12 @@
           <span class="badge badge-sm" id="twitchStatus">Not linked</span>
         </div>
         <div class="card-body">
+          {% if native_login_enabled %}
+          <button class="btn btn-primary btn-sm btn-block" id="nativeLoginBtn" onclick="openNativeLogin()">Open Twitch Login in Normal Browser</button>
+          <p class="hint-text" id="nativeLoginHint">Recommended for first-time sign-in. Log in in the normal browser window, close it, then press Start.</p>
+          {% else %}
+          <p class="hint-text">Native browser login is available only when the app runs directly on Windows. Connect with an auth token below.</p>
+          {% endif %}
           <div class="field">
             <label>Auth Token</label>
             <input type="text" id="authToken" placeholder="Paste your auth-token here"
@@ -137,12 +144,14 @@
   var overlay = document.getElementById('scOverlay');
   var statusDot = document.getElementById('statusDot');
   var statusMsg = document.getElementById('statusMsg');
+  var browserBadge = document.getElementById('browserBadge');
   var streamBadge = document.getElementById('streamBadge');
   var startBtn = document.getElementById('startBtn');
   var stopBtn  = document.getElementById('stopBtn');
   var watchTimeEl = document.getElementById('watchTime');
   var twitchStatusBadge = document.getElementById('twitchStatus');
   var running = false;
+  var nativeLoginActive = false;
 
   /* ---- screencast ---- */
   var frameImg = new Image();
@@ -163,12 +172,20 @@
   /* ---- status updates ---- */
   socket.on('automation_status', function(s) {
     running = s.running;
+    nativeLoginActive = !!s.native_login_active;
     statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
     var msg = s.message || (running ? 'Running' : 'Stopped');
     statusMsg.textContent = msg;
     statusMsg.className = 'status-text' + (msg.indexOf('2FA') >= 0 || msg.indexOf('verification') >= 0 ? ' status-alert' : '');
-    startBtn.disabled = running;
+    startBtn.disabled = running || nativeLoginActive;
     stopBtn.disabled  = !running;
+
+    if (s.browser_channel) {
+      browserBadge.textContent = s.browser_channel;
+      browserBadge.style.display = '';
+    } else {
+      browserBadge.style.display = 'none';
+    }
 
     // Stream badge
     if (s.stream_name) {
@@ -289,15 +306,58 @@
   window.doStart = function() {
     fetch('/api/start',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
       if(d.success){ startBtn.disabled=true; stopBtn.disabled=false; overlay.innerHTML='<p>Starting…</p>'; }
+      else { statusMsg.textContent = 'Start failed: ' + (d.error || 'Already running'); }
+    }).catch(function() {
+      statusMsg.textContent = 'Start failed: request failed';
     });
   };
   window.doStop = function() {
     fetch('/api/stop',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
       if(d.success){ startBtn.disabled=false; stopBtn.disabled=true; overlay.style.display=''; overlay.innerHTML='<p>Stopped.</p>'; }
+      else { statusMsg.textContent = 'Stop failed: ' + (d.error || 'Not running'); }
+    }).catch(function() {
+      statusMsg.textContent = 'Stop failed: request failed';
     });
   };
 
   /* ---- import auth token ---- */
+  function pollNativeLogin() {
+    if (!nativeLoginActive) return;
+    setTimeout(function() {
+      fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
+        nativeLoginActive = !!s.native_login_active;
+        if (nativeLoginActive) {
+          pollNativeLogin();
+        } else {
+          document.getElementById('nativeLoginHint').textContent = 'Login browser closed. Press Start to verify the saved Twitch session.';
+          startBtn.disabled = false;
+        }
+      }).catch(function() { pollNativeLogin(); });
+    }, 1500);
+  }
+
+  window.openNativeLogin = function() {
+    var btn = document.getElementById('nativeLoginBtn');
+    var hint = document.getElementById('nativeLoginHint');
+    btn.disabled = true;
+    hint.textContent = 'Stopping automation and opening a normal browserâ€¦';
+    fetch('/api/native-login', {method:'POST'}).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) {
+        hint.textContent = d.browser + ' opened. Sign in there, close that window, then press Start.';
+        nativeLoginActive = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = true;
+        pollNativeLogin();
+      } else {
+        hint.textContent = 'Could not open login: ' + (d.error || 'Unknown error');
+      }
+    }).catch(function() {
+      hint.textContent = 'Could not open login: request failed';
+    }).finally(function() {
+      btn.disabled = false;
+    });
+  };
+
   window.importToken = function() {
     var token = document.getElementById('authToken').value.trim();
     if (!token) { alert('Paste your Twitch auth-token first'); return; }
@@ -391,7 +451,9 @@
         screencast_quality: parseInt(document.getElementById('scQuality').value)
       })
     }).then(function(r){return r.json()}).then(function(d){
-      if(d.success) statusMsg.textContent='Settings saved';
+      statusMsg.textContent = d.success ? 'Settings saved' : 'Settings error: ' + (d.error || 'Unknown error');
+    }).catch(function() {
+      statusMsg.textContent = 'Settings error: request failed';
     });
   };
 
@@ -413,9 +475,11 @@
   /* ---- init ---- */
   fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
     running = s.running;
+    nativeLoginActive = !!s.native_login_active;
     statusDot.className = 'status-dot '+(running?'on':'off');
     statusMsg.textContent = s.message||(running?'Running':'Stopped');
-    startBtn.disabled = running; stopBtn.disabled = !running;
+    startBtn.disabled = running || nativeLoginActive; stopBtn.disabled = !running;
+    if (nativeLoginActive) pollNativeLogin();
     if (running) overlay.style.display = 'none';
     if (s.logged_in) {
       twitchStatusBadge.textContent = 'Logged in';
