@@ -81,12 +81,12 @@
       <section class="card">
         <div class="card-header">
           <h2>Games &amp; Streamers</h2>
-          <button class="btn btn-sm btn-outline" onclick="discoverGames()" id="discoverBtn">Browse</button>
+          <button class="btn btn-sm btn-outline" onclick="discoverGames()" id="discoverBtn" disabled>Browse</button>
         </div>
         <div class="card-body">
           <div id="watchTargets"><p class="empty">No games selected.</p></div>
           <div id="gameDiscovery" style="display:none">
-            <p class="hint-text">Select games with active drops:</p>
+            <p class="hint-text">Add a game, or choose a specific eligible channel:</p>
             <div id="gameList" class="game-list"></div>
           </div>
         </div>
@@ -148,10 +148,29 @@
   var streamBadge = document.getElementById('streamBadge');
   var startBtn = document.getElementById('startBtn');
   var stopBtn  = document.getElementById('stopBtn');
+  var discoverBtn = document.getElementById('discoverBtn');
   var watchTimeEl = document.getElementById('watchTime');
   var twitchStatusBadge = document.getElementById('twitchStatus');
   var running = false;
+  var browserReady = false;
   var nativeLoginActive = false;
+
+  function syncRunningControls() {
+    startBtn.disabled = running || nativeLoginActive;
+    stopBtn.disabled = !running;
+    discoverBtn.disabled = !browserReady || nativeLoginActive || discoverBtn.dataset.pending === 'true';
+    document.querySelectorAll('[data-action]').forEach(function(btn) {
+      if (btn.textContent === '✓') {
+        btn.disabled = true;
+      } else if (btn.dataset.pending === 'true') {
+        btn.disabled = true;
+      } else if (btn.dataset.action === 'channels') {
+        btn.disabled = !browserReady || nativeLoginActive;
+      } else {
+        btn.disabled = false;
+      }
+    });
+  }
 
   /* ---- screencast ---- */
   var frameImg = new Image();
@@ -172,13 +191,13 @@
   /* ---- status updates ---- */
   socket.on('automation_status', function(s) {
     running = s.running;
+    browserReady = !!s.browser_ready;
     nativeLoginActive = !!s.native_login_active;
     statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
     var msg = s.message || (running ? 'Running' : 'Stopped');
     statusMsg.textContent = msg;
     statusMsg.className = 'status-text' + (msg.indexOf('2FA') >= 0 || msg.indexOf('verification') >= 0 ? ' status-alert' : '');
-    startBtn.disabled = running || nativeLoginActive;
-    stopBtn.disabled  = !running;
+    syncRunningControls();
 
     if (s.browser_channel) {
       browserBadge.textContent = s.browser_channel;
@@ -239,11 +258,12 @@
     if (s.drops_in_progress && s.drops_in_progress.length) {
       s.drops_in_progress.forEach(function(d) {
         var pct = d.progress || 0;
-        var imgHtml = d.image ? '<img src="'+esc(d.image)+'" class="drop-thumb" alt="">' : '';
+        var imgHtml = d.image ? '<img src="'+escAttr(d.image)+'" class="drop-thumb" alt="">' : '';
+        var gameHtml = d.game ? '<small class="drop-game">' + esc(d.game) + '</small>' : '';
         html += '<div class="drop-item">' +
           '<div class="drop-item-top">' +
             imgHtml +
-            '<span class="drop-name">' + esc(d.name || 'Drop') + '</span>' +
+            '<span class="drop-name">' + esc(d.name || 'Drop') + gameHtml + '</span>' +
             '<span class="drop-pct">' + pct + '%</span>' +
           '</div>' +
           '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
@@ -252,8 +272,9 @@
     }
     if (s.drops_claimed && s.drops_claimed.length) {
       s.drops_claimed.slice(-5).reverse().forEach(function(d) {
+        var gameHtml = d.game ? '<small class="drop-game">' + esc(d.game) + '</small>' : '';
         html += '<div class="drop-item claimed">' +
-          '<span class="drop-name">✓ ' + esc(d.name || 'Drop') + '</span>' +
+          '<span class="drop-name">✓ ' + esc(d.name || 'Drop') + gameHtml + '</span>' +
         '</div>';
       });
     }
@@ -305,7 +326,12 @@
   /* ---- controls ---- */
   window.doStart = function() {
     fetch('/api/start',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
-      if(d.success){ startBtn.disabled=true; stopBtn.disabled=false; overlay.innerHTML='<p>Starting…</p>'; }
+      if(d.success){
+        running = true;
+        browserReady = false;
+        syncRunningControls();
+        overlay.innerHTML='<p>Starting…</p>';
+      }
       else { statusMsg.textContent = 'Start failed: ' + (d.error || 'Already running'); }
     }).catch(function() {
       statusMsg.textContent = 'Start failed: request failed';
@@ -313,7 +339,13 @@
   };
   window.doStop = function() {
     fetch('/api/stop',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
-      if(d.success){ startBtn.disabled=false; stopBtn.disabled=true; overlay.style.display=''; overlay.innerHTML='<p>Stopped.</p>'; }
+      if(d.success){
+        running = false;
+        browserReady = false;
+        syncRunningControls();
+        overlay.style.display='';
+        overlay.innerHTML='<p>Stopped.</p>';
+      }
       else { statusMsg.textContent = 'Stop failed: ' + (d.error || 'Not running'); }
     }).catch(function() {
       statusMsg.textContent = 'Stop failed: request failed';
@@ -326,11 +358,13 @@
     setTimeout(function() {
       fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
         nativeLoginActive = !!s.native_login_active;
+        browserReady = !!s.browser_ready;
+        syncRunningControls();
         if (nativeLoginActive) {
           pollNativeLogin();
         } else {
           document.getElementById('nativeLoginHint').textContent = 'Login browser closed. Press Start to verify the saved Twitch session.';
-          startBtn.disabled = false;
+          syncRunningControls();
         }
       }).catch(function() { pollNativeLogin(); });
     }, 1500);
@@ -345,8 +379,8 @@
       if (d.success) {
         hint.textContent = d.browser + ' opened. Sign in there, close that window, then press Start.';
         nativeLoginActive = true;
-        startBtn.disabled = true;
-        stopBtn.disabled = true;
+        browserReady = false;
+        syncRunningControls();
         pollNativeLogin();
       } else {
         hint.textContent = 'Could not open login: ' + (d.error || 'Unknown error');
@@ -391,7 +425,7 @@
           '<span class="drop-name">' + (done ? '✅ ' : '') + esc(t.game_name) +
           (t.streamer ? ' → ' + esc(t.streamer) : '') +
           (done ? ' <small>(complete)</small>' : '') + '</span>' +
-          '<button class="btn-x" onclick="removeTarget('+t.id+')">&times;</button>' +
+          '<button class="btn-x" data-action="remove" onclick="removeTarget(this,'+t.id+')">&times;</button>' +
         '</div>';
       });
       el.innerHTML = html;
@@ -400,23 +434,38 @@
   loadWatchTargets();
 
   window.discoverGames = function() {
+    if (!browserReady) {
+      statusMsg.textContent = 'Wait for the automation browser to finish launching.';
+      return;
+    }
     var disc = document.getElementById('gameDiscovery');
     if (disc.style.display !== 'none') { disc.style.display = 'none'; return; }
     disc.style.display = '';
     var gl = document.getElementById('gameList');
     gl.innerHTML = '<p class="empty">Loading games…</p>';
+    discoverBtn.dataset.pending = 'true';
+    syncRunningControls();
     fetch('/api/discover-games', {method:'POST'}).then(function(r){return r.json()}).then(function(d) {
       if (!d.success) { gl.innerHTML = '<p class="empty">'+esc(d.error||'Error')+'</p>'; return; }
       if (!d.games.length) { gl.innerHTML = '<p class="empty">No games with drops found.</p>'; return; }
       var html = '';
       d.games.forEach(function(g) {
-        html += '<div class="game-row" data-url="'+esc(g.url)+'" data-name="'+esc(g.name)+'">' +
-          '<span class="game-name">' + esc(g.name) + '</span>' +
-          '<span class="game-viewers">' + esc(g.viewers || '') + '</span>' +
-          '<button class="btn btn-sm btn-success" onclick="addGame(this)">+</button>' +
+        html += '<div class="game-entry">' +
+          '<div class="game-row" data-url="'+escAttr(g.url)+'" data-name="'+escAttr(g.name)+'">' +
+            '<span class="game-name">' + esc(g.name) + '</span>' +
+            '<span class="game-viewers">' + esc(g.viewers || '') + '</span>' +
+            '<button class="btn btn-sm btn-outline" data-action="channels" onclick="discoverStreamers(this)">Channels</button>' +
+            '<button class="btn btn-sm btn-success" data-action="add-game" title="Add any eligible channel" onclick="addGame(this)">+</button>' +
+          '</div>' +
+          '<div class="streamer-list" style="display:none"></div>' +
         '</div>';
       });
       gl.innerHTML = html;
+    }).catch(function() {
+      gl.innerHTML = '<p class="empty">Game discovery request failed.</p>';
+    }).finally(function() {
+      discoverBtn.dataset.pending = 'false';
+      syncRunningControls();
     });
   };
 
@@ -424,20 +473,108 @@
     var row = btn.closest('.game-row');
     var name = row.dataset.name;
     var url = row.dataset.url;
+    btn.dataset.pending = 'true';
+    syncRunningControls();
     fetch('/api/watch-targets', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({game_name: name, game_url: url})
     }).then(function(r){return r.json()}).then(function(d) {
       if (d.success) { btn.textContent = '✓'; btn.disabled = true; loadWatchTargets(); }
+      else { statusMsg.textContent = 'Could not add game: ' + (d.error || 'Unknown error'); }
+    }).catch(function() {
+      statusMsg.textContent = 'Could not add game: request failed';
+    }).finally(function() {
+      btn.dataset.pending = 'false';
+      syncRunningControls();
     });
   };
 
-  window.removeTarget = function(id) {
+  window.discoverStreamers = function(btn) {
+    if (!browserReady) {
+      statusMsg.textContent = 'Wait for the automation browser to finish launching.';
+      return;
+    }
+    var row = btn.closest('.game-row');
+    var list = row.parentElement.querySelector('.streamer-list');
+    if (list.dataset.loaded === 'true') {
+      list.style.display = list.style.display === 'none' ? '' : 'none';
+      return;
+    }
+    list.style.display = '';
+    list.innerHTML = '<p class="empty">Loading eligible channels…</p>';
+    btn.dataset.pending = 'true';
+    syncRunningControls();
+    fetch('/api/discover-streamers', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({game_url: row.dataset.url})
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (!d.success) { list.innerHTML = '<p class="empty">'+esc(d.error||'Error')+'</p>'; return; }
+      if (!d.streamers.length) {
+        list.innerHTML = '<p class="empty">No live Drops Enabled channels found.</p>';
+        list.dataset.loaded = 'true';
+        return;
+      }
+      var html = '';
+      d.streamers.forEach(function(s) {
+        html += '<div class="streamer-row" data-login="'+escAttr(s.name)+'">' +
+          '<span class="streamer-name">@' + esc(s.name) + '</span>' +
+          '<span class="game-viewers">' + esc(s.viewers || '') + '</span>' +
+          '<button class="btn btn-sm btn-success" data-action="add-streamer" onclick="addStreamer(this)">+</button>' +
+        '</div>';
+      });
+      list.innerHTML = html;
+      list.dataset.loaded = 'true';
+    }).catch(function() {
+      list.innerHTML = '<p class="empty">Channel discovery request failed.</p>';
+    }).finally(function() {
+      btn.dataset.pending = 'false';
+      syncRunningControls();
+    });
+  };
+
+  window.addStreamer = function(btn) {
+    var entry = btn.closest('.game-entry');
+    var game = entry.querySelector('.game-row');
+    var streamer = btn.closest('.streamer-row').dataset.login;
+    btn.dataset.pending = 'true';
+    syncRunningControls();
+    fetch('/api/watch-targets', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        game_name: game.dataset.name,
+        game_url: game.dataset.url,
+        streamer: streamer
+      })
+    }).then(function(r){return r.json()}).then(function(d) {
+      if (d.success) { btn.textContent = '✓'; btn.disabled = true; loadWatchTargets(); }
+      else { statusMsg.textContent = 'Could not add channel: ' + (d.error || 'Unknown error'); }
+    }).catch(function() {
+      statusMsg.textContent = 'Could not add channel: request failed';
+    }).finally(function() {
+      btn.dataset.pending = 'false';
+      syncRunningControls();
+    });
+  };
+
+  window.removeTarget = function(btn, id) {
+    btn.dataset.pending = 'true';
+    syncRunningControls();
     fetch('/api/watch-targets', {
       method:'DELETE', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({id: id})
     }).then(function(r){return r.json()}).then(function(d) {
-      if (d.success) loadWatchTargets();
+      if (d.success) {
+        loadWatchTargets();
+        document.getElementById('gameDiscovery').style.display = 'none';
+        document.getElementById('gameList').innerHTML = '';
+      } else {
+        statusMsg.textContent = 'Could not remove target: ' + (d.error || 'Unknown error');
+      }
+    }).catch(function() {
+      statusMsg.textContent = 'Could not remove target: request failed';
+    }).finally(function() {
+      btn.dataset.pending = 'false';
+      syncRunningControls();
     });
   };
 
@@ -463,8 +600,9 @@
       if (!list.length) return;
       var html = '';
       list.slice(0,20).forEach(function(d) {
+        var gameHtml = d.game ? '<small class="drop-game">' + esc(d.game) + '</small>' : '';
         html += '<div class="drop-row '+(d.status==='claimed'?'claimed':'')+'">' +
-          '<span class="drop-name">'+ esc(d.name||'Drop')+'</span>' +
+          '<span class="drop-name">'+ esc(d.name||'Drop') + gameHtml + '</span>' +
           '<span class="drop-pct">'+(d.status==='claimed'?'Claimed':(d.progress||0)+'%')+'</span></div>';
       });
       document.getElementById('historyBody').innerHTML = html;
@@ -475,10 +613,11 @@
   /* ---- init ---- */
   fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
     running = s.running;
+    browserReady = !!s.browser_ready;
     nativeLoginActive = !!s.native_login_active;
     statusDot.className = 'status-dot '+(running?'on':'off');
     statusMsg.textContent = s.message||(running?'Running':'Stopped');
-    startBtn.disabled = running || nativeLoginActive; stopBtn.disabled = !running;
+    syncRunningControls();
     if (nativeLoginActive) pollNativeLogin();
     if (running) overlay.style.display = 'none';
     if (s.logged_in) {
@@ -491,6 +630,14 @@
   });
 
   function esc(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+  function escAttr(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
 })();
 </script>
 {% endblock %}

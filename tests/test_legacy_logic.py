@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import twitch_drop_automator as legacy
 
@@ -160,6 +160,240 @@ class LegacyNameResolutionRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, (False, False))
         self.assertIn("examplestreamer", completed_streamers)
         claimed_check.assert_awaited_once()
+
+
+class LegacyTargetSelectionTests(unittest.IsolatedAsyncioTestCase):
+    def test_rust_detection_uses_exact_game_identity(self):
+        self.assertTrue(legacy.is_rust_game_preference({
+            "game": "Rust",
+            "game_url": "https://www.twitch.tv/directory/category/rust",
+        }))
+        self.assertFalse(legacy.is_rust_game_preference({
+            "game": "Trust No One",
+            "game_url": "https://www.twitch.tv/directory/category/trust-no-one",
+        }))
+        self.assertFalse(legacy.is_rust_game_preference({
+            "game": "Rusty Lake Paradise",
+            "game_url": "https://www.twitch.tv/directory/category/rusty-lake-paradise",
+        }))
+
+    def test_selected_streamer_login_does_not_fuzzy_match_another_channel(self):
+        game = {"streamers": {"streamerone": True}}
+
+        self.assertTrue(legacy.is_streamer_allowed_for_game_preference(
+            game,
+            "StreamerOne",
+            "https://www.twitch.tv/streamerone",
+        ))
+        self.assertFalse(legacy.is_streamer_allowed_for_game_preference(
+            game,
+            "StreamerTwo",
+            "https://www.twitch.tv/streamertwo",
+        ))
+
+    def test_legacy_game_url_normalizer_rejects_external_or_local_urls(self):
+        self.assertEqual(
+            legacy._normalize_game_directory_url("rust"),
+            "https://www.twitch.tv/directory/category/rust",
+        )
+        for value in (
+            "http://www.twitch.tv/directory/category/rust",
+            "https://evil.example/directory/category/rust",
+            "https://127.0.0.1/directory/category/rust",
+        ):
+            self.assertEqual(legacy._normalize_game_directory_url(value), "")
+
+    def test_legacy_channel_parser_rejects_external_or_reserved_urls(self):
+        self.assertEqual(
+            legacy._extract_channel_login("https://www.twitch.tv/Example_Channel"),
+            "example_channel",
+        )
+        self.assertIsNone(legacy._extract_channel_login("https://evil.example/channel"))
+        self.assertIsNone(legacy._extract_channel_login("https://www.twitch.tv/directory"))
+
+    async def test_non_drops_streams_are_never_selected(self):
+        enabled = [{
+            "game": "Example",
+            "game_url": "https://www.twitch.tv/directory/category/example",
+        }]
+        non_drops = [{
+            "streamer": "popular",
+            "stream_url": "https://www.twitch.tv/popular",
+            "has_drops": False,
+            "viewer_score": 1000,
+        }]
+
+        with patch.object(
+            legacy,
+            "fetch_live_drops_streamers_for_game",
+            AsyncMock(return_value=non_drops),
+        ):
+            self.assertIsNone(await legacy.pick_live_stream_from_enabled_games(object(), enabled))
+
+    async def test_rust_picker_reads_drops_from_accessible_tag_label(self):
+        link = MagicMock()
+        link.get_attribute = AsyncMock(return_value="/preferred")
+        tag = MagicMock()
+        tag.inner_text = AsyncMock(return_value="")
+        tag.get_attribute = AsyncMock(
+            side_effect=lambda name: "Tag, DropsEnabled" if name == "aria-label" else None
+        )
+        card = MagicMock()
+        card.query_selector = AsyncMock(return_value=link)
+        card.query_selector_all = AsyncMock(return_value=[tag])
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[card])
+        page.wait_for_timeout = AsyncMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+
+        with (
+            patch.object(legacy, "goto_with_exit", AsyncMock()),
+            patch.object(legacy, "maybe_accept_cookies", AsyncMock()),
+        ):
+            selected = await legacy.pick_live_rust_stream_with_drops(
+                context,
+                preferred_streamers=["preferred"],
+            )
+
+        self.assertEqual(selected, "https://www.twitch.tv/preferred")
+
+    async def test_drops_stream_beats_ineligible_higher_viewer_channel(self):
+        enabled = [{
+            "game": "Example",
+            "game_url": "https://www.twitch.tv/directory/category/example",
+        }]
+        streams = [
+            {
+                "streamer": "popular",
+                "stream_url": "https://www.twitch.tv/popular",
+                "has_drops": False,
+                "viewer_score": 1000,
+            },
+            {
+                "streamer": "eligible",
+                "stream_url": "https://www.twitch.tv/eligible",
+                "has_drops": True,
+                "viewer_score": 10,
+            },
+        ]
+
+        with patch.object(
+            legacy,
+            "fetch_live_drops_streamers_for_game",
+            AsyncMock(return_value=streams),
+        ):
+            selected = await legacy.pick_live_stream_from_enabled_games(object(), enabled)
+
+        self.assertEqual(selected["streamer"], "eligible")
+
+    async def test_legacy_playback_stops_when_mature_gate_cannot_clear(self):
+        page = MagicMock()
+        page.wait_for_selector = AsyncMock()
+
+        with patch.object(
+            legacy,
+            "accept_mature_content_gate",
+            AsyncMock(return_value=False),
+        ):
+            self.assertFalse(await legacy.ensure_stream_playing(page))
+
+        page.wait_for_selector.assert_not_awaited()
+
+    async def test_legacy_playback_requires_a_loaded_video(self):
+        page = MagicMock()
+        page.wait_for_selector = AsyncMock(side_effect=TimeoutError)
+        page.get_attribute = AsyncMock(return_value="0")
+        page.hover = AsyncMock(side_effect=RuntimeError)
+        page.query_selector = AsyncMock(return_value=None)
+
+        with patch.object(
+            legacy,
+            "accept_mature_content_gate",
+            AsyncMock(return_value=True),
+        ):
+            self.assertFalse(await legacy.ensure_stream_playing(page))
+
+    async def test_selected_stream_must_match_channel_game_and_drops(self):
+        target = {
+            "stream_url": "https://www.twitch.tv/expected",
+            "game_url": "https://www.twitch.tv/directory/category/example",
+        }
+        metadata = {
+            "login": "expected",
+            "game_url": "https://www.twitch.tv/directory/game/example",
+            "drops_enabled": True,
+        }
+
+        with patch.object(
+            legacy,
+            "read_twitch_channel_metadata",
+            AsyncMock(return_value=metadata),
+        ):
+            self.assertTrue(await legacy.selected_stream_matches_target(object(), target))
+
+        metadata["login"] = "redirected"
+        with patch.object(
+            legacy,
+            "read_twitch_channel_metadata",
+            AsyncMock(return_value=metadata),
+        ):
+            self.assertFalse(await legacy.selected_stream_matches_target(object(), target))
+
+    async def test_selected_game_cycle_stops_when_video_stalls(self):
+        target = {
+            "game": "Example",
+            "streamer": "expected",
+            "stream_url": "https://www.twitch.tv/expected",
+            "game_url": "https://www.twitch.tv/directory/category/example",
+        }
+        page = MagicMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+
+        with (
+            patch.object(
+                legacy,
+                "pick_live_stream_from_enabled_games",
+                AsyncMock(return_value=target),
+            ),
+            patch.object(legacy, "goto_with_exit", AsyncMock()),
+            patch.object(legacy, "maybe_accept_cookies", AsyncMock()),
+            patch.object(legacy, "ensure_stream_playing", AsyncMock(return_value=True)),
+            patch.object(
+                legacy,
+                "selected_stream_matches_target",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(legacy, "ensure_live_video_playing", AsyncMock(return_value=False)),
+            patch.object(legacy, "set_low_quality", AsyncMock()),
+            patch.object(legacy, "send_notification"),
+            patch.object(legacy, "update_current_working_item"),
+        ):
+            result = await legacy.watch_selected_games_cycle(
+                context,
+                object(),
+                [{"game": "Example"}],
+            )
+
+        self.assertFalse(result)
+        page.close.assert_awaited_once_with()
+
+
+class LegacyWebApiTests(unittest.TestCase):
+    def test_streamer_endpoint_rejects_external_game_url(self):
+        app, _ = legacy.create_web_app()
+        client = app.test_client()
+
+        response = client.get(
+            "/api/games/streamers",
+            query_string={"game_url": "https://evil.example/directory/category/rust"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["success"])
 
 
 if __name__ == "__main__":

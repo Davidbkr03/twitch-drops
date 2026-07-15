@@ -1,10 +1,11 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from app import create_app
 from app.automator import (
+    _STREAM_CARD_EXTRACTOR_JS,
     AutomationManager,
     TWITCH_INVENTORY_URL,
     UserAutomator,
@@ -20,6 +21,17 @@ from app.extensions import db
 from app.models import DropLog, User
 from app.process_lock import ProcessLock, ProcessLockError
 from app.routes import _resolve_discovery_future
+from app.twitch_pages import (
+    CHANNEL_METADATA_JS,
+    MATURE_ACCEPT_SELECTORS,
+    MATURE_GATE_SELECTOR,
+    accept_mature_content_gate,
+    collect_virtualized_cards,
+    ensure_live_video_playing,
+    normalize_twitch_channel_login,
+    twitch_channel_login_from_url,
+    twitch_directories_match,
+)
 
 
 class WebAppTestCase(unittest.TestCase):
@@ -122,6 +134,15 @@ class WebAppTestCase(unittest.TestCase):
         self.assertNotIn(b"id=\"nativeLoginBtn\"", response.data)
         self.assertIn(b"Connect with an auth token below", response.data)
 
+    def test_dashboard_exposes_eligible_streamer_discovery(self):
+        self.register()
+
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"discoverStreamers", response.data)
+        self.assertIn(b"/api/discover-streamers", response.data)
+
     def test_native_login_requires_local_same_origin_request(self):
         self.register()
 
@@ -216,6 +237,48 @@ class WebAppTestCase(unittest.TestCase):
             "https://www.twitch.tv/directory/category/rust?tl=drops",
         )
 
+    def test_watch_target_requires_a_usable_game_directory(self):
+        self.register()
+
+        response = self.client.post(
+            "/api/watch-targets",
+            json={"game_name": "Rust", "streamer": "oilrats"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("game_url", response.get_json()["error"])
+
+    def test_watch_target_normalizes_streamer_and_deduplicates(self):
+        self.register()
+        payload = {
+            "game_name": "Rust",
+            "game_url": "https://www.twitch.tv/directory/category/rust",
+            "streamer": "https://www.twitch.tv/Oilrats?ref=test",
+        }
+
+        first = self.client.post("/api/watch-targets", json=payload)
+        second = self.client.post("/api/watch-targets", json=payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.get_json()["existing"])
+        targets = self.client.get("/api/watch-targets").get_json()
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["streamer"], "oilrats")
+
+    def test_watch_target_rejects_reserved_or_malformed_streamer(self):
+        self.register()
+        for streamer in ("drops", "channel/videos", "https://evil.example/oilrats"):
+            response = self.client.post(
+                "/api/watch-targets",
+                json={
+                    "game_name": "Rust",
+                    "game_url": "https://www.twitch.tv/directory/category/rust",
+                    "streamer": streamer,
+                },
+            )
+            self.assertEqual(response.status_code, 400)
+
     def test_claim_transitions_existing_history_without_hardcoded_game(self):
         self.register()
         with self.app.app_context():
@@ -241,6 +304,136 @@ class WebAppTestCase(unittest.TestCase):
             self.assertEqual(rows[0].progress, 100)
             self.assertIsNone(rows[0].game)
             self.assertIsNotNone(rows[0].claimed_at)
+
+    def test_same_named_drops_are_kept_separate_by_game(self):
+        self.register()
+        with self.app.app_context():
+            user = User.query.filter_by(username="tester").one()
+            automator = UserAutomator(user.id, "unused", MagicMock(), self.app)
+
+            automator._persist_drops(
+                [
+                    {"name": "Shared Reward", "game": "Rust", "progress": 10},
+                    {"name": "Shared Reward", "game": "Warframe", "progress": 20},
+                ],
+                [],
+            )
+
+            rows = DropLog.query.filter_by(user_id=user.id).order_by(DropLog.game).all()
+            self.assertEqual(
+                [(row.game, row.progress) for row in rows],
+                [("Rust", 10), ("Warframe", 20)],
+            )
+
+    def test_repeated_claim_event_does_not_duplicate_history(self):
+        self.register()
+        with self.app.app_context():
+            user = User.query.filter_by(username="tester").one()
+            automator = UserAutomator(user.id, "unused", MagicMock(), self.app)
+            claimed = [{"name": "Shared Reward", "game": "Rust"}]
+
+            automator._persist_drops([], claimed)
+            automator._persist_drops([], claimed)
+
+            rows = DropLog.query.filter_by(
+                user_id=user.id,
+                drop_name="Shared Reward",
+                game="Rust",
+                status="claimed",
+            ).all()
+            self.assertEqual(len(rows), 1)
+
+    def test_game_less_claim_transitions_unique_game_scoped_progress(self):
+        self.register()
+        with self.app.app_context():
+            user = User.query.filter_by(username="tester").one()
+            db.session.add(DropLog(
+                user_id=user.id,
+                drop_name="Shared Reward",
+                game="Rust",
+                status="in_progress",
+                progress=75,
+            ))
+            db.session.commit()
+            automator = UserAutomator(user.id, "unused", MagicMock(), self.app)
+
+            automator._persist_drops(
+                [],
+                [{"name": "Shared Reward", "game": None}],
+            )
+
+            rows = DropLog.query.filter_by(user_id=user.id).all()
+            self.assertEqual(
+                [(row.game, row.status, row.progress) for row in rows],
+                [("Rust", "claimed", 100)],
+            )
+
+    def test_claimed_item_is_not_reinserted_as_progress_in_same_scrape(self):
+        self.register()
+        with self.app.app_context():
+            user = User.query.filter_by(username="tester").one()
+            automator = UserAutomator(user.id, "unused", MagicMock(), self.app)
+
+            automator._persist_drops(
+                [{"name": "Shared Reward", "game": "Rust", "progress": 100}],
+                [{"name": "Shared Reward", "game": None}],
+            )
+
+            rows = DropLog.query.filter_by(user_id=user.id).all()
+            self.assertEqual(
+                [(row.game, row.status, row.progress) for row in rows],
+                [("Rust", "claimed", 100)],
+            )
+
+    def test_game_less_progress_uses_claims_inferred_game_in_same_scrape(self):
+        self.register()
+        with self.app.app_context():
+            user = User.query.filter_by(username="tester").one()
+            db.session.add(DropLog(
+                user_id=user.id,
+                drop_name="Shared Reward",
+                game="Rust",
+                status="in_progress",
+                progress=75,
+            ))
+            db.session.commit()
+            automator = UserAutomator(user.id, "unused", MagicMock(), self.app)
+
+            automator._persist_drops(
+                [{"name": "Shared Reward", "game": None, "progress": 100}],
+                [{"name": "Shared Reward", "game": None}],
+            )
+
+            rows = DropLog.query.filter_by(user_id=user.id).all()
+            self.assertEqual(
+                [(row.game, row.status, row.progress) for row in rows],
+                [("Rust", "claimed", 100)],
+            )
+
+    def test_game_less_repeat_claim_reuses_unique_scoped_claim(self):
+        self.register()
+        with self.app.app_context():
+            user = User.query.filter_by(username="tester").one()
+            db.session.add(DropLog(
+                user_id=user.id,
+                drop_name="Shared Reward",
+                game="Rust",
+                status="claimed",
+                progress=100,
+            ))
+            db.session.commit()
+            automator = UserAutomator(user.id, "unused", MagicMock(), self.app)
+
+            automator._persist_drops(
+                [],
+                [{"name": "Shared Reward", "game": None}],
+            )
+
+            rows = DropLog.query.filter_by(user_id=user.id).all()
+            self.assertEqual(
+                [(row.game, row.status, row.progress) for row in rows],
+                [("Rust", "claimed", 100)],
+            )
 
     def test_discovery_timeout_cancels_background_work(self):
         future = MagicMock()
@@ -365,6 +558,20 @@ class LifecycleTestCase(unittest.TestCase):
 
         self.assertEqual(automator._completed_games, {"Warframe"})
 
+    def test_legacy_game_directory_campaign_alias_marks_target_complete(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        automator._load_watch_targets = MagicMock(return_value=[{
+            "game_name": "Warframe",
+            "game_url": "https://www.twitch.tv/directory/category/warframe",
+        }])
+
+        automator._detect_completed_games(campaigns=[{
+            "gamePath": "/directory/game/warframe",
+            "complete": True,
+        }])
+
+        self.assertEqual(automator._completed_games, {"Warframe"})
+
     def test_mixed_campaign_records_keep_game_active(self):
         automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
         automator._completed_games.add("Warframe")
@@ -463,13 +670,150 @@ class InventoryPageTestCase(unittest.IsolatedAsyncioTestCase):
         gate = MagicMock()
         gate.text_content = AsyncMock(return_value="Mature content warning")
         video = MagicMock()
+        video.evaluate = AsyncMock(return_value={"ended": False, "readyState": 4})
         automator.page = MagicMock()
         automator.page.url = "https://www.twitch.tv/example"
         automator.page.query_selector = AsyncMock(side_effect=[gate, video])
-        automator._accept_mature_content = AsyncMock()
+        automator._accept_mature_content = AsyncMock(return_value=True)
 
         self.assertTrue(await automator._is_stream_live())
         automator._accept_mature_content.assert_awaited_once_with()
+
+    async def test_uncleared_mature_gate_is_not_counted_as_live(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        gate = MagicMock()
+        gate.text_content = AsyncMock(return_value="Continue Watching mature content")
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/example"
+        automator.page.query_selector = AsyncMock(return_value=gate)
+        automator._accept_mature_content = AsyncMock(return_value=False)
+
+        self.assertFalse(await automator._is_stream_live())
+        self.assertEqual(automator.page.query_selector.await_count, 1)
+
+    async def test_channel_name_with_reserved_prefix_can_be_live(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        video = MagicMock()
+        video.evaluate = AsyncMock(return_value={"ended": False, "readyState": 4})
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/dropship"
+        automator.page.query_selector = AsyncMock(side_effect=[None, video])
+
+        self.assertTrue(await automator._is_stream_live())
+
+    async def test_unloaded_video_is_not_treated_as_live(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        video = MagicMock()
+        video.evaluate = AsyncMock(return_value={
+            "ended": False,
+            "paused": False,
+            "readyState": 0,
+            "error": False,
+        })
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/example"
+        automator.page.query_selector = AsyncMock(
+            side_effect=lambda selector: (
+                None if selector == MATURE_GATE_SELECTOR else video
+            )
+        )
+
+        with patch("app.twitch_pages.asyncio.sleep", new=AsyncMock()):
+            self.assertFalse(await automator._is_stream_live())
+
+    async def test_paused_video_that_cannot_resume_is_not_live(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        video = MagicMock()
+        video.evaluate = AsyncMock(side_effect=[{
+            "ended": False,
+            "paused": True,
+            "readyState": 4,
+            "error": False,
+        }, False])
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/example"
+        automator.page.query_selector = AsyncMock(side_effect=[None, video])
+
+        self.assertFalse(await automator._is_stream_live())
+
+    async def test_mature_video_waits_until_playable_after_gate_clears(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        gate = MagicMock()
+        gate.is_visible = AsyncMock(return_value=True)
+        gate.text_content = AsyncMock(return_value="Continue Watching mature content")
+        video = MagicMock()
+        video.evaluate = AsyncMock(side_effect=[
+            {"ended": False, "paused": False, "readyState": 0, "error": False},
+            {"ended": False, "paused": False, "readyState": 1, "error": False},
+            {"ended": False, "paused": False, "readyState": 4, "error": False},
+        ])
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/example"
+        automator.page.query_selector = AsyncMock(
+            side_effect=lambda selector: (
+                gate if selector == MATURE_GATE_SELECTOR else video
+            )
+        )
+        automator._accept_mature_content = AsyncMock(return_value=True)
+
+        with patch("app.twitch_pages.asyncio.sleep", new=AsyncMock()):
+            self.assertTrue(await automator._is_stream_live())
+
+    async def test_hidden_offline_overlay_does_not_override_playing_video(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        gate = MagicMock()
+        gate.is_visible = AsyncMock(return_value=False)
+        gate.text_content = AsyncMock(return_value="This channel is offline")
+        video = MagicMock()
+        video.evaluate = AsyncMock(return_value={
+            "ended": False,
+            "paused": False,
+            "readyState": 4,
+            "error": False,
+        })
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/example"
+        automator.page.query_selector = AsyncMock(side_effect=[gate, video])
+
+        self.assertTrue(await automator._is_stream_live())
+
+    async def test_channel_vod_is_not_treated_as_live(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/oilrats/videos/123"
+        automator.page.query_selector = AsyncMock()
+
+        self.assertFalse(await automator._is_stream_live())
+        automator.page.query_selector.assert_not_awaited()
+
+    async def test_channel_metadata_uses_channel_identity_and_actual_game(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        automator.page = MagicMock()
+        automator.page.url = "https://www.twitch.tv/oilrats"
+        automator.page.evaluate = AsyncMock(return_value={
+            "url": "https://www.twitch.tv/oilrats",
+            "displayName": "Oilrats",
+            "gameName": "Rust",
+            "gameUrl": "https://www.twitch.tv/directory/category/rust",
+            "dropsEnabled": True,
+            "streamTitle": "This must not become the streamer name",
+        })
+
+        metadata = await automator._read_channel_metadata()
+
+        self.assertEqual(metadata["login"], "oilrats")
+        self.assertEqual(metadata["display_name"], "Oilrats")
+        self.assertEqual(metadata["game_name"], "Rust")
+        self.assertTrue(automator._stream_matches_target(
+            metadata,
+            "https://www.twitch.tv/directory/category/rust",
+            "oilrats",
+        ))
+        self.assertFalse(automator._stream_matches_target(
+            metadata,
+            "https://www.twitch.tv/directory/category/warframe",
+            "oilrats",
+        ))
 
     async def test_completed_current_game_switches_without_live_check(self):
         automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
@@ -493,6 +837,7 @@ class InventoryPageTestCase(unittest.IsolatedAsyncioTestCase):
         automator._update_status.assert_called_once_with(
             watching=None,
             watching_game=None,
+            watching_game_url=None,
             stream_name=None,
             message="Warframe campaign complete — finding another…",
         )
@@ -502,9 +847,15 @@ class InventoryPageTestCase(unittest.IsolatedAsyncioTestCase):
         automator.status.update({
             "watching": "https://www.twitch.tv/example",
             "watching_game": "Warframe",
+            "watching_game_url": "https://www.twitch.tv/directory/category/warframe",
             "stream_name": "example",
         })
         automator._is_stream_live = AsyncMock(return_value=True)
+        automator._read_channel_metadata = AsyncMock(return_value={
+            "login": "example",
+            "game_url": "https://www.twitch.tv/directory/category/warframe",
+            "drops_enabled": True,
+        })
         automator._update_watch_time = MagicMock()
         automator._update_status = MagicMock()
         automator._find_best_stream = AsyncMock()
@@ -514,8 +865,67 @@ class InventoryPageTestCase(unittest.IsolatedAsyncioTestCase):
         await automator._watch_loop_cycle()
 
         automator._is_stream_live.assert_awaited_once_with()
+        automator._read_channel_metadata.assert_awaited_once_with()
         automator._find_best_stream.assert_not_awaited()
         automator._sleep.assert_awaited_once_with(30)
+
+    async def test_current_stream_switches_after_category_change(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        automator.status.update({
+            "watching": "https://www.twitch.tv/example",
+            "watching_game": "Warframe",
+            "watching_game_url": "https://www.twitch.tv/directory/category/warframe",
+            "stream_name": "example",
+        })
+        automator._is_stream_live = AsyncMock(return_value=True)
+        automator._read_channel_metadata = AsyncMock(return_value={
+            "login": "example",
+            "game_url": "https://www.twitch.tv/directory/category/rust",
+            "drops_enabled": True,
+        })
+        automator._stop_watch_timer = MagicMock()
+        automator._update_status = MagicMock()
+        automator._find_best_stream = AsyncMock()
+        automator._sleep = AsyncMock()
+
+        await automator._watch_loop_cycle()
+
+        automator._stop_watch_timer.assert_called_once_with()
+        automator._find_best_stream.assert_awaited_once_with()
+        automator._update_status.assert_called_once_with(
+            watching=None,
+            watching_game=None,
+            watching_game_url=None,
+            stream_name=None,
+            message=(
+                "Stream redirected, changed category, or lost Drops Enabled "
+                "— finding another…"
+            ),
+        )
+
+    async def test_current_stream_switches_after_channel_redirect(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        automator.status.update({
+            "watching": "https://www.twitch.tv/original",
+            "watching_game": "Warframe",
+            "watching_game_url": "https://www.twitch.tv/directory/category/warframe",
+            "stream_name": "Original",
+        })
+        automator._is_stream_live = AsyncMock(return_value=True)
+        automator._read_channel_metadata = AsyncMock(return_value={
+            "login": "raid_target",
+            "game_url": "https://www.twitch.tv/directory/category/warframe",
+            "drops_enabled": True,
+        })
+        automator._stop_watch_timer = MagicMock()
+        automator._update_status = MagicMock()
+        automator._find_best_stream = AsyncMock()
+        automator._sleep = AsyncMock()
+
+        await automator._watch_loop_cycle()
+
+        automator._stop_watch_timer.assert_called_once_with()
+        automator._find_best_stream.assert_awaited_once_with()
 
     async def test_stream_selection_skips_cards_without_drops_enabled(self):
         automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
@@ -524,9 +934,61 @@ class InventoryPageTestCase(unittest.IsolatedAsyncioTestCase):
             "game_url": "https://www.twitch.tv/directory/category/example",
         }])
         automator.page = MagicMock()
-        automator.page.evaluate = AsyncMock(return_value=["/eligible-channel"])
-        automator.page.query_selector = AsyncMock(return_value=None)
-        automator._goto = AsyncMock()
+        candidates = [
+            {
+                "login": "wrong-channel",
+                "url": "https://www.twitch.tv/wrong-channel",
+                "drops": False,
+            },
+            {
+                "login": "eligible_channel",
+                "url": "https://www.twitch.tv/eligible_channel",
+                "drops": True,
+            },
+        ]
+        automator._goto = AsyncMock(return_value=True)
+        automator._is_stream_live = AsyncMock(return_value=True)
+        automator._read_channel_metadata = AsyncMock(return_value={
+            "login": "eligible_channel",
+            "display_name": "Eligible_Channel",
+            "url": "https://www.twitch.tv/eligible_channel",
+            "game_name": "Example",
+            "game_url": "https://www.twitch.tv/directory/category/example",
+            "drops_enabled": True,
+        })
+        automator._start_watching = AsyncMock(return_value=True)
+        automator._update_status = MagicMock()
+
+        with (
+            patch("app.automator.asyncio.sleep", new=AsyncMock()),
+            patch(
+                "app.automator.collect_virtualized_cards",
+                new=AsyncMock(return_value=candidates),
+            ),
+        ):
+            await automator._find_best_stream()
+
+        automator._goto.assert_any_await("https://www.twitch.tv/eligible_channel")
+        self.assertNotIn(
+            call("https://www.twitch.tv/wrong-channel"),
+            automator._goto.await_args_list,
+        )
+        automator._start_watching.assert_awaited_once_with(
+            "Eligible_Channel",
+            "https://www.twitch.tv/eligible_channel",
+            "Example",
+            "https://www.twitch.tv/directory/category/example",
+        )
+
+    async def test_failed_preferred_navigation_cannot_reuse_old_live_page(self):
+        automator = UserAutomator(1, "unused", MagicMock(), MagicMock())
+        automator._load_watch_targets = MagicMock(return_value=[{
+            "game_name": "Rust",
+            "game_url": "https://www.twitch.tv/directory/category/rust",
+            "streamer": "oilrats",
+        }])
+        automator._goto = AsyncMock(return_value=False)
+        automator._read_channel_metadata = AsyncMock()
         automator._is_stream_live = AsyncMock(return_value=True)
         automator._start_watching = AsyncMock()
         automator._update_status = MagicMock()
@@ -534,14 +996,197 @@ class InventoryPageTestCase(unittest.IsolatedAsyncioTestCase):
         with patch("app.automator.asyncio.sleep", new=AsyncMock()):
             await automator._find_best_stream()
 
-        evaluate_args = automator.page.evaluate.await_args.args
-        self.assertFalse(evaluate_args[1])
-        automator._goto.assert_any_await("https://www.twitch.tv/eligible-channel")
-        automator._start_watching.assert_awaited_once_with(
-            "eligible-channel",
-            "https://www.twitch.tv/eligible-channel",
-            "Example",
+        automator._goto.assert_awaited_once_with("https://www.twitch.tv/oilrats")
+        automator._read_channel_metadata.assert_not_awaited()
+        automator._is_stream_live.assert_not_awaited()
+        automator._start_watching.assert_not_awaited()
+
+
+class TwitchPageHelperTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_video_readiness_waits_for_video_element_to_mount(self):
+        video = MagicMock()
+        video.evaluate = AsyncMock(return_value={
+            "ended": False,
+            "paused": False,
+            "readyState": 4,
+            "error": False,
+        })
+        page = MagicMock()
+        page.query_selector = AsyncMock(side_effect=[None, None, video])
+
+        with patch("app.twitch_pages.asyncio.sleep", new=AsyncMock()):
+            self.assertTrue(await ensure_live_video_playing(page))
+
+        self.assertEqual(page.query_selector.await_count, 3)
+
+    def test_twitch_tag_extractors_read_accessible_label(self):
+        self.assertIn("getAttribute('aria-label')", CHANNEL_METADATA_JS)
+        self.assertIn("getAttribute('aria-label')", _STREAM_CARD_EXTRACTOR_JS)
+
+    async def test_current_continue_watching_button_clears_mature_gate(self):
+        gate = MagicMock()
+        button = MagicMock()
+        gate_active = True
+
+        def clear_gate():
+            nonlocal gate_active
+            gate_active = False
+
+        button.click = AsyncMock(side_effect=clear_gate)
+        page = MagicMock()
+
+        def query(selector):
+            if selector == MATURE_GATE_SELECTOR:
+                return gate if gate_active else None
+            if selector == MATURE_ACCEPT_SELECTORS[1]:
+                return button
+            return None
+
+        page.query_selector = AsyncMock(side_effect=query)
+        page.wait_for_selector = AsyncMock()
+
+        self.assertTrue(await accept_mature_content_gate(page))
+        button.click.assert_awaited_once_with()
+        page.wait_for_selector.assert_awaited_once_with(
+            MATURE_GATE_SELECTOR,
+            state="hidden",
+            timeout=5000,
         )
+
+    async def test_unknown_gate_without_accept_button_stays_blocked(self):
+        gate = MagicMock()
+        page = MagicMock()
+        page.query_selector = AsyncMock(
+            side_effect=lambda selector: gate if selector == MATURE_GATE_SELECTOR else None
+        )
+
+        self.assertFalse(await accept_mature_content_gate(page))
+
+    async def test_hidden_retained_gate_does_not_block_playback(self):
+        gate = MagicMock()
+        gate.is_visible = AsyncMock(return_value=False)
+        page = MagicMock()
+        page.query_selector = AsyncMock(return_value=gate)
+
+        self.assertTrue(await accept_mature_content_gate(page))
+        self.assertEqual(page.query_selector.await_count, 1)
+
+    async def test_virtualized_cards_are_accumulated_and_eligibility_is_upgraded(self):
+        class FakePage:
+            def __init__(self):
+                self.index = 0
+                self.batches = [
+                    [{"login": "first", "drops": False}],
+                    [
+                        {"login": "first", "drops": True},
+                        {"login": "second", "drops": True},
+                    ],
+                    [{"login": "third", "drops": True}],
+                ]
+
+            async def evaluate(self, script):
+                if script == "extract":
+                    return self.batches[self.index]
+                if script == "document.body.scrollHeight":
+                    return 1000 + self.index
+                if script == "window.scrollTo(0, document.body.scrollHeight)":
+                    self.index += 1
+                    return None
+                raise AssertionError(f"Unexpected script: {script}")
+
+        with patch("app.twitch_pages.asyncio.sleep", new=AsyncMock()):
+            cards = await collect_virtualized_cards(
+                FakePage(),
+                "extract",
+                key=lambda item: item.get("login"),
+                max_scrolls=2,
+            )
+
+        self.assertEqual([card["login"] for card in cards], ["first", "second", "third"])
+        self.assertTrue(cards[0]["drops"])
+
+    async def test_streamer_discovery_returns_only_valid_drops_channels(self):
+        page = MagicMock()
+        page.url = "https://www.twitch.tv/directory/category/example"
+        page.goto = AsyncMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        discovered = [
+            {
+                "login": "eligible_channel",
+                "viewers": "123 viewers",
+                "drops": True,
+                "gameUrl": "",
+            },
+            {
+                "login": "wrong_game",
+                "viewers": "500 viewers",
+                "drops": True,
+                "gameUrl": "https://www.twitch.tv/directory/category/other",
+            },
+            {
+                "login": "ordinary_channel",
+                "viewers": "999 viewers",
+                "drops": False,
+                "gameUrl": "https://www.twitch.tv/directory/category/example",
+            },
+            {
+                "login": "directory",
+                "viewers": "1 viewer",
+                "drops": True,
+                "gameUrl": "https://www.twitch.tv/directory/category/example",
+            },
+        ]
+
+        with (
+            patch("app.automator.asyncio.sleep", new=AsyncMock()),
+            patch(
+                "app.automator.collect_virtualized_cards",
+                new=AsyncMock(return_value=discovered),
+            ),
+        ):
+            streamers = await UserAutomator.discover_streamers(
+                context,
+                "https://www.twitch.tv/directory/category/example",
+            )
+
+        self.assertEqual(streamers, [{
+            "name": "eligible_channel",
+            "url": "https://www.twitch.tv/eligible_channel",
+            "viewers": "123 viewers",
+            "drops": True,
+        }])
+        page.close.assert_awaited_once_with()
+
+    async def test_streamer_discovery_rejects_login_redirect(self):
+        page = MagicMock()
+        page.url = "https://www.twitch.tv/login"
+        page.goto = AsyncMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+
+        with self.assertRaisesRegex(RuntimeError, "redirected"):
+            await UserAutomator.discover_streamers(
+                context,
+                "https://www.twitch.tv/directory/category/example",
+            )
+
+        page.close.assert_awaited_once_with()
+
+    async def test_game_discovery_rejects_other_directory_redirect(self):
+        page = MagicMock()
+        page.url = "https://www.twitch.tv/directory/category/rust"
+        page.goto = AsyncMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+
+        with self.assertRaisesRegex(RuntimeError, "redirected"):
+            await UserAutomator.discover_games(context)
+
+        page.close.assert_awaited_once_with()
 
 
 class ConfigurationTestCase(unittest.TestCase):
@@ -602,8 +1247,49 @@ class ConfigurationTestCase(unittest.TestCase):
         self.assertGreater(len(first), 40)
 
     def test_url_normalizer_rejects_non_directory_twitch_pages(self):
-        with self.assertRaises(ValueError):
-            normalize_twitch_game_url("https://www.twitch.tv/user")
+        invalid_urls = (
+            "https://www.twitch.tv/user",
+            "https://www.twitch.tv/directory/category/",
+            "https://www.twitch.tv/directory/category/rust/videos",
+            "https://www.twitch.tv/directory/all/tags/dropsenabled-bogus",
+            "https://www.twitch.tv/directory/category/rust%2Fvideos",
+            "https://www.twitch.tv/directory/category/rust%252Fvideos",
+            "https://www.twitch.tv/directory/category/%252e%252e",
+        )
+        for url in invalid_urls:
+            with self.assertRaises(ValueError):
+                normalize_twitch_game_url(url)
+
+    def test_channel_parser_uses_exact_routes_and_rejects_reserved_pages(self):
+        self.assertEqual(
+            twitch_channel_login_from_url("https://www.twitch.tv/Dropship?ref=test"),
+            "dropship",
+        )
+        self.assertEqual(normalize_twitch_channel_login("Oilrats"), "oilrats")
+        for url in (
+            "https://www.twitch.tv/drops",
+            "https://www.twitch.tv/oilrats/videos",
+            "https://evil.example/oilrats",
+        ):
+            self.assertIsNone(twitch_channel_login_from_url(url))
+
+    def test_directory_alias_matching_preserves_punctuation(self):
+        self.assertTrue(twitch_directories_match(
+            "https://www.twitch.tv/directory/category/counter-strike",
+            "https://www.twitch.tv/directory/game/counter-strike",
+        ))
+        self.assertFalse(twitch_directories_match(
+            "https://www.twitch.tv/directory/category/a-bc",
+            "https://www.twitch.tv/directory/category/ab-c",
+        ))
+        self.assertFalse(twitch_directories_match(
+            "https://www.twitch.tv/directory/category/counter-strike",
+            "https://www.twitch.tv/directory/category/counterstrike",
+        ))
+        self.assertTrue(twitch_directories_match(
+            "https://www.twitch.tv/directory/category/grand-theft-auto-v",
+            "https://www.twitch.tv/directory/game/Grand%20Theft%20Auto%20V",
+        ))
 
     def test_screencast_fps_is_applied_as_an_emit_interval(self):
         self.assertEqual(screencast_emit_interval(1), 1.0)

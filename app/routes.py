@@ -14,6 +14,7 @@ from app.automator import (
     UserAutomator,
     normalize_twitch_game_url,
 )
+from app.twitch_pages import normalize_twitch_channel_login
 
 main_bp = Blueprint("main", __name__)
 DISCOVERY_TIMEOUT_SECONDS = 75
@@ -264,17 +265,32 @@ def api_watch_targets():
             return jsonify({"success": False, "error": "game_name required"}), 400
         raw_game_url = data.get("game_url") or ""
         try:
-            game_url = normalize_twitch_game_url(raw_game_url) if raw_game_url else None
+            game_url = normalize_twitch_game_url(raw_game_url)
         except ValueError as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
         raw_streamer = data.get("streamer") or ""
         if not isinstance(raw_streamer, str):
             return jsonify({"success": False, "error": "streamer must be a string"}), 400
+        try:
+            streamer = (
+                normalize_twitch_channel_login(raw_streamer)
+                if raw_streamer.strip()
+                else None
+            )
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+        existing = WatchTarget.query.filter_by(
+            user_id=current_user.id,
+            game_url=game_url,
+            streamer=streamer,
+        ).first()
+        if existing:
+            return jsonify({"success": True, "id": existing.id, "existing": True})
         wt = WatchTarget(
             user_id=current_user.id,
             game_name=game_name,
             game_url=game_url,
-            streamer=raw_streamer.strip() or None,
+            streamer=streamer,
         )
         db.session.add(wt)
         db.session.commit()
