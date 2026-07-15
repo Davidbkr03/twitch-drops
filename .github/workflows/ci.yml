@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install locked dependencies
+        run: python -m pip install --require-hashes --requirement requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Check formatting
+        run: ruff format --check .
+      - name: Test
+        run: pytest -q
+
+  production-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create isolated smoke-test configuration
+        run: |
+          printf '%s\n' \
+            'BIND_ADDRESS=127.0.0.1' \
+            'PORT=5000' \
+            'SECRET_KEY=ci-only-secret-key-000000000000000000000000000000000000000000000000' \
+            'BOOTSTRAP_TOKEN=ci-only-bootstrap-token-000000000000000000000000000000000000000000000000' \
+            'POSTGRES_USER=twitch' \
+            'POSTGRES_PASSWORD=ci-only-postgres-password-000000000000000000000000000000000000000000' \
+            'POSTGRES_DB=twitch_drops' \
+            "BACKUP_ROOT=$RUNNER_TEMP/twitch-drop-backups" > .env
+          chmod 600 .env
+      - name: Validate deployment scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+          bash -n install.sh scripts/*.sh
+          sh -n entrypoint.sh
+          shellcheck install.sh scripts/*.sh entrypoint.sh
+      - name: Validate and start production stack
+        run: |
+          docker compose config --quiet
+          docker compose build app
+          docker compose up --detach --wait --wait-timeout 300
+      - name: Verify health and production Chromium launch mode
+        run: |
+          curl --fail --max-time 10 http://127.0.0.1:5000/health/live
+          curl --fail --max-time 10 http://127.0.0.1:5000/health/ready
+          docker compose exec -T app python - <<'PY'
+          import asyncio
+          import shutil
+
+          from playwright.async_api import async_playwright
+
+          from app.automator import UserAutomator
+
+
+          class SmokeSocket:
+              def emit(self, *args, **kwargs):
+                  pass
+
+
+          class SmokeApp:
+              config = {}
+
+
+          async def main():
+              profile = "/data/ci-production-browser-profile"
+              shutil.rmtree(profile, ignore_errors=True)
+              automator = UserAutomator(999, profile, SmokeSocket(), SmokeApp())
+              async with async_playwright() as playwright:
+                  await automator._launch_browser(playwright)
+                  page = automator.page
+                  await page.goto("data:text/html,<title>chromium-ready</title>")
+                  assert await page.title() == "chromium-ready"
+                  await automator._cleanup()
+              shutil.rmtree(profile)
+
+
+          asyncio.run(main())
+          PY
+      - name: Verify single-process lock and graceful restart
+        run: |
+          set +e
+          docker compose exec -T app timeout 15 \
+            gunicorn --config gunicorn.conf.py --bind 127.0.0.1:5001 run:app
+          second_server_status=$?
+          set -e
+          if [ "$second_server_status" -eq 0 ] || [ "$second_server_status" -eq 124 ]; then
+            echo "A second server was able to use the same persistent data directory" >&2
+            exit 1
+          fi
+          docker compose restart --timeout 60 app
+          docker compose up --detach --wait --wait-timeout 300 app
+      - name: Verify legacy PostgreSQL migration adoption
+        run: |
+          docker compose stop --timeout 60 app
+          docker compose exec -T db psql --username twitch --dbname twitch_drops <<'SQL'
+          TRUNCATE TABLE alembic_version;
+          ALTER TABLE user_settings DROP COLUMN automation_enabled;
+          ALTER TABLE user_settings ADD COLUMN twitch_username VARCHAR(100);
+          ALTER TABLE user_settings ADD COLUMN twitch_password VARCHAR(256);
+          ALTER TABLE user_settings ADD COLUMN twitch_auth_token TEXT;
+          SQL
+          docker compose run --rm --no-deps --entrypoint alembic app upgrade head
+          test "$(docker compose exec -T db psql --username twitch --dbname twitch_drops --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE table_name='user_settings' AND column_name='automation_enabled'")" = "1"
+          test "$(docker compose exec -T db psql --username twitch --dbname twitch_drops --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE table_name='user_settings' AND column_name IN ('twitch_username','twitch_password','twitch_auth_token')")" = "0"
+          docker compose up --detach --wait --wait-timeout 300 app
+      - name: Verify production backup and restore round trip
+        run: |
+          docker compose exec -T db psql --username twitch --dbname twitch_drops --set ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO users (username, password_hash, is_active)
+          VALUES ('ci-backup-owner', 'not-a-login-hash', true);
+          INSERT INTO user_settings (user_id, automation_enabled, auto_claim, check_interval, screencast_quality, screencast_max_fps)
+          SELECT id, false, true, 60, 50, 3 FROM users WHERE username = 'ci-backup-owner';
+          SQL
+          backup_root="$RUNNER_TEMP/twitch-drop-backups"
+          bash scripts/backup.sh "$backup_root"
+          backup_dir="$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' | sort | tail -n 1)"
+          test -n "$backup_dir"
+          docker compose exec -T db psql --username twitch --dbname twitch_drops --set ON_ERROR_STOP=1 \
+            --command "UPDATE users SET username = 'ci-mutated-owner' WHERE username = 'ci-backup-owner'"
+          bash scripts/restore.sh "$backup_dir" --yes
+          test "$(docker compose exec -T db psql --username twitch --dbname twitch_drops --tuples-only --no-align --command "SELECT username FROM users WHERE password_hash = 'not-a-login-hash'")" = "ci-backup-owner"
+          bash scripts/doctor.sh --strict
+      - name: Show logs and clean up
+        if: always()
+        run: |
+          docker compose ps --all || true
+          docker compose logs --no-color --tail=200 app db || true
+          docker compose down --volumes --remove-orphans || true

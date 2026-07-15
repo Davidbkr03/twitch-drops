@@ -1,21 +1,23 @@
+import atexit
 import os
 
 from app import create_app
-from app.extensions import socketio
+from app.config import Config
 from app.process_lock import ProcessLock, ProcessLockError
 
-app = create_app()
+
+_server_lock = ProcessLock(os.path.join(Config.DATA_DIR, ".server.lock"))
+try:
+    _server_lock.acquire()
+except ProcessLockError as exc:
+    raise RuntimeError(str(exc)) from exc
+atexit.register(_server_lock.release)
+
+try:
+    app = create_app()
+except Exception:
+    _server_lock.release()
+    raise
 
 if __name__ == "__main__":
-    lock_path = os.path.join(app.config["DATA_DIR"], ".server.lock")
-    try:
-        with ProcessLock(lock_path):
-            socketio.run(
-                app,
-                host="0.0.0.0",
-                port=int(os.environ.get("PORT", "5000")),
-                debug=False,
-                allow_unsafe_werkzeug=True,
-            )
-    except ProcessLockError as exc:
-        raise SystemExit(str(exc)) from None
+    raise SystemExit("This service is supported through Docker Compose; see README.md")

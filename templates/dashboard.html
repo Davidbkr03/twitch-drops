@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Dashboard — Twitch Drop Automator{% endblock %}
 {% block head %}
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<script src="{{ url_for('static', filename='vendor/socket.io.min.js') }}"></script>
 {% endblock %}
 
 {% block content %}
@@ -52,16 +52,11 @@
           <span class="badge badge-sm" id="twitchStatus">Not linked</span>
         </div>
         <div class="card-body">
-          {% if native_login_enabled %}
-          <button class="btn btn-primary btn-sm btn-block" id="nativeLoginBtn" onclick="openNativeLogin()">Open Twitch Login in Normal Browser</button>
-          <p class="hint-text" id="nativeLoginHint">Recommended for first-time sign-in. Log in in the normal browser window, close it, then press Start.</p>
-          {% else %}
-          <p class="hint-text">Native browser login is available only when the app runs directly on Windows. Connect with an auth token below.</p>
-          {% endif %}
+          <p class="hint-text">Connect this server to Twitch with a one-time auth token below.</p>
           <div class="field">
             <label>Auth Token</label>
-            <input type="text" id="authToken" placeholder="Paste your auth-token here"
-                   value="">
+            <input type="password" id="authToken" placeholder="Paste your auth-token here"
+                   value="" autocomplete="off" autocapitalize="none" spellcheck="false">
           </div>
           <button class="btn btn-primary btn-sm btn-block" onclick="importToken()">Connect Twitch</button>
           <details class="token-help">
@@ -73,7 +68,7 @@
               <li>Copy the <strong>Value</strong> and paste it above</li>
             </ol>
           </details>
-          <p class="hint-text" id="twitchHint">The auth token lets the bot use your Twitch session directly — no login page needed. Tokens persist across restarts.</p>
+          <p class="hint-text" id="twitchHint">The token is used once and is never stored in the database. The resulting Twitch session stays in the persistent browser profile.</p>
         </div>
       </section>
 
@@ -138,6 +133,19 @@
 
 <script>
 (function() {
+  var nativeFetch = window.fetch.bind(window);
+  var csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+  window.fetch = function(input, init) {
+    init = Object.assign({}, init || {});
+    var method = String(init.method || 'GET').toUpperCase();
+    var url = new URL(typeof input === 'string' ? input : input.url, window.location.href);
+    if (url.origin === window.location.origin && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+      var headers = new Headers(init.headers || {});
+      headers.set('X-CSRFToken', csrfToken);
+      init.headers = headers;
+    }
+    return nativeFetch(input, init);
+  };
   var socket = io();
   var canvas = document.getElementById('screencast');
   var ctx    = canvas.getContext('2d');
@@ -153,19 +161,18 @@
   var twitchStatusBadge = document.getElementById('twitchStatus');
   var running = false;
   var browserReady = false;
-  var nativeLoginActive = false;
 
   function syncRunningControls() {
-    startBtn.disabled = running || nativeLoginActive;
+    startBtn.disabled = running;
     stopBtn.disabled = !running;
-    discoverBtn.disabled = !browserReady || nativeLoginActive || discoverBtn.dataset.pending === 'true';
+    discoverBtn.disabled = !browserReady || discoverBtn.dataset.pending === 'true';
     document.querySelectorAll('[data-action]').forEach(function(btn) {
       if (btn.textContent === '✓') {
         btn.disabled = true;
       } else if (btn.dataset.pending === 'true') {
         btn.disabled = true;
       } else if (btn.dataset.action === 'channels') {
-        btn.disabled = !browserReady || nativeLoginActive;
+        btn.disabled = !browserReady;
       } else {
         btn.disabled = false;
       }
@@ -192,7 +199,6 @@
   socket.on('automation_status', function(s) {
     running = s.running;
     browserReady = !!s.browser_ready;
-    nativeLoginActive = !!s.native_login_active;
     statusDot.className = 'status-dot ' + (running ? 'on' : 'off');
     var msg = s.message || (running ? 'Running' : 'Stopped');
     statusMsg.textContent = msg;
@@ -218,9 +224,6 @@
     if (s.logged_in) {
       twitchStatusBadge.textContent = 'Logged in';
       twitchStatusBadge.className = 'badge badge-sm badge-success';
-    } else if (s.twitch_saved) {
-      twitchStatusBadge.textContent = 'Saved';
-      twitchStatusBadge.className = 'badge badge-sm badge-warn';
     } else {
       twitchStatusBadge.textContent = 'Not linked';
       twitchStatusBadge.className = 'badge badge-sm';
@@ -353,62 +356,32 @@
   };
 
   /* ---- import auth token ---- */
-  function pollNativeLogin() {
-    if (!nativeLoginActive) return;
-    setTimeout(function() {
-      fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
-        nativeLoginActive = !!s.native_login_active;
-        browserReady = !!s.browser_ready;
-        syncRunningControls();
-        if (nativeLoginActive) {
-          pollNativeLogin();
-        } else {
-          document.getElementById('nativeLoginHint').textContent = 'Login browser closed. Press Start to verify the saved Twitch session.';
-          syncRunningControls();
-        }
-      }).catch(function() { pollNativeLogin(); });
-    }, 1500);
-  }
-
-  window.openNativeLogin = function() {
-    var btn = document.getElementById('nativeLoginBtn');
-    var hint = document.getElementById('nativeLoginHint');
-    btn.disabled = true;
-    hint.textContent = 'Stopping automation and opening a normal browserâ€¦';
-    fetch('/api/native-login', {method:'POST'}).then(function(r){return r.json()}).then(function(d) {
-      if (d.success) {
-        hint.textContent = d.browser + ' opened. Sign in there, close that window, then press Start.';
-        nativeLoginActive = true;
-        browserReady = false;
-        syncRunningControls();
-        pollNativeLogin();
-      } else {
-        hint.textContent = 'Could not open login: ' + (d.error || 'Unknown error');
-      }
-    }).catch(function() {
-      hint.textContent = 'Could not open login: request failed';
-    }).finally(function() {
-      btn.disabled = false;
-    });
-  };
-
   window.importToken = function() {
-    var token = document.getElementById('authToken').value.trim();
+    var tokenInput = document.getElementById('authToken');
+    var token = tokenInput.value.trim();
+    tokenInput.value = '';
     if (!token) { alert('Paste your Twitch auth-token first'); return; }
+    if (!browserReady) {
+      document.getElementById('twitchHint').textContent = 'Start automation and wait for the browser before importing a token.';
+      return;
+    }
     document.getElementById('twitchHint').textContent = 'Importing token…';
     fetch('/api/import-token', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({auth_token: token})
     }).then(function(r){return r.json()}).then(function(d) {
       if (d.success) {
-        document.getElementById('twitchHint').textContent = 'Token saved! Start or restart automation to connect.';
-        twitchStatusBadge.textContent = 'Token saved';
-        twitchStatusBadge.className = 'badge badge-sm badge-warn';
-        document.getElementById('authToken').value = '';
-        document.getElementById('authToken').placeholder = '••••••••••••••';
+        document.getElementById('twitchHint').textContent = 'Twitch session connected. The token was not stored.';
+        twitchStatusBadge.textContent = 'Logged in';
+        twitchStatusBadge.className = 'badge badge-sm badge-success';
+        tokenInput.placeholder = '••••••••••••••';
       } else {
         document.getElementById('twitchHint').textContent = 'Error: ' + (d.error || 'Unknown');
       }
+    }).catch(function() {
+      document.getElementById('twitchHint').textContent = 'Error: request failed';
+    }).finally(function() {
+      tokenInput.value = '';
     });
   };
 
@@ -614,18 +587,13 @@
   fetch('/api/status').then(function(r){return r.json()}).then(function(s) {
     running = s.running;
     browserReady = !!s.browser_ready;
-    nativeLoginActive = !!s.native_login_active;
     statusDot.className = 'status-dot '+(running?'on':'off');
     statusMsg.textContent = s.message||(running?'Running':'Stopped');
     syncRunningControls();
-    if (nativeLoginActive) pollNativeLogin();
     if (running) overlay.style.display = 'none';
     if (s.logged_in) {
       twitchStatusBadge.textContent = 'Logged in';
       twitchStatusBadge.className = 'badge badge-sm badge-success';
-    } else if (s.twitch_saved || s.twitch_user) {
-      twitchStatusBadge.textContent = 'Token saved';
-      twitchStatusBadge.className = 'badge badge-sm badge-warn';
     }
   });
 

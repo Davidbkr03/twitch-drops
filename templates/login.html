@@ -7,6 +7,7 @@
     <h1>Welcome back</h1>
     <p class="auth-subtitle">Log in to manage your Twitch drop automation</p>
     <form method="POST" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="form-group">
         <label for="username">Username</label>
         <input type="text" id="username" name="username" required autofocus
@@ -19,7 +20,9 @@
       </div>
       <button type="submit" class="btn btn-primary btn-block">Log In</button>
     </form>
-    <p class="auth-link">Don't have an account? <a href="{{ url_for('auth.register') }}">Register</a></p>
+    {% if registration_open %}
+    <p class="auth-link">First time here? <a href="{{ url_for('auth.register') }}">Create the owner account</a></p>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

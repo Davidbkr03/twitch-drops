@@ -1,7 +1,5 @@
 import asyncio
-import ipaddress
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from urllib.parse import urlsplit
 
 from flask import Blueprint, current_app, render_template, jsonify, request
 from flask_login import login_required, current_user
@@ -20,77 +18,61 @@ main_bp = Blueprint("main", __name__)
 DISCOVERY_TIMEOUT_SECONDS = 75
 
 
+def _schedule_automator_coroutine(automator, coroutine):
+    """Schedule work without leaking a coroutine when its browser loop closes."""
+    loop = getattr(automator, "_loop", None)
+    if not loop or not loop.is_running():
+        close = getattr(coroutine, "close", None)
+        if close:
+            close()
+        return None
+    try:
+        return asyncio.run_coroutine_threadsafe(coroutine, loop)
+    except RuntimeError:
+        close = getattr(coroutine, "close", None)
+        if close:
+            close()
+        return None
+
+
 def _resolve_discovery_future(future, resource_name):
     try:
         return future.result(timeout=DISCOVERY_TIMEOUT_SECONDS), None
     except FutureTimeoutError:
         future.cancel()
         return None, (
-            jsonify({
-                "success": False,
-                "error": f"{resource_name} discovery timed out; try again",
-            }),
+            jsonify(
+                {
+                    "success": False,
+                    "error": f"{resource_name} discovery timed out; try again",
+                }
+            ),
             504,
         )
-
-
-def _is_local_same_origin_request() -> bool:
-    """Restrict native desktop launches to the machine hosting the app."""
-    try:
-        remote = ipaddress.ip_address(request.remote_addr or "")
-    except ValueError:
-        return False
-    is_loopback = remote.is_loopback or bool(
-        getattr(remote, "ipv4_mapped", None) and remote.ipv4_mapped.is_loopback
-    )
-    if not is_loopback:
-        return False
-
-    origin = request.headers.get("Origin")
-    if not origin:
-        return False
-    supplied = urlsplit(origin)
-    expected = urlsplit(request.host_url)
-    return (
-        supplied.scheme.lower(),
-        supplied.hostname,
-        supplied.port,
-    ) == (
-        expected.scheme.lower(),
-        expected.hostname,
-        expected.port,
-    )
 
 
 # ------------------------------------------------------------------
 # Pages
 # ------------------------------------------------------------------
 
+
 @main_bp.route("/")
 @login_required
 def dashboard():
     settings = UserSettings.query.filter_by(user_id=current_user.id).first()
-    return render_template(
-        "dashboard.html",
-        settings=settings,
-        native_login_enabled=current_app.config.get("NATIVE_LOGIN_ENABLED", False),
-    )
+    return render_template("dashboard.html", settings=settings)
 
 
 # ------------------------------------------------------------------
 # REST API
 # ------------------------------------------------------------------
 
+
 @main_bp.route("/api/status")
 @login_required
 def api_status():
     mgr = AutomationManager.get()
     status = mgr.get_status(current_user.id) if mgr else {"running": False}
-    # Supplement with DB info
-    s = UserSettings.query.filter_by(user_id=current_user.id).first()
-    if s and (s.twitch_username or s.twitch_auth_token):
-        status["twitch_user"] = s.twitch_username
-        status["twitch_saved"] = True
     return jsonify(status)
 
 
@@ -101,11 +83,6 @@ def api_start():
     if not mgr:
         return jsonify({"success": False, "error": "Manager not ready"}), 503
     ok = mgr.start_for_user(current_user.id)
-    if not ok and mgr.native_login_active_for_user(current_user.id):
-        return jsonify({
-            "success": False,
-            "error": "Close the normal Twitch login browser before starting",
-        }), 409
     return jsonify({"success": ok})
 
 
@@ -119,73 +96,48 @@ def api_stop():
     return jsonify({"success": ok})
 
 
-@main_bp.route("/api/twitch-account", methods=["GET", "POST"])
-@login_required
-def api_twitch_account():
-    s = UserSettings.query.filter_by(user_id=current_user.id).first()
-    if not s:
-        s = UserSettings(user_id=current_user.id)
-        db.session.add(s)
-        db.session.commit()
-
-    if request.method == "GET":
-        return jsonify({
-            "twitch_username": s.twitch_username or "",
-            "has_password": bool(s.twitch_password),
-        })
-
-    data = request.get_json(silent=True) or {}
-    u = (data.get("twitch_username") or "").strip()
-    p = data.get("twitch_password") or ""
-    if not u:
-        return jsonify({"success": False, "error": "Username required"}), 400
-    s.twitch_username = u
-    if p:
-        s.twitch_password = p
-    db.session.commit()
-    return jsonify({"success": True})
-
-
 @main_bp.route("/api/import-token", methods=["POST"])
 @login_required
 def api_import_token():
-    data = request.get_json(silent=True) or {}
-    token = (data.get("auth_token") or "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "JSON object required"}), 400
+    raw_token = data.get("auth_token")
+    if not isinstance(raw_token, str):
+        return jsonify({"success": False, "error": "Token format is invalid"}), 400
+    token = raw_token.strip()
     if not token:
         return jsonify({"success": False, "error": "Token required"}), 400
-    s = UserSettings.query.filter_by(user_id=current_user.id).first()
-    if not s:
-        s = UserSettings(user_id=current_user.id)
-        db.session.add(s)
-    s.twitch_auth_token = token
-    db.session.commit()
-    # If automation is running, apply immediately
+    if len(token) > 512 or not token.isascii():
+        return jsonify({"success": False, "error": "Token format is invalid"}), 400
     mgr = AutomationManager.get()
-    if mgr:
-        a = mgr.get_automator(current_user.id)
-        if a and a._loop and a._loop.is_running():
-            import asyncio
-            asyncio.run_coroutine_threadsafe(a.import_cookies(token), a._loop)
+    automator = mgr.get_automator(current_user.id) if mgr else None
+    if (
+        not automator
+        or not automator.context
+        or not automator._loop
+        or not automator._loop.is_running()
+    ):
+        return jsonify(
+            {
+                "success": False,
+                "error": "Start automation and wait for the browser before importing a token",
+            }
+        ), 409
+    future = _schedule_automator_coroutine(automator, automator.import_cookies(token))
+    if future is None:
+        return jsonify({"success": False, "error": "Browser session changed; try again"}), 409
+    try:
+        imported = future.result(timeout=30)
+    except FutureTimeoutError:
+        future.cancel()
+        return jsonify({"success": False, "error": "Token verification timed out"}), 504
+    except Exception:
+        current_app.logger.warning("Twitch token import failed", exc_info=True)
+        return jsonify({"success": False, "error": "Browser session changed; try again"}), 409
+    if not imported:
+        return jsonify({"success": False, "error": "Twitch rejected the token"}), 401
     return jsonify({"success": True})
-
-
-@main_bp.route("/api/native-login", methods=["POST"])
-@login_required
-def api_native_login():
-    if not current_app.config.get("NATIVE_LOGIN_ENABLED", False):
-        return jsonify({
-            "success": False,
-            "error": "Native login is only available on a local desktop install",
-        }), 409
-    if not _is_local_same_origin_request():
-        return jsonify({"success": False, "error": "Local same-origin request required"}), 403
-    mgr = AutomationManager.get()
-    if not mgr:
-        return jsonify({"success": False, "error": "Manager not ready"}), 503
-    success, detail = mgr.open_native_login_for_user(current_user.id)
-    if not success:
-        return jsonify({"success": False, "error": detail}), 409
-    return jsonify({"success": True, "browser": detail})
 
 
 @main_bp.route("/api/discover-games", methods=["POST"])
@@ -196,12 +148,13 @@ def api_discover_games():
         return jsonify({"success": False, "error": "Not ready"}), 503
     a = mgr.get_automator(current_user.id)
     if not a or not a.context:
-        return jsonify({"success": False, "error": "Start automation first so the browser is available"}), 400
-    import asyncio
+        return jsonify(
+            {"success": False, "error": "Start automation first so the browser is available"}
+        ), 400
     try:
-        future = asyncio.run_coroutine_threadsafe(
-            UserAutomator.discover_games(a.context), a._loop
-        )
+        future = _schedule_automator_coroutine(a, UserAutomator.discover_games(a.context))
+        if future is None:
+            return jsonify({"success": False, "error": "Browser session changed"}), 409
         games, error_response = _resolve_discovery_future(future, "Game")
         if error_response:
             return error_response
@@ -229,11 +182,12 @@ def api_discover_streamers():
     a = mgr.get_automator(current_user.id)
     if not a or not a.context:
         return jsonify({"success": False, "error": "Start automation first"}), 400
-    import asyncio
     try:
-        future = asyncio.run_coroutine_threadsafe(
-            UserAutomator.discover_streamers(a.context, game_url), a._loop
+        future = _schedule_automator_coroutine(
+            a, UserAutomator.discover_streamers(a.context, game_url)
         )
+        if future is None:
+            return jsonify({"success": False, "error": "Browser session changed"}), 409
         streamers, error_response = _resolve_discovery_future(future, "Streamer")
         if error_response:
             return error_response
@@ -246,12 +200,21 @@ def api_discover_streamers():
 @login_required
 def api_watch_targets():
     from app.models import WatchTarget
+
     if request.method == "GET":
         rows = WatchTarget.query.filter_by(user_id=current_user.id).all()
-        return jsonify([{
-            "id": r.id, "game_name": r.game_name, "game_url": r.game_url,
-            "streamer": r.streamer, "enabled": r.enabled,
-        } for r in rows])
+        return jsonify(
+            [
+                {
+                    "id": r.id,
+                    "game_name": r.game_name,
+                    "game_url": r.game_url,
+                    "streamer": r.streamer,
+                    "enabled": r.enabled,
+                }
+                for r in rows
+            ]
+        )
 
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
@@ -273,9 +236,7 @@ def api_watch_targets():
             return jsonify({"success": False, "error": "streamer must be a string"}), 400
         try:
             streamer = (
-                normalize_twitch_channel_login(raw_streamer)
-                if raw_streamer.strip()
-                else None
+                normalize_twitch_channel_login(raw_streamer) if raw_streamer.strip() else None
             )
         except ValueError as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
@@ -315,12 +276,14 @@ def api_settings():
         db.session.commit()
 
     if request.method == "GET":
-        return jsonify({
-            "auto_claim": s.auto_claim,
-            "check_interval": s.check_interval,
-            "screencast_quality": s.screencast_quality,
-            "screencast_max_fps": s.screencast_max_fps,
-        })
+        return jsonify(
+            {
+                "auto_claim": s.auto_claim,
+                "check_interval": s.check_interval,
+                "screencast_quality": s.screencast_quality,
+                "screencast_max_fps": s.screencast_max_fps,
+            }
+        )
 
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
@@ -342,10 +305,12 @@ def api_settings():
         if isinstance(value, bool) or not isinstance(value, int):
             return jsonify({"success": False, "error": f"{name} must be an integer"}), 400
         if not minimum <= value <= maximum:
-            return jsonify({
-                "success": False,
-                "error": f"{name} must be between {minimum} and {maximum}",
-            }), 400
+            return jsonify(
+                {
+                    "success": False,
+                    "error": f"{name} must be between {minimum} and {maximum}",
+                }
+            ), 400
         setattr(s, name, value)
     db.session.commit()
     return jsonify({"success": True})
@@ -360,31 +325,49 @@ def api_drops():
         .limit(100)
         .all()
     )
-    return jsonify([{
-        "id": d.id, "name": d.drop_name, "game": d.game,
-        "status": d.status, "progress": d.progress,
-        "created_at": d.created_at.isoformat() if d.created_at else None,
-        "claimed_at": d.claimed_at.isoformat() if d.claimed_at else None,
-    } for d in logs])
+    return jsonify(
+        [
+            {
+                "id": d.id,
+                "name": d.drop_name,
+                "game": d.game,
+                "status": d.status,
+                "progress": d.progress,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "claimed_at": d.claimed_at.isoformat() if d.claimed_at else None,
+            }
+            for d in logs
+        ]
+    )
 
 
 # ------------------------------------------------------------------
 # Socket.IO
 # ------------------------------------------------------------------
 
+
 @socketio.on("connect")
 def on_connect():
-    if current_user.is_authenticated:
-        join_room(f"user_{current_user.id}")
-        mgr = AutomationManager.get()
-        if mgr:
-            socketio.emit("automation_status", mgr.get_status(current_user.id), room=f"user_{current_user.id}")
+    if not current_user.is_authenticated:
+        return False
+    join_room(f"user_{current_user.id}")
+    mgr = AutomationManager.get()
+    if mgr:
+        mgr.set_preview_connected(current_user.id, True)
+        socketio.emit(
+            "automation_status",
+            mgr.get_status(current_user.id),
+            room=f"user_{current_user.id}",
+        )
 
 
 @socketio.on("disconnect")
 def on_disconnect():
     if current_user.is_authenticated:
         leave_room(f"user_{current_user.id}")
+        mgr = AutomationManager.get()
+        if mgr:
+            mgr.set_preview_connected(current_user.id, False)
 
 
 @socketio.on("browser_input")
@@ -396,20 +379,4 @@ def on_browser_input(data):
         return
     a = mgr.get_automator(current_user.id)
     if a and a._loop and a._loop.is_running():
-        asyncio.run_coroutine_threadsafe(a.handle_input(data), a._loop)
-
-
-@socketio.on("twitch_login")
-def on_twitch_login(data):
-    if not current_user.is_authenticated:
-        return
-    mgr = AutomationManager.get()
-    if not mgr:
-        return
-    a = mgr.get_automator(current_user.id)
-    u = (data.get("username") or "").strip()
-    p = data.get("password") or ""
-    if not u or not p:
-        return
-    if a and a._loop and a._loop.is_running():
-        asyncio.run_coroutine_threadsafe(a.auto_login(u, p), a._loop)
+        _schedule_automator_coroutine(a, a.handle_input(data))
