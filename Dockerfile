@@ -1,33 +1,37 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12.13-slim-bookworm
 
-# Install system deps + Google Chrome
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl gnupg xvfb && \
-    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && \
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
-      http://dl.google.com/linux/chrome/deb/ stable main" \
-      > /etc/apt/sources.list.d/google-chrome.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends google-chrome-stable && \
-    rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    HOME=/tmp/home \
+    TMPDIR=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ./requirements.txt
+RUN python -m pip install --no-cache-dir --require-hashes --requirement requirements.txt \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod -R a+rX /ms-playwright
 
-# Install Playwright browsers (Chromium as fallback + deps)
-RUN playwright install --with-deps chromium
+RUN groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --create-home --shell /usr/sbin/nologin app \
+    && install -d -o app -g app -m 0750 /data
 
-COPY . .
+COPY --chown=app:app app/ ./app/
+COPY --chown=app:app migrations/ ./migrations/
+COPY --chown=app:app templates/ ./templates/
+COPY --chown=app:app static/ ./static/
+COPY --chown=app:app alembic.ini gunicorn.conf.py run.py ./
+COPY entrypoint.sh /usr/local/bin/twitch-drops-entrypoint
+RUN chmod 0755 /usr/local/bin/twitch-drops-entrypoint
 
-RUN mkdir -p /data/browser
+USER app:app
 
 EXPOSE 5000
 
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python", "run.py"]
+ENTRYPOINT ["/usr/local/bin/twitch-drops-entrypoint"]
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "run:app"]

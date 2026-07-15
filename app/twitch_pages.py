@@ -13,14 +13,10 @@ MATURE_GATE_SELECTOR = (
 )
 MATURE_ACCEPT_SELECTORS = (
     '[data-a-target="player-overlay-mature-accept"]',
-    '[data-a-target="content-classification-gate-overlay"] '
-    'button:has-text("Continue Watching")',
-    '[data-a-target="content-classification-gate-overlay"] '
-    'button:has-text("Start Watching")',
-    '[data-a-target="player-overlay-content-gate"] '
-    'button:has-text("Continue Watching")',
-    '[data-a-target="player-overlay-content-gate"] '
-    'button:has-text("Start Watching")',
+    '[data-a-target="content-classification-gate-overlay"] button:has-text("Continue Watching")',
+    '[data-a-target="content-classification-gate-overlay"] button:has-text("Start Watching")',
+    '[data-a-target="player-overlay-content-gate"] button:has-text("Continue Watching")',
+    '[data-a-target="player-overlay-content-gate"] button:has-text("Start Watching")',
 )
 
 CHANNEL_METADATA_JS = r"""
@@ -134,9 +130,7 @@ def normalize_twitch_game_url(value: str) -> str:
         raise ValueError(invalid_url)
 
     normalized_path = decoded_path.rstrip("/")
-    is_drops_directory = (
-        normalized_path.casefold() == "/directory/all/tags/dropsenabled"
-    )
+    is_drops_directory = normalized_path.casefold() == "/directory/all/tags/dropsenabled"
     is_game_directory = bool(_GAME_DIRECTORY_RE.fullmatch(decoded_path))
     if not is_drops_directory and not is_game_directory:
         raise ValueError("game_url must point to a Twitch game directory")
@@ -146,9 +140,7 @@ def normalize_twitch_game_url(value: str) -> str:
         if slug in {".", ".."} or not slug.strip():
             raise ValueError("game_url must point to a Twitch game directory")
 
-    return urlunsplit(
-        ("https", "www.twitch.tv", parsed.path.rstrip("/"), parsed.query, "")
-    )
+    return urlunsplit(("https", "www.twitch.tv", parsed.path.rstrip("/"), parsed.query, ""))
 
 
 def normalize_twitch_channel_login(value: str) -> str:
@@ -327,11 +319,7 @@ async def ensure_live_video_playing(
         except Exception:
             await asyncio.sleep(readiness_delay)
             continue
-        if (
-            not isinstance(state, dict)
-            or state.get("ended") is True
-            or state.get("error") is True
-        ):
+        if not isinstance(state, dict) or state.get("ended") is True or state.get("error") is True:
             return False
         if int(state.get("readyState") or 0) < 2:
             await asyncio.sleep(readiness_delay)

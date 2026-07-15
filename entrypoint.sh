@@ -1,46 +1,79 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env sh
+set -eu
 
-# Start virtual display for headed Chrome
+umask 027
+mkdir -p "$HOME" "$XDG_CACHE_HOME"
+
+echo "Applying database migrations..."
+alembic upgrade head
+
 export DISPLAY=:99
-Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp &
-sleep 1
-echo "Xvfb started on :99"
+Xvfb "$DISPLAY" -screen 0 1920x1080x24 -ac -nolisten tcp &
+xvfb_pid=$!
+app_pid=
+monitor_pid=
 
-echo "Waiting for database..."
-for i in $(seq 1 30); do
-    if python -c "
-import psycopg2, os
-try:
-    conn = psycopg2.connect(os.environ.get('DATABASE_URL', 'postgresql://twitch:twitch@db:5432/twitch_drops'))
-    conn.close()
-    exit(0)
-except Exception:
-    exit(1)
-" 2>/dev/null; then
-        echo "Database is ready."
+terminate() {
+    trap - TERM INT HUP
+    if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
+        kill -TERM "$app_pid" 2>/dev/null || true
+    fi
+}
+
+cleanup() {
+    if [ -n "$monitor_pid" ] && kill -0 "$monitor_pid" 2>/dev/null; then
+        kill -TERM "$monitor_pid" 2>/dev/null || true
+        wait "$monitor_pid" 2>/dev/null || true
+    fi
+    if kill -0 "$xvfb_pid" 2>/dev/null; then
+        kill -TERM "$xvfb_pid" 2>/dev/null || true
+        wait "$xvfb_pid" 2>/dev/null || true
+    fi
+}
+
+trap terminate TERM INT HUP
+trap cleanup EXIT
+
+ready=false
+for _attempt in $(seq 1 50); do
+    if [ -S /tmp/.X11-unix/X99 ]; then
+        ready=true
         break
     fi
-    echo "  waiting... ($i/30)"
-    sleep 2
+    if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+        echo "Virtual display exited during startup" >&2
+        exit 1
+    fi
+    sleep 0.1
 done
+[ "$ready" = true ] || {
+    echo "Virtual display did not become ready" >&2
+    exit 1
+}
 
-# Ensure new columns exist on older databases
-python -c "
-import psycopg2, os
-conn = psycopg2.connect(os.environ.get('DATABASE_URL', 'postgresql://twitch:twitch@db:5432/twitch_drops'))
-cur = conn.cursor()
-cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_username VARCHAR(100)')
-cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_password VARCHAR(256)')
-cur.execute('ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS twitch_auth_token TEXT')
-cur.execute('''CREATE TABLE IF NOT EXISTS watch_targets (
-    id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-    game_name VARCHAR(200) NOT NULL, game_url VARCHAR(500),
-    streamer VARCHAR(100), enabled BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT NOW())''')
-conn.commit()
-conn.close()
-print('Schema migration OK')
-" 2>/dev/null || echo "Schema migration skipped (tables may not exist yet)"
+echo "Starting application with a supervised virtual display..."
+"$@" &
+app_pid=$!
 
-exec "$@"
+monitor_display() {
+    while kill -0 "$app_pid" 2>/dev/null; do
+        if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+            echo "Virtual display exited; stopping the application for container recovery" >&2
+            kill -TERM "$app_pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 2
+    done
+}
+monitor_display &
+monitor_pid=$!
+
+set +e
+wait "$app_pid"
+status=$?
+if kill -0 "$app_pid" 2>/dev/null; then
+    wait "$app_pid"
+    status=$?
+fi
+set -e
+exit "$status"

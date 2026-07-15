@@ -13,6 +13,11 @@ class ProcessLock:
         self._file = None
 
     def __enter__(self):
+        return self.acquire()
+
+    def acquire(self):
+        if self._file:
+            return self
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         lock_file = open(self.path, "a+b")
         if lock_file.tell() == 0:
@@ -37,6 +42,9 @@ class ProcessLock:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+    def release(self):
         if not self._file:
             return
         try:

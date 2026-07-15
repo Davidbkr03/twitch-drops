@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
   <title>{% block title %}Twitch Drop Automator{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
   {% block head %}{% endblock %}
@@ -16,7 +17,10 @@
     <div class="nav-right">
       {% if current_user.is_authenticated %}
         <span class="nav-user">{{ current_user.username }}</span>
-        <a href="{{ url_for('auth.logout') }}" class="btn btn-sm btn-outline">Log out</a>
+        <form method="POST" action="{{ url_for('auth.logout') }}" class="nav-logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="btn btn-sm btn-outline">Log out</button>
+        </form>
       {% endif %}
     </div>
   </nav>

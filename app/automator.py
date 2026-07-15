@@ -4,12 +4,9 @@ import asyncio
 import logging
 import os
 import re
-import shutil
-import subprocess
 import threading
 import time
-from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
@@ -34,7 +31,6 @@ TWITCH_DROPS_ENABLED_URL = "https://www.twitch.tv/directory/all/tags/dropsenable
 TWITCH_LOGIN_URL = "https://www.twitch.tv/login"
 
 BROWSER_ARGS = [
-    "--no-sandbox",
     "--disable-blink-features=AutomationControlled",
     "--disable-features=BlockThirdPartyCookies,CookieDeprecationMessages,TranslateUI",
     "--disable-background-timer-throttling",
@@ -48,7 +44,6 @@ BROWSER_ARGS = [
     "--disable-translate",
     "--disable-component-extensions-with-background-pages",
     "--disable-http-cache",
-    "--disable-dev-shm-usage",
     "--disable-popup-blocking",
     "--disable-field-trial-config",
     "--disable-back-forward-cache",
@@ -65,7 +60,6 @@ BROWSER_ARGS = [
 ]
 
 VIEWPORT = {"width": 1366, "height": 768}
-DEFAULT_BROWSER_CHANNELS = ("msedge", "chrome")
 
 _GAME_CARD_EXTRACTOR_JS = r"""
 () => {
@@ -146,80 +140,6 @@ _STREAM_CARD_EXTRACTOR_JS = r"""
     return out;
 }
 """
-
-
-def browser_channel_candidates(configured_channel: str | None = None) -> tuple[str | None, ...]:
-    """Return one forced channel, or branded defaults with Chromium fallback."""
-    if configured_channel and configured_channel.strip():
-        return (configured_channel.strip(),)
-    candidates: list[str | None] = []
-    candidates.extend(DEFAULT_BROWSER_CHANNELS)
-    candidates.append(None)
-    return tuple(dict.fromkeys(candidates))
-
-
-def find_native_browser() -> tuple[str, str, str] | None:
-    """Find a supported installed browser for user-driven Twitch login."""
-    configured = os.environ.get("TWITCH_BROWSER_EXECUTABLE")
-    candidates: list[tuple[str, str | None, str]] = []
-    if configured:
-        configured_channel = "msedge" if "edge" in Path(configured).stem.lower() else "chrome"
-        candidates.append((Path(configured).stem, configured, configured_channel))
-
-    if os.name == "nt":
-        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
-        program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        candidates.extend([
-            ("Microsoft Edge", os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"), "msedge"),
-            ("Microsoft Edge", os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"), "msedge"),
-            ("Google Chrome", os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"), "chrome"),
-            ("Google Chrome", os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"), "chrome"),
-            ("Google Chrome", os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"), "chrome"),
-        ])
-    elif os.name == "posix":
-        candidates.extend([
-            ("Microsoft Edge", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "msedge"),
-            ("Google Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "chrome"),
-        ])
-
-    for command, browser_name, channel in (
-        ("msedge", "Microsoft Edge", "msedge"),
-        ("microsoft-edge", "Microsoft Edge", "msedge"),
-        ("google-chrome", "Google Chrome", "chrome"),
-        ("chrome", "Google Chrome", "chrome"),
-    ):
-        candidates.append((browser_name, shutil.which(command), channel))
-
-    for browser_name, executable, channel in candidates:
-        if executable and os.path.isfile(executable):
-            return browser_name, executable, channel
-    return None
-
-
-def launch_native_twitch_login(data_dir: str) -> tuple[str, str, subprocess.Popen]:
-    """Open Twitch in an ordinary browser that persists into the automation profile."""
-    browser = find_native_browser()
-    if not browser:
-        raise RuntimeError("No supported native browser is installed")
-    browser_name, executable, channel = browser
-    os.makedirs(data_dir, exist_ok=True)
-    process = subprocess.Popen(
-        [
-            executable,
-            f"--user-data-dir={os.path.abspath(data_dir)}",
-            "--profile-directory=Default",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-mode",
-            TWITCH_LOGIN_URL,
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
-    return browser_name, channel, process
 
 
 def screencast_emit_interval(max_fps: int) -> float:
@@ -327,6 +247,7 @@ _STEALTH_JS = """(() => {
 # Manager
 # ======================================================================
 
+
 class AutomationManager:
     _instance = None
 
@@ -334,15 +255,19 @@ class AutomationManager:
         self.socketio = socketio
         self.app = app
         self.automators: dict[int, "UserAutomator"] = {}
-        self._native_login_processes: dict[int, subprocess.Popen] = {}
-        self._native_login_channels: dict[int, str] = {}
-        self._native_login_starting: set[int] = set()
+        self._preview_clients: dict[int, int] = {}
+        self._shutting_down = threading.Event()
         self._lock = threading.RLock()
+        self._reconcile_thread: threading.Thread | None = None
+        self._state_versions: dict[int, int] = {}
+        self._automator_snapshot: tuple["UserAutomator", ...] = ()
 
     def _data_dir_for_user(self, user_id: int) -> str:
-        return os.path.join(
-            self.app.config.get("BROWSER_DATA_DIR", "/data/browser"), str(user_id)
-        )
+        return os.path.join(self.app.config.get("BROWSER_DATA_DIR", "/data/browser"), str(user_id))
+
+    def _refresh_automator_snapshot(self) -> None:
+        """Publish a mutation-safe worker snapshot while the manager lock is held."""
+        self._automator_snapshot = tuple(self.automators.values())
 
     @classmethod
     def init(cls, socketio, app):
@@ -353,82 +278,225 @@ class AutomationManager:
     def get(cls):
         return cls._instance
 
-    def start_for_user(self, user_id: int) -> bool:
+    def _set_automation_enabled(self, user_id: int, enabled: bool) -> bool:
+        try:
+            with self.app.app_context():
+                from app.extensions import db
+                from app.models import UserSettings
+
+                settings = UserSettings.query.filter_by(user_id=user_id).first()
+                if not settings:
+                    return False
+                settings.automation_enabled = enabled
+                db.session.commit()
+                return True
+        except Exception:
+            logger.exception(
+                "Could not persist automation state for user %s",
+                user_id,
+            )
+            return False
+
+    def _automation_is_enabled(self, user_id: int) -> bool:
+        try:
+            with self.app.app_context():
+                from app.models import User, UserSettings
+
+                return (
+                    UserSettings.query.join(User)
+                    .filter(
+                        UserSettings.user_id == user_id,
+                        UserSettings.automation_enabled.is_(True),
+                        User.is_active.is_(True),
+                    )
+                    .first()
+                    is not None
+                )
+        except Exception:
+            logger.exception(
+                "Could not verify desired automation state for user %s",
+                user_id,
+            )
+            return False
+
+    def _enabled_user_ids(self) -> list[int]:
+        """Load active users whose persisted desired state is enabled."""
+        with self.app.app_context():
+            from app.models import User, UserSettings
+
+            return [
+                row.user_id
+                for row in UserSettings.query.join(User).filter(
+                    UserSettings.automation_enabled.is_(True),
+                    User.is_active.is_(True),
+                )
+            ]
+
+    def reconcile_enabled_users(self) -> None:
+        """Restart missing workers whose persisted desired state is enabled."""
+        if self._shutting_down.is_set():
+            return
+        try:
+            user_ids = self._enabled_user_ids()
+        except Exception:
+            logger.exception("Could not reconcile enabled automations")
+            return
+
+        for user_id in user_ids:
+            with self._lock:
+                existing = self.automators.get(user_id)
+                if existing and existing.is_alive():
+                    continue
+                state_version = self._state_versions.get(user_id, 0)
+            enabled = self._automation_is_enabled(user_id)
+            with self._lock:
+                if self._shutting_down.is_set():
+                    return
+                if self._state_versions.get(user_id, 0) != state_version:
+                    continue
+                existing = self.automators.get(user_id)
+                if existing and existing.is_alive():
+                    continue
+                if not enabled:
+                    continue
+                if not self.start_for_user(user_id, persist=False):
+                    logger.error("Could not reconcile automation for user %s", user_id)
+
+    def restore_enabled_users(self) -> None:
+        """Start every automation that was enabled before the process restarted."""
+        self.reconcile_enabled_users()
+
+    def start_reconciler(self) -> None:
+        """Continuously repair enabled workers after rare thread-level exits."""
         with self._lock:
-            if (
-                user_id in self._native_login_starting
-                or self._native_login_active_unlocked(user_id)
-            ):
+            if self._shutting_down.is_set():
+                return
+            if self._reconcile_thread and self._reconcile_thread.is_alive():
+                return
+            self._reconcile_thread = threading.Thread(
+                target=self._reconcile_loop,
+                name="automation-reconciler",
+                daemon=True,
+            )
+            self._reconcile_thread.start()
+
+    def _reconcile_loop(self) -> None:
+        interval = int(self.app.config.get("AUTOMATION_RECONCILE_INTERVAL_SECONDS", 30))
+        while not self._shutting_down.wait(max(5, interval)):
+            try:
+                self.reconcile_enabled_users()
+            except Exception:
+                # Keep the watchdog alive even if a future reconciliation path
+                # gains an exception outside its current defensive boundary.
+                logger.exception("Unexpected automation reconciliation failure")
+
+    def reconciler_is_alive(self) -> bool:
+        thread = self._reconcile_thread
+        return bool(thread and thread.is_alive())
+
+    def start_for_user(self, user_id: int, *, persist: bool = True) -> bool:
+        with self._lock:
+            if self._shutting_down.is_set():
                 return False
             existing = self.automators.get(user_id)
             if existing and existing.is_alive():
                 return False
-            data_dir = self._data_dir_for_user(user_id)
-            os.makedirs(data_dir, exist_ok=True)
-            automator = UserAutomator(
-                user_id,
-                data_dir,
-                self.socketio,
-                self.app,
-                browser_channel=self._native_login_channels.get(user_id),
-            )
-            self.automators[user_id] = automator
-            automator.start()
+            active_count = sum(automator.is_alive() for automator in self.automators.values())
+            if active_count >= int(self.app.config.get("MAX_AUTOMATORS", 2)):
+                logger.warning("Automation capacity reached; rejected user %s", user_id)
+                return False
+            state_persisted = persist and self._set_automation_enabled(user_id, True)
+            if persist and not state_persisted:
+                return False
+            if state_persisted:
+                self._state_versions[user_id] = self._state_versions.get(user_id, 0) + 1
+            if self._shutting_down.is_set():
+                # Preserve the enabled desired state for the next process, but
+                # do not create a worker after graceful shutdown has begun.
+                return False
+            try:
+                data_dir = self._data_dir_for_user(user_id)
+                os.makedirs(data_dir, exist_ok=True)
+                automator = UserAutomator(
+                    user_id,
+                    data_dir,
+                    self.socketio,
+                    self.app,
+                    preview_enabled=self._preview_clients.get(user_id, 0) > 0,
+                )
+                self.automators[user_id] = automator
+                self._refresh_automator_snapshot()
+                if self._shutting_down.is_set():
+                    return False
+                automator.start()
+                if self._shutting_down.is_set():
+                    # Shutdown may set its event without acquiring this lock.
+                    # A start already past the earlier check must self-signal
+                    # so it cannot escape a timed fallback snapshot.
+                    automator.stop()
+                    return False
+            except Exception:
+                self.automators.pop(user_id, None)
+                self._refresh_automator_snapshot()
+                if state_persisted:
+                    if self._set_automation_enabled(user_id, False):
+                        self._state_versions[user_id] = self._state_versions.get(user_id, 0) + 1
+                logger.exception("Could not start automation for user %s", user_id)
+                return False
             return True
 
-    def stop_for_user(self, user_id: int) -> bool:
+    def stop_for_user(self, user_id: int, *, persist: bool = True) -> bool:
         with self._lock:
+            state_changed = self._set_automation_enabled(user_id, False) if persist else False
+            if persist and not state_changed:
+                return False
+            if state_changed:
+                self._state_versions[user_id] = self._state_versions.get(user_id, 0) + 1
             automator = self.automators.get(user_id)
             if automator and automator.is_alive():
                 automator.stop()
                 return True
-            return False
+            return state_changed
 
-    def open_native_login_for_user(self, user_id: int) -> tuple[bool, str]:
-        """Stop automation, release its profile, and open a normal login browser."""
+    def set_preview_connected(self, user_id: int, connected: bool) -> None:
         with self._lock:
-            if (
-                user_id in self._native_login_starting
-                or self._native_login_active_unlocked(user_id)
-            ):
-                return False, "The native Twitch login browser is already open"
-            self._native_login_starting.add(user_id)
+            count = self._preview_clients.get(user_id, 0)
+            count = count + 1 if connected else max(0, count - 1)
+            if count:
+                self._preview_clients[user_id] = count
+            else:
+                self._preview_clients.pop(user_id, None)
             automator = self.automators.get(user_id)
-            if automator and automator.is_alive():
-                automator.stop()
+            enabled = count > 0
+        if automator:
+            automator.set_preview_enabled(enabled)
 
+    def is_shutting_down(self) -> bool:
+        return self._shutting_down.is_set()
+
+    def shutdown(self, timeout: float = 45) -> None:
+        """Stop all browser workers without clearing their persisted desired state."""
+        if self._shutting_down.is_set():
+            return
+        self._shutting_down.set()
+        deadline = time.monotonic() + max(0, timeout)
+        lock_timeout = max(0, min(1, deadline - time.monotonic()))
+        acquired = self._lock.acquire(timeout=lock_timeout)
         try:
-            if automator and not automator.wait_until_stopped(timeout=15):
-                return False, "Automation browser is still stopping; try again in a moment"
-            browser_name, channel, process = launch_native_twitch_login(
-                self._data_dir_for_user(user_id)
+            automators = (
+                list(self.automators.values()) if acquired else list(self._automator_snapshot)
             )
-        except (OSError, RuntimeError) as exc:
-            return False, str(exc)
-        else:
-            with self._lock:
-                self._native_login_processes[user_id] = process
-                self._native_login_channels[user_id] = channel
-            return True, browser_name
+            reconcile_thread = self._reconcile_thread
         finally:
-            with self._lock:
-                self._native_login_starting.discard(user_id)
-
-    def _native_login_active_unlocked(self, user_id: int) -> bool:
-        process = self._native_login_processes.get(user_id)
-        if not process:
-            return False
-        if process.poll() is None:
-            return True
-        self._native_login_processes.pop(user_id, None)
-        return False
-
-    def native_login_active_for_user(self, user_id: int) -> bool:
-        with self._lock:
-            return (
-                user_id in self._native_login_starting
-                or self._native_login_active_unlocked(user_id)
-            )
+            if acquired:
+                self._lock.release()
+        for automator in automators:
+            if automator.is_alive():
+                automator.stop()
+        if reconcile_thread and reconcile_thread is not threading.current_thread():
+            reconcile_thread.join(max(0, deadline - time.monotonic()))
+        for automator in automators:
+            automator.wait_until_stopped(max(0, deadline - time.monotonic()))
 
     def get_automator(self, user_id: int):
         return self.automators.get(user_id)
@@ -442,9 +510,15 @@ class AutomationManager:
                 "running": False,
                 "browser_ready": False,
                 "logged_in": False,
-                "twitch_saved": False,
             }
-        status["native_login_active"] = self.native_login_active_for_user(user_id)
+        try:
+            with self.app.app_context():
+                from app.models import UserSettings
+
+                settings = UserSettings.query.filter_by(user_id=user_id).first()
+                status["automation_enabled"] = bool(settings and settings.automation_enabled)
+        except Exception:
+            status["automation_enabled"] = status.get("running", False)
         return status
 
 
@@ -452,26 +526,28 @@ class AutomationManager:
 # Per-user automator
 # ======================================================================
 
-class UserAutomator:
 
+class UserAutomator:
     def __init__(
         self,
         user_id: int,
         data_dir: str,
         socketio,
         app,
-        browser_channel: str | None = None,
+        preview_enabled: bool = False,
     ):
         self.user_id = user_id
         self.data_dir = data_dir
         self.socketio = socketio
         self.app = app
-        self.browser_channel = browser_channel
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._main_task: asyncio.Task | None = None
         self._stop = threading.Event()
+        self._preview_enabled = threading.Event()
+        if preview_enabled:
+            self._preview_enabled.set()
 
         self.running = False
         self.context = None
@@ -490,8 +566,6 @@ class UserAutomator:
             "logged_in": False,
             "browser_channel": None,
             "browser_ready": False,
-            "twitch_user": None,
-            "twitch_saved": False,
             "watching": None,
             "watching_game": None,
             "watching_game_url": None,
@@ -502,6 +576,7 @@ class UserAutomator:
             "drops_claimed": [],
             "last_check": None,
             "last_update": None,
+            "restart_count": 0,
         }
 
     # ---- lifecycle ----
@@ -512,20 +587,9 @@ class UserAutomator:
         self._total_watch_secs = 0
         self._watch_start = None
 
-        twitch_saved = False
-        try:
-            with self.app.app_context():
-                from app.models import UserSettings
-                s = UserSettings.query.filter_by(user_id=self.user_id).first()
-                if s and (s.twitch_username or s.twitch_auth_token):
-                    twitch_saved = True
-        except Exception:
-            pass
-
         self._update_status(
             running=True,
             browser_ready=False,
-            twitch_saved=twitch_saved,
             message="Starting…",
         )
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
@@ -544,7 +608,26 @@ class UserAutomator:
         self._stop.set()
         self._update_status(message="Stopping…")
         if self._loop and self._loop.is_running() and self._main_task:
-            self._loop.call_soon_threadsafe(self._main_task.cancel)
+            try:
+                self._loop.call_soon_threadsafe(self._main_task.cancel)
+            except RuntimeError:
+                # The worker may close its loop after is_running().
+                pass
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._preview_enabled.set()
+        else:
+            self._preview_enabled.clear()
+        if not self._loop or not self._loop.is_running():
+            return
+        coroutine = self._start_screencast() if enabled else self._stop_screencast()
+        try:
+            asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        except RuntimeError:
+            # The browser thread may close its loop between the state check and
+            # scheduling. Close the coroutine so Python does not warn or leak it.
+            coroutine.close()
 
     def get_status(self) -> dict:
         s = dict(self.status)
@@ -585,34 +668,56 @@ class UserAutomator:
                     message=f"Automation error: {detail[:200]}",
                 )
             else:
-                message = "Stopped" if self._stop.is_set() else self.status.get("message", "Stopped")
+                message = (
+                    "Stopped" if self._stop.is_set() else self.status.get("message", "Stopped")
+                )
                 self._update_status(running=False, message=message)
 
     async def _async_main(self):
         tried_compat = False
-        async with async_playwright() as p:
-            while not self._stop.is_set():
-                self._passport_429 = 0
-                try:
+        failure_count = 0
+        while not self._stop.is_set():
+            self._passport_429 = 0
+            cycle_started = time.monotonic()
+            delay = 0
+            try:
+                # Restart the Playwright driver as well as Chromium after a
+                # failure. A dead driver must not strand an enabled worker.
+                async with async_playwright() as p:
                     await self._launch_browser(p, compat_mode=tried_compat)
-                    await self._start_screencast()
+                    if self._preview_enabled.is_set():
+                        await self._start_screencast()
                     await self._full_automation()
-                    break
-                except asyncio.CancelledError:
-                    break
-                except Exception:
-                    logger.exception("User %s flow error", self.user_id)
-                    if self._passport_429 >= 3 and not tried_compat:
-                        tried_compat = True
-                        self._update_status(message="Retrying with compatibility mode…")
-                        logger.info("User %s: switching to compat mode after %d 429s",
-                                    self.user_id, self._passport_429)
-                        await self._cleanup()
-                        await asyncio.sleep(5)
-                        continue
-                    raise
-                finally:
-                    await self._cleanup()
+                    if not self._stop.is_set():
+                        raise RuntimeError("Automation flow ended unexpectedly")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.exception("User %s flow error", self.user_id)
+                if self._passport_429 >= 3 and not tried_compat:
+                    tried_compat = True
+                    logger.info(
+                        "User %s: switching to compat mode after %d 429s",
+                        self.user_id,
+                        self._passport_429,
+                    )
+                if time.monotonic() - cycle_started >= 300:
+                    failure_count = 0
+                failure_count += 1
+                base_delay = int(self.app.config.get("AUTOMATION_RETRY_BASE_SECONDS", 5))
+                max_delay = int(self.app.config.get("AUTOMATION_RETRY_MAX_SECONDS", 300))
+                delay = min(max_delay, base_delay * (2 ** min(failure_count - 1, 8)))
+                detail = str(exc).strip() or exc.__class__.__name__
+                self._update_status(
+                    browser_ready=False,
+                    logged_in=False,
+                    restart_count=failure_count,
+                    message=f"Automation error: {detail[:120]}; retrying in {delay}s",
+                )
+            finally:
+                await self._cleanup()
+            if not self._stop.is_set() and delay:
+                await self._sleep(delay)
 
     # ---- browser launch ----
 
@@ -633,36 +738,11 @@ class UserAutomator:
             args=args,
             viewport=VIEWPORT,
             locale="en-US",
+            chromium_sandbox=True,
         )
-        configured_channel = self.browser_channel or os.environ.get("TWITCH_BROWSER_CHANNEL")
-        launch_error = None
-        for channel in browser_channel_candidates(configured_channel):
-            try:
-                launch_kw = dict(kw)
-                if channel:
-                    launch_kw["channel"] = channel
-                self.context = await p.chromium.launch_persistent_context(**launch_kw)
-                logger.info(
-                    "User %s browser launched with %s",
-                    self.user_id,
-                    channel or "bundled Chromium",
-                )
-                browser_name = {
-                    "msedge": "Microsoft Edge",
-                    "chrome": "Google Chrome",
-                    None: "Bundled Chromium",
-                }.get(channel, channel)
-                self._update_status(browser_channel=browser_name)
-                break
-            except Exception as exc:
-                launch_error = exc
-                logger.info(
-                    "User %s browser channel %s unavailable",
-                    self.user_id,
-                    channel or "bundled Chromium",
-                )
-        if self.context is None:
-            raise RuntimeError("No compatible Chromium browser could be launched") from launch_error
+        self.context = await p.chromium.launch_persistent_context(**kw)
+        logger.info("User %s bundled Chromium launched", self.user_id)
+        self._update_status(browser_channel="Bundled Chromium")
 
         # Apply stealth via Playwright init scripts (covers main page frames)
         stealth = Stealth(init_scripts_only=True, navigator_webdriver=True)
@@ -674,10 +754,13 @@ class UserAutomator:
         # cross-origin Kasada iframes that context.add_init_script misses.
         try:
             cdp = await self.context.new_cdp_session(self.page)
-            await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-                "source": _STEALTH_JS,
-                "runImmediately": True,
-            })
+            await cdp.send(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": _STEALTH_JS,
+                    "runImmediately": True,
+                },
+            )
             await cdp.detach()
         except Exception:
             # Fallback to context-level script
@@ -688,12 +771,13 @@ class UserAutomator:
     # ---- screencast ----
 
     async def _start_screencast(self):
-        if not self.page:
+        if not self.page or self.cdp_session:
             return
         quality, max_fps = 50, 3
         try:
             with self.app.app_context():
                 from app.models import UserSettings
+
                 s = UserSettings.query.filter_by(user_id=self.user_id).first()
                 if s:
                     quality = max(10, min(100, s.screencast_quality or 50))
@@ -708,6 +792,21 @@ class UserAutomator:
             await self.cdp_session.send("Page.startScreencast", screencast_options(quality))
         except Exception:
             logger.exception("User %s screencast init failed", self.user_id)
+            await self._stop_screencast()
+
+    async def _stop_screencast(self):
+        session = self.cdp_session
+        self.cdp_session = None
+        if not session:
+            return
+        try:
+            await session.send("Page.stopScreencast")
+        except Exception:
+            pass
+        try:
+            await session.detach()
+        except Exception:
+            pass
 
     def _on_frame(self, params):
         try:
@@ -720,10 +819,13 @@ class UserAutomator:
                     room=f"user_{self.user_id}",
                 )
             if self.cdp_session and self._loop and self._loop.is_running():
-                asyncio.run_coroutine_threadsafe(
-                    self.cdp_session.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]}),
-                    self._loop,
+                acknowledgement = self.cdp_session.send(
+                    "Page.screencastFrameAck", {"sessionId": params["sessionId"]}
                 )
+                try:
+                    asyncio.run_coroutine_threadsafe(acknowledgement, self._loop)
+                except RuntimeError:
+                    acknowledgement.close()
         except Exception:
             pass
 
@@ -741,7 +843,9 @@ class UserAutomator:
             elif k == "press":
                 await self.page.keyboard.press(data.get("key", ""))
             elif k == "scroll":
-                await self.page.mouse.wheel(float(data.get("deltaX", 0)), float(data.get("deltaY", 0)))
+                await self.page.mouse.wheel(
+                    float(data.get("deltaX", 0)), float(data.get("deltaY", 0))
+                )
         except Exception:
             pass
 
@@ -750,8 +854,6 @@ class UserAutomator:
     # ==================================================================
 
     async def _full_automation(self):
-        import random
-
         # Track passport 429s for compat-mode switch
         def _on_resp(resp):
             try:
@@ -759,16 +861,13 @@ class UserAutomator:
                     self._passport_429 += 1
             except Exception:
                 pass
+
         self.page.on("response", _on_resp)
 
-        # 1. Load stored Twitch credentials
-        twitch_user, twitch_pass = self._load_twitch_creds()
-        if twitch_user:
-            self._update_status(twitch_user=twitch_user, twitch_saved=True)
-
-        # 2. Navigate to inventory — Twitch will redirect to login if needed
+        # Navigate to inventory — Twitch will redirect to login if needed.
         self._update_status(message="Navigating to Twitch…")
-        await self._goto(TWITCH_INVENTORY_URL)
+        if not await self._goto(TWITCH_INVENTORY_URL):
+            raise RuntimeError("Could not reach Twitch inventory")
         await asyncio.sleep(4)
         await self._accept_cookies()
 
@@ -781,216 +880,26 @@ class UserAutomator:
         logged_in = await self._is_logged_in()
         self._update_status(logged_in=logged_in)
 
-        # 3. Try cookie-based login first (if auth_token is stored)
+        # Imported tokens and normal browser logins persist in the browser profile.
+        # If that session has expired, wait for the owner to reconnect through the preview.
         if not logged_in:
-            try:
-                with self.app.app_context():
-                    from app.models import UserSettings
-                    s = UserSettings.query.filter_by(user_id=self.user_id).first()
-                    if s and s.twitch_auth_token:
-                        self._update_status(message="Logging in with saved auth token…")
-                        logged_in = await self.import_cookies(s.twitch_auth_token)
-                        self._update_status(logged_in=logged_in)
-            except Exception:
-                pass
-
-        # 4. If still not logged in, pre-fill credentials on login page
-        if not logged_in:
-            # Check if we got redirected to login
             if "/login" not in (self.page.url or ""):
                 await self._goto(TWITCH_LOGIN_URL)
                 await asyncio.sleep(3)
 
             await self._accept_cookies()
-            await asyncio.sleep(2 + random.random() * 2)
-
-            if twitch_user and twitch_pass:
-                self._update_status(message="Pre-filling credentials — click Log In in the preview")
-                try:
-                    await self.page.wait_for_selector(
-                        'input[autocomplete="username"]', timeout=10000
-                    )
-                    await asyncio.sleep(0.5 + random.random())
-                    u_el = await self.page.query_selector('input[autocomplete="username"]')
-                    if u_el:
-                        await u_el.click()
-                        await asyncio.sleep(0.2 + random.random() * 0.3)
-                        await u_el.press("Control+a")
-                        await u_el.type(twitch_user, delay=55 + random.randint(0, 45))
-                    await asyncio.sleep(0.3 + random.random() * 0.4)
-                    p_el = await self.page.query_selector('input[autocomplete="current-password"]')
-                    if p_el:
-                        await p_el.click()
-                        await asyncio.sleep(0.2 + random.random() * 0.3)
-                        await p_el.press("Control+a")
-                        await p_el.type(twitch_pass, delay=55 + random.randint(0, 45))
-                except Exception:
-                    pass
-
-            self._update_status(
-                message="Click Log In in the browser preview to complete first-time login"
-            )
+            self._update_status(message="Twitch login required — connect a token in the dashboard")
             logged_in = await self._wait_for_login()
             if not logged_in:
                 return
 
         self._update_status(logged_in=True, message="Logged in to Twitch!")
 
-        # 5. Main monitoring loop
+        # Main monitoring loop. Any unexpected failure returns to the outer
+        # browser supervisor so the whole context is recreated with backoff.
         while not self._stop.is_set():
-            try:
-                await self._check_and_claim_drops()
-                await self._watch_loop_cycle()
-            except Exception:
-                logger.exception("User %s loop error", self.user_id)
-                self._update_status(message="Error — retrying in 15 s")
-                await asyncio.sleep(15)
-
-    # ---- auto-login ----
-
-    async def auto_login(self, username: str, password: str):
-        """Called from the Socket.IO handler when user submits credentials via UI."""
-        self._save_twitch_creds(username, password)
-        self._update_status(twitch_user=username, twitch_saved=True, message=f"Logging in as {username}…")
-        ok = await self._do_auto_login(username, password)
-        self._update_status(logged_in=ok)
-        if ok:
-            self._update_status(message="Logged in to Twitch!")
-        return ok
-
-    async def _do_auto_login(self, username: str, password: str) -> bool:
-        import random
-
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            if self._stop.is_set():
-                return False
-            self._update_status(
-                message=f"Login attempt {attempt}/{max_attempts}…"
-                if attempt > 1 else f"Logging in as {username}…"
-            )
-
-            await self._goto(TWITCH_LOGIN_URL)
-            await asyncio.sleep(2)
-
-            # Dismiss cookie banner first — lets Kasada fingerprint scripts
-            # settle before we interact with the login form.
-            try:
-                proceed = await self.page.query_selector(
-                    'button:has-text("Proceed"), #onetrust-accept-btn-handler'
-                )
-                if proceed:
-                    await proceed.click()
-                    await asyncio.sleep(1)
-            except Exception:
-                pass
-
-            # Wait for Kasada/fingerprint iframes to finish initial load
-            await asyncio.sleep(3 + random.random() * 2)
-
-            try:
-                await self.page.wait_for_selector(
-                    'input[autocomplete="username"], #login-username', timeout=15000
-                )
-            except Exception:
-                continue
-
-            await asyncio.sleep(0.5 + random.random())
-
-            # Type username with human-like timing
-            self._update_status(message="Entering credentials…")
-            u_el = (
-                await self.page.query_selector('input[autocomplete="username"]')
-                or await self.page.query_selector('#login-username')
-            )
-            if u_el:
-                await u_el.click()
-                await asyncio.sleep(0.2 + random.random() * 0.3)
-                await u_el.press("Control+a")
-                await u_el.type(username, delay=50 + random.randint(0, 40))
-
-            await asyncio.sleep(0.3 + random.random() * 0.5)
-
-            p_el = (
-                await self.page.query_selector('input[autocomplete="current-password"]')
-                or await self.page.query_selector('#password-input')
-            )
-            if p_el:
-                await p_el.click()
-                await asyncio.sleep(0.2 + random.random() * 0.3)
-                await p_el.press("Control+a")
-                await p_el.type(password, delay=50 + random.randint(0, 40))
-
-            await asyncio.sleep(0.4 + random.random() * 0.5)
-
-            # Click login
-            btn = (
-                await self.page.query_selector('button[data-a-target="passport-login-button"]')
-                or await self.page.query_selector('button:has-text("Log In")')
-            )
-            if not btn:
-                self._update_status(message="Login button not found")
-                continue
-            await btn.click()
-            self._update_status(message="Waiting for Twitch…")
-
-            # Poll for result — spinner might hang due to Kasada 429
-            result = await self._poll_login_result(timeout_sec=30)
-
-            if result == "success":
-                logger.info("User %s: Twitch login succeeded", self.user_id)
-                return True
-            elif result == "error":
-                return False
-            elif result == "2fa":
-                self._update_status(
-                    message="Verification code required — enter it in the browser preview"
-                )
-                for _ in range(300):
-                    if self._stop.is_set():
-                        return False
-                    if await self._is_logged_in():
-                        return True
-                    await asyncio.sleep(2)
-                self._update_status(message="Verification timeout")
-                return False
-            else:
-                # "timeout" — spinner hung, Kasada likely blocked it
-                logger.warning("User %s: login attempt %d timed out (Kasada 429), retrying",
-                               self.user_id, attempt)
-                self._update_status(message=f"Login stalled — retrying ({attempt}/{max_attempts})…")
-                await asyncio.sleep(3)
-
-        self._update_status(message="Login failed after retries — try using the browser preview to log in manually")
-        return False
-
-    async def _poll_login_result(self, timeout_sec: int = 30) -> str:
-        """Poll the login page after clicking Log In.
-        Returns: 'success', 'error', '2fa', or 'timeout'.
-        """
-        for _ in range(timeout_sec):
-            if self._stop.is_set():
-                return "timeout"
-
-            if await self._is_logged_in():
-                return "success"
-
-            err = await self.page.query_selector('[data-a-target="passport-error"]')
-            if err:
-                txt = (await err.text_content() or "").strip()[:120]
-                self._update_status(message=f"Login error: {txt}")
-                return "error"
-
-            # Real 2FA: a new visible input appears for the verification code
-            # and the login form fields are hidden/replaced
-            u_el = await self.page.query_selector('input[autocomplete="username"]')
-            if not u_el:
-                # Login form disappeared — likely moved to 2FA/verification page
-                return "2fa"
-
-            await asyncio.sleep(1)
-
-        return "timeout"
+            await self._check_and_claim_drops()
+            await self._watch_loop_cycle()
 
     # ---- login helpers ----
 
@@ -1007,9 +916,7 @@ class UserAutomator:
             if signup:
                 return False
             # Double-check: user display name only exists when logged in
-            display = await self.page.query_selector(
-                '[data-a-target="user-display-name"]'
-            )
+            display = await self.page.query_selector('[data-a-target="user-display-name"]')
             if display:
                 return True
             # Fallback: if no signup button AND no display name, page might
@@ -1031,32 +938,6 @@ class UserAutomator:
         self._update_status(message="Login timeout")
         return False
 
-    # ---- credential storage ----
-
-    def _load_twitch_creds(self) -> tuple[str | None, str | None]:
-        try:
-            with self.app.app_context():
-                from app.models import UserSettings
-                s = UserSettings.query.filter_by(user_id=self.user_id).first()
-                if s and s.twitch_username:
-                    return s.twitch_username, s.twitch_password
-        except Exception:
-            pass
-        return None, None
-
-    def _save_twitch_creds(self, username: str, password: str):
-        try:
-            with self.app.app_context():
-                from app.models import UserSettings
-                from app.extensions import db
-                s = UserSettings.query.filter_by(user_id=self.user_id).first()
-                if s:
-                    s.twitch_username = username
-                    s.twitch_password = password
-                    db.session.commit()
-        except Exception:
-            logger.debug("cred save error", exc_info=True)
-
     # ---- cookie import ----
 
     async def import_cookies(self, auth_token: str):
@@ -1065,17 +946,19 @@ class UserAutomator:
         if not self.context:
             return False
         try:
-            await self.context.add_cookies([
-                {
-                    "name": "auth-token",
-                    "value": auth_token.strip(),
-                    "domain": ".twitch.tv",
-                    "path": "/",
-                    "httpOnly": False,
-                    "secure": True,
-                    "sameSite": "None",
-                },
-            ])
+            await self.context.add_cookies(
+                [
+                    {
+                        "name": "auth-token",
+                        "value": auth_token.strip(),
+                        "domain": ".twitch.tv",
+                        "path": "/",
+                        "httpOnly": False,
+                        "secure": True,
+                        "sameSite": "None",
+                    },
+                ]
+            )
             # Verify by navigating to Twitch
             await self._goto(TWITCH_INVENTORY_URL)
             await asyncio.sleep(4)
@@ -1186,11 +1069,13 @@ class UserAutomator:
                     await asyncio.sleep(1.5)
                     if not isinstance(claim_info, dict):
                         claim_info = {"name": claim_info or "Drop claimed", "game": ""}
-                    claimed.append({
-                        "name": normalize_drop_name(claim_info.get("name")),
-                        "game": (claim_info.get("game") or "").strip() or None,
-                        "time": datetime.now(timezone.utc).isoformat(),
-                    })
+                    claimed.append(
+                        {
+                            "name": normalize_drop_name(claim_info.get("name")),
+                            "game": (claim_info.get("game") or "").strip() or None,
+                            "time": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
                 except Exception:
                     pass
 
@@ -1319,13 +1204,15 @@ class UserAutomator:
                 }
             """)
 
-            for item in (inventory.get("items") or []):
-                in_progress.append({
-                    "name": normalize_drop_name(item.get("name")),
-                    "progress": item.get("progress", 0),
-                    "image": item.get("image", ""),
-                    "game": (item.get("game") or "").strip() or None,
-                })
+            for item in inventory.get("items") or []:
+                in_progress.append(
+                    {
+                        "name": normalize_drop_name(item.get("name")),
+                        "progress": item.get("progress", 0),
+                        "image": item.get("image", ""),
+                        "game": (item.get("game") or "").strip() or None,
+                    }
+                )
 
             self._detect_completed_games(inventory.get("campaigns") or [])
 
@@ -1351,9 +1238,7 @@ class UserAutomator:
         records: list[tuple[str, bool]] = []
         for campaign in campaigns:
             game_path = str(campaign.get("gamePath") or "").strip()
-            if not game_path.casefold().startswith(
-                ("/directory/category/", "/directory/game/")
-            ):
+            if not game_path.casefold().startswith(("/directory/category/", "/directory/game/")):
                 continue
             records.append((game_path, campaign.get("complete") is True))
 
@@ -1396,11 +1281,14 @@ class UserAutomator:
                         return legacy
                     return query.filter(DropLog.game.is_(None)).first()
 
-                normalized_progress = [{
-                    **d,
-                    "name": normalize_drop_name(d.get("name"))[:255],
-                    "game": (d.get("game") or "").strip() or None,
-                } for d in in_progress]
+                normalized_progress = [
+                    {
+                        **d,
+                        "name": normalize_drop_name(d.get("name"))[:255],
+                        "game": (d.get("game") or "").strip() or None,
+                    }
+                    for d in in_progress
+                ]
                 claimed_keys: set[tuple[str, str | None]] = set()
                 resolved_game_less_claims: dict[str, str | None] = {}
                 for d in claimed:
@@ -1412,9 +1300,9 @@ class UserAutomator:
                             for row in DropLog.query.filter_by(
                                 user_id=self.user_id,
                                 drop_name=name,
-                            ).filter(
-                                DropLog.status.in_(("in_progress", "claimed"))
-                            ).all()
+                            )
+                            .filter(DropLog.status.in_(("in_progress", "claimed")))
+                            .all()
                             if row.game
                         }
                         incoming_games = {
@@ -1435,18 +1323,18 @@ class UserAutomator:
                         existing = find_log(name, "claimed", game)
                         if existing:
                             existing.progress = 100
-                            existing.claimed_at = (
-                                existing.claimed_at or datetime.now(timezone.utc)
-                            )
+                            existing.claimed_at = existing.claimed_at or datetime.now(timezone.utc)
                         else:
-                            db.session.add(DropLog(
-                                user_id=self.user_id,
-                                drop_name=name,
-                                game=game,
-                                status="claimed",
-                                progress=100,
-                                claimed_at=datetime.now(timezone.utc),
-                            ))
+                            db.session.add(
+                                DropLog(
+                                    user_id=self.user_id,
+                                    drop_name=name,
+                                    game=game,
+                                    status="claimed",
+                                    progress=100,
+                                    claimed_at=datetime.now(timezone.utc),
+                                )
+                            )
                     claimed_keys.add((name, game))
                 for d in normalized_progress:
                     name = d["name"]
@@ -1462,11 +1350,35 @@ class UserAutomator:
                     if ex:
                         ex.progress = progress
                     else:
-                        db.session.add(DropLog(
-                            user_id=self.user_id, drop_name=name,
-                            game=game, status="in_progress",
-                            progress=progress,
-                        ))
+                        db.session.add(
+                            DropLog(
+                                user_id=self.user_id,
+                                drop_name=name,
+                                game=game,
+                                status="in_progress",
+                                progress=progress,
+                            )
+                        )
+
+                retention_days = int(self.app.config.get("DROP_LOG_RETENTION_DAYS", 365))
+                max_rows = int(self.app.config.get("DROP_LOG_MAX_ROWS_PER_USER", 10_000))
+                cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+                DropLog.query.filter(
+                    DropLog.user_id == self.user_id,
+                    DropLog.created_at < cutoff,
+                ).delete(synchronize_session=False)
+                overflow_ids = [
+                    row.id
+                    for row in DropLog.query.filter_by(user_id=self.user_id)
+                    .order_by(DropLog.created_at.desc(), DropLog.id.desc())
+                    .offset(max_rows)
+                    .limit(1000)
+                    .all()
+                ]
+                if overflow_ids:
+                    DropLog.query.filter(DropLog.id.in_(overflow_ids)).delete(
+                        synchronize_session=False
+                    )
                 db.session.commit()
         except Exception:
             logger.debug("persist error", exc_info=True)
@@ -1492,9 +1404,7 @@ class UserAutomator:
             elif await self._is_stream_live():
                 metadata = await self._read_channel_metadata()
                 expected_game_url = self.status.get("watching_game_url")
-                expected_login = twitch_channel_login_from_url(
-                    self.status.get("watching")
-                )
+                expected_login = twitch_channel_login_from_url(self.status.get("watching"))
                 if (
                     metadata
                     and expected_login
@@ -1509,9 +1419,7 @@ class UserAutomator:
                     )
                 ):
                     self._update_watch_time()
-                    self._update_status(
-                        message=f"Watching: {self.status.get('stream_name', '?')}"
-                    )
+                    self._update_status(message=f"Watching: {self.status.get('stream_name', '?')}")
                     await self._sleep(self._get_check_interval())
                     return
                 self._stop_watch_timer()
@@ -1600,16 +1508,15 @@ class UserAutomator:
         targets = self._load_watch_targets()
         if not targets:
             self._update_status(message="No games selected — browsing all drops")
-            targets = [{
-                "game_name": "All Drops",
-                "game_url": TWITCH_DROPS_ENABLED_URL,
-            }]
+            targets = [
+                {
+                    "game_name": "All Drops",
+                    "game_url": TWITCH_DROPS_ENABLED_URL,
+                }
+            ]
 
         # Filter out completed games
-        active_targets = [
-            t for t in targets
-            if t.get("game_name", "") not in self._completed_games
-        ]
+        active_targets = [t for t in targets if t.get("game_name", "") not in self._completed_games]
         if not active_targets and targets:
             self._update_status(
                 message="All selected games complete! Add more games or wait for new campaigns."
@@ -1619,7 +1526,7 @@ class UserAutomator:
             self._completed_games.clear()
             return
 
-        for target in (active_targets or targets):
+        for target in active_targets or targets:
             if self._stop.is_set():
                 return
             game_url = target.get("game_url") or ""
@@ -1693,9 +1600,8 @@ class UserAutomator:
                         continue
                     await asyncio.sleep(5)
                     metadata = await self._read_channel_metadata()
-                    if (
-                        not await self._is_stream_live()
-                        or not self._stream_matches_target(metadata, url, expected_login)
+                    if not await self._is_stream_live() or not self._stream_matches_target(
+                        metadata, url, expected_login
                     ):
                         continue
                     if await self._start_watching(
@@ -1740,17 +1646,16 @@ class UserAutomator:
         try:
             with self.app.app_context():
                 from app.models import WatchTarget
-                rows = WatchTarget.query.filter_by(
-                    user_id=self.user_id, enabled=True
-                ).all()
+
+                rows = WatchTarget.query.filter_by(user_id=self.user_id, enabled=True).all()
                 targets = [
-                    {"game_name": r.game_name, "game_url": r.game_url,
-                     "streamer": r.streamer}
+                    {"game_name": r.game_name, "game_url": r.game_url, "streamer": r.streamer}
                     for r in rows
                 ]
                 return sorted(targets, key=lambda target: not bool(target.get("streamer")))
         except Exception:
-            return []
+            logger.exception("Could not load watch targets for user %s", self.user_id)
+            raise RuntimeError("Could not load saved watch targets")
 
     # ---- game discovery (class method, no browser needed) ----
 
@@ -1761,19 +1666,13 @@ class UserAutomator:
         try:
             response = await page.goto(
                 "https://www.twitch.tv/directory/all/tags/dropsenabled",
-                wait_until="domcontentloaded", timeout=30000,
+                wait_until="domcontentloaded",
+                timeout=30000,
             )
-            if (
-                isinstance(getattr(response, "status", None), int)
-                and response.status >= 400
-            ):
+            if isinstance(getattr(response, "status", None), int) and response.status >= 400:
                 raise RuntimeError(f"Twitch directory returned HTTP {response.status}")
-            if twitch_directory_path(page.url) != twitch_directory_path(
-                TWITCH_DROPS_ENABLED_URL
-            ):
-                raise RuntimeError(
-                    "Twitch redirected game discovery away from the directory"
-                )
+            if twitch_directory_path(page.url) != twitch_directory_path(TWITCH_DROPS_ENABLED_URL):
+                raise RuntimeError("Twitch redirected game discovery away from the directory")
             await asyncio.sleep(3)
             games = await collect_virtualized_cards(
                 page,
@@ -1788,11 +1687,13 @@ class UserAutomator:
                     game_url = normalize_twitch_game_url(game.get("url") or "")
                 except ValueError:
                     continue
-                normalized.append({
-                    "name": (game.get("name") or "").strip(),
-                    "url": game_url,
-                    "viewers": (game.get("viewers") or "").strip(),
-                })
+                normalized.append(
+                    {
+                        "name": (game.get("name") or "").strip(),
+                        "url": game_url,
+                        "viewers": (game.get("viewers") or "").strip(),
+                    }
+                )
             return [game for game in normalized if game["name"]]
         finally:
             await page.close()
@@ -1803,18 +1704,11 @@ class UserAutomator:
         page = await context.new_page()
         try:
             url = normalize_twitch_game_url(game_url)
-            response = await page.goto(
-                url, wait_until="domcontentloaded", timeout=30000
-            )
-            if (
-                isinstance(getattr(response, "status", None), int)
-                and response.status >= 400
-            ):
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if isinstance(getattr(response, "status", None), int) and response.status >= 400:
                 raise RuntimeError(f"Twitch directory returned HTTP {response.status}")
             if not twitch_directories_match(url, page.url):
-                raise RuntimeError(
-                    "Twitch redirected channel discovery away from the game"
-                )
+                raise RuntimeError("Twitch redirected channel discovery away from the game")
             await asyncio.sleep(3)
             streamers = await collect_virtualized_cards(
                 page,
@@ -1827,21 +1721,22 @@ class UserAutomator:
             for streamer in streamers:
                 if streamer.get("drops") is not True:
                     continue
-                if (
-                    streamer.get("gameUrl")
-                    and not twitch_directories_match(url, streamer.get("gameUrl"))
+                if streamer.get("gameUrl") and not twitch_directories_match(
+                    url, streamer.get("gameUrl")
                 ):
                     continue
                 try:
                     login = normalize_twitch_channel_login(streamer.get("login") or "")
                 except ValueError:
                     continue
-                eligible.append({
-                    "name": login,
-                    "url": f"https://www.twitch.tv/{login}",
-                    "viewers": (streamer.get("viewers") or "").strip(),
-                    "drops": True,
-                })
+                eligible.append(
+                    {
+                        "name": login,
+                        "url": f"https://www.twitch.tv/{login}",
+                        "viewers": (streamer.get("viewers") or "").strip(),
+                        "drops": True,
+                    }
+                )
             return eligible
         finally:
             await page.close()
@@ -1858,7 +1753,9 @@ class UserAutomator:
 
     def _update_watch_time(self):
         if self._watch_start:
-            self.status["watch_seconds"] = int(self._total_watch_secs + (time.time() - self._watch_start))
+            self.status["watch_seconds"] = int(
+                self._total_watch_secs + (time.time() - self._watch_start)
+            )
 
     # ---- stream helpers ----
 
@@ -1876,7 +1773,9 @@ class UserAutomator:
                 return
             await sb.click()
             await asyncio.sleep(0.5)
-            qb = await self.page.query_selector('[data-a-target="player-settings-menu-item-quality"]')
+            qb = await self.page.query_selector(
+                '[data-a-target="player-settings-menu-item-quality"]'
+            )
             if qb:
                 await qb.click()
                 await asyncio.sleep(0.5)
@@ -1917,6 +1816,7 @@ class UserAutomator:
         try:
             with self.app.app_context():
                 from app.models import UserSettings
+
                 s = UserSettings.query.filter_by(user_id=self.user_id).first()
                 if s:
                     return max(10, s.check_interval or 60)
@@ -1941,11 +1841,7 @@ class UserAutomator:
         self._stop_watch_timer()
         self._update_status(browser_ready=False)
         try:
-            if self.cdp_session:
-                try:
-                    await self.cdp_session.send("Page.stopScreencast")
-                except Exception:
-                    pass
+            await self._stop_screencast()
             if self.context:
                 await self.context.close()
         except Exception:

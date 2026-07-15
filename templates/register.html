@@ -7,6 +7,15 @@
     <h1>Create account</h1>
     <p class="auth-subtitle">Set up your personal drop automation</p>
     <form method="POST" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      {% if bootstrap_token_required %}
+      <div class="form-group">
+        <label for="bootstrap_token">Deployment bootstrap token</label>
+        <input type="password" id="bootstrap_token" name="bootstrap_token" required
+               autocomplete="one-time-code" spellcheck="false"
+               placeholder="From the server's .env file">
+      </div>
+      {% endif %}
       <div class="form-group">
         <label for="username">Username</label>
         <input type="text" id="username" name="username" required autofocus
@@ -15,12 +24,12 @@
       <div class="form-group">
         <label for="password">Password</label>
         <input type="password" id="password" name="password" required
-               minlength="6" placeholder="At least 6 characters">
+               minlength="12" placeholder="At least 12 characters">
       </div>
       <div class="form-group">
         <label for="confirm_password">Confirm password</label>
         <input type="password" id="confirm_password" name="confirm_password" required
-               minlength="6" placeholder="Repeat your password">
+               minlength="12" placeholder="Repeat your password">
       </div>
       <button type="submit" class="btn btn-primary btn-block">Create Account</button>
     </form>
