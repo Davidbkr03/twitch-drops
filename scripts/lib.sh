@@ -7,7 +7,7 @@ readonly TWITCH_DROPS_LIB_LOADED=1
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ROOT_DIR
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || return 1
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -63,8 +63,10 @@ is_private_ipv4() {
     done
     [[ "$first" == "10" || "$first" == "127" ]] && return 0
     [[ "$first" == "192" && "$second" == "168" ]] && return 0
-    [[ "$first" == "172" && 10#$second -ge 16 && 10#$second -le 31 ]] && return 0
-    [[ "$first" == "100" && 10#$second -ge 64 && 10#$second -le 127 ]] && return 0
+    [[ "$first" == "172" ]] && ((10#$second >= 16 && 10#$second <= 31)) \
+        && return 0
+    [[ "$first" == "100" ]] && ((10#$second >= 64 && 10#$second <= 127)) \
+        && return 0
     return 1
 }
 

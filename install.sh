@@ -185,8 +185,10 @@ is_private_ipv4() {
     IFS=. read -r first second _rest <<<"$address"
     [[ "$first" == "10" || "$first" == "127" ]] && return 0
     [[ "$first" == "192" && "$second" == "168" ]] && return 0
-    [[ "$first" == "172" && 10#$second -ge 16 && 10#$second -le 31 ]] && return 0
-    [[ "$first" == "100" && 10#$second -ge 64 && 10#$second -le 127 ]] && return 0
+    [[ "$first" == "172" ]] && ((10#$second >= 16 && 10#$second <= 31)) \
+        && return 0
+    [[ "$first" == "100" ]] && ((10#$second >= 64 && 10#$second <= 127)) \
+        && return 0
     return 1
 }
 

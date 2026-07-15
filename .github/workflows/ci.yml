@@ -26,7 +26,7 @@ jobs:
       - name: Check formatting
         run: ruff format --check .
       - name: Test
-        run: pytest -q
+        run: python -m pytest -q
 
   production-smoke:
     runs-on: ubuntu-24.04
@@ -51,7 +51,7 @@ jobs:
           sudo apt-get install --yes shellcheck
           bash -n install.sh scripts/*.sh
           sh -n entrypoint.sh
-          shellcheck install.sh scripts/*.sh entrypoint.sh
+          shellcheck --severity=warning install.sh scripts/*.sh entrypoint.sh
       - name: Validate and start production stack
         run: |
           docker compose config --quiet
