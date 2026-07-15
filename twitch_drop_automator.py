@@ -18,6 +18,15 @@ from urllib.parse import urlparse
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 
+from app.twitch_pages import (
+	accept_mature_content_gate,
+	ensure_live_video_playing,
+	normalize_twitch_game_url as normalize_app_twitch_game_url,
+	read_twitch_channel_metadata,
+	twitch_channel_login_from_url,
+	twitch_directories_match,
+)
+
 # --- Platform detection ---
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -289,8 +298,7 @@ def is_rust_game_preference(game_entry: dict) -> bool:
 		return False
 	key = (game_entry.get("game_key") or derive_game_key(game_entry.get("game_url"), game_entry.get("game")) or "").lower()
 	name = (game_entry.get("game") or "").lower()
-	url = (game_entry.get("game_url") or "").lower()
-	return "rust" in key or name == "rust" or "/rust" in url
+	return key == "rust" or name == "rust"
 
 def is_streamer_allowed_for_game_preference(game_entry: dict, streamer_name: str, streamer_url: str | None = None) -> bool:
 	"""If no specific streamers selected, all streamers are allowed."""
@@ -302,10 +310,13 @@ def is_streamer_allowed_for_game_preference(game_entry: dict, streamer_name: str
 	selected_streamers = [s for s, enabled in streamers.items() if bool(enabled)]
 	if not selected_streamers:
 		return True
-	for selected in selected_streamers:
-		if is_streamer_name_match(streamer_name, selected, streamer_url=streamer_url):
-			return True
-	return False
+	candidate_login = _extract_channel_login(streamer_url) or _compact_match_text(streamer_name)
+	if not candidate_login:
+		return False
+	return any(
+		candidate_login == (_extract_channel_login(selected) or _compact_match_text(selected))
+		for selected in selected_streamers
+	)
 
 def get_integrity_prefs():
 	try:
@@ -555,19 +566,7 @@ def _tokenize_match_text(value: str) -> set[str]:
 	return {tok for tok in _normalize_match_text(value).split(" ") if len(tok) >= 3}
 
 def _extract_channel_login(url: str | None) -> str | None:
-	raw = (url or "").strip()
-	if not raw:
-		return None
-	try:
-		parsed = urlparse(raw if raw.startswith("http") else f"https://www.twitch.tv{raw}")
-		parts = [p for p in parsed.path.split('/') if p]
-		if not parts:
-			return None
-		first = parts[0].lower()
-		invalid = {"directory", "drops", "videos", "settings", "login", "signup"}
-		return None if first in invalid else first
-	except Exception:
-		return None
+	return twitch_channel_login_from_url(url)
 
 def _absolutize_twitch_href(href: str | None) -> str:
 	link = (href or "").strip()
@@ -1374,6 +1373,10 @@ def create_web_app():
 		game_url = (request.args.get("game_url") or "").strip()
 		if not game_url:
 			return jsonify({'success': False, 'message': 'Missing game_url'}), 400
+		try:
+			game_url = normalize_app_twitch_game_url(game_url)
+		except ValueError as exc:
+			return jsonify({'success': False, 'message': str(exc)}), 400
 		try:
 			async def _refresh():
 				return await fetch_game_streamers_public(game_url, limit=100)
@@ -2784,10 +2787,14 @@ async def _extract_drop_games_from_directory_page(page, limit: int = 120) -> lis
 		  const rows = [];
 		  const cards = Array.from(document.querySelectorAll('article')).slice(0, maxCards);
 		  for (const card of cards) {
-			const tags = Array.from(card.querySelectorAll('[data-a-target="tag"], a[data-a-target="tag"], span'))
-			  .map(n => (n.textContent || '').trim().toLowerCase())
+			const tags = Array.from(card.querySelectorAll('[aria-label^="Tag, "], [data-a-target="tag"], a[href*="/directory/all/tags/"]'))
+			  .flatMap(n => [
+				(n.textContent || ''),
+				(n.getAttribute('aria-label') || '').replace(/^Tag,\s*/i, '')
+			  ])
+			  .map(value => value.replace(/[^a-z0-9]/gi, '').toLowerCase())
 			  .filter(Boolean);
-			const hasDrops = tags.some(t => t.includes('drops'));
+			const hasDrops = tags.some(t => t === 'dropsenabled');
 			if (!hasDrops) continue;
 			const gameAnchor = card.querySelector('a[data-a-target="preview-card-game-link"], a[href*="/directory/category/"], a[href*="/directory/game/"]');
 			const game = (gameAnchor?.textContent || '').trim();
@@ -2842,11 +2849,12 @@ def _normalize_game_directory_url(game_url: str) -> str:
 	url = (game_url or "").strip()
 	if not url:
 		return ""
-	if url.startswith("http://") or url.startswith("https://"):
-		return url
-	if url.startswith("/"):
-		return f"https://www.twitch.tv{url}"
-	return f"https://www.twitch.tv/directory/category/{url.strip('/')}"
+	if not url.startswith(("http://", "https://", "/")):
+		url = f"/directory/category/{url.strip('/')}"
+	try:
+		return normalize_app_twitch_game_url(url)
+	except ValueError:
+		return ""
 
 def _viewer_count_score(viewers_text: str) -> int:
 	text = (viewers_text or "").strip().lower().replace(",", "")
@@ -2894,19 +2902,27 @@ async def _extract_live_drops_streamers_from_game_page(page, game_url: str, limi
 			  });
 			if (!streamerAnchor) continue;
 			const href = (streamerAnchor.getAttribute('href') || '').trim();
-			if (!href) continue;
-			const login = href.replace(/^\//, '').split('/')[0].trim().toLowerCase();
-			if (!login) continue;
+			let parsed;
+			try { parsed = new URL(href, location.origin); }
+			catch { continue; }
+			if (!/^(www\.)?twitch\.tv$/i.test(parsed.hostname)) continue;
+			const parts = parsed.pathname.split('/').filter(Boolean);
+			if (parts.length !== 1 || !/^[a-z0-9_]{1,25}$/i.test(parts[0])) continue;
+			const login = parts[0].toLowerCase();
 			if (disallowedLogins.has(login)) continue;
-			const tags = Array.from(card.querySelectorAll('[data-a-target="tag"], a[data-a-target="tag"], span'))
-			  .map(n => (n.textContent || '').trim().toLowerCase())
+			const tags = Array.from(card.querySelectorAll('[aria-label^="Tag, "], [data-a-target="tag"], a[href*="/directory/all/tags/"]'))
+			  .flatMap(n => [
+				(n.textContent || ''),
+				(n.getAttribute('aria-label') || '').replace(/^Tag,\s*/i, '')
+			  ])
+			  .map(value => value.replace(/[^a-z0-9]/gi, '').toLowerCase())
 			  .filter(Boolean);
-			const hasDrops = tags.some(t => t.includes('drops'));
+			const hasDrops = tags.some(t => t === 'dropsenabled');
 			const viewers = (card.querySelector('[data-a-target="animated-channel-viewers-count"], [data-a-target*="viewers"]')?.textContent || '').trim();
 			const game = (card.querySelector('a[data-a-target="preview-card-game-link"]')?.textContent || '').trim();
 			out.push({
 			  streamer: login,
-			  stream_url: href.startsWith('/') ? `https://www.twitch.tv${href}` : href,
+			  stream_url: `https://www.twitch.tv/${login}`,
 			  viewers_text: viewers,
 			  game,
 			  has_drops: hasDrops
@@ -3492,7 +3508,6 @@ async def pick_live_rust_stream_with_drops(context, preferred_streamers=None):
 		cards = await page.query_selector_all('article')
 		preferred_candidate = None
 		drops_candidates = []
-		fallback_first = None
 		for card in cards[:60]:
 			try:
 				link = await card.query_selector('a[data-a-target="preview-card-title-link"]')
@@ -3502,17 +3517,23 @@ async def pick_live_rust_stream_with_drops(context, preferred_streamers=None):
 				if not href:
 					continue
 				url = 'https://www.twitch.tv' + href if href.startswith('/') else href
-				if not fallback_first:
-					fallback_first = url
 				path = href.split('?')[0].strip('/') if href.startswith('/') else url.split('twitch.tv/')[-1]
 				has_drops_tag = False
-				tag_nodes = await card.query_selector_all('[data-a-target="tag"], a, span, div')
+				tag_nodes = await card.query_selector_all('[aria-label^="Tag, "], [data-a-target="tag"], a[href*="/directory/all/tags/"]')
 				for t in tag_nodes[:20]:
-					txt = (await t.inner_text()).strip().lower()
-					if 'drops enabled' in txt or txt == 'drops' or 'drops' in txt:
+					txt = re.sub(r'[^a-z0-9]', '', (await t.inner_text()).lower())
+					aria_label = (await t.get_attribute('aria-label') or '')
+					aria_label = re.sub(r'^tag,\s*', '', aria_label, flags=re.IGNORECASE)
+					aria_tag = re.sub(r'[^a-z0-9]', '', aria_label.lower())
+					tag_href = (await t.get_attribute('href') or '').lower()
+					if (
+						txt == 'dropsenabled'
+						or aria_tag == 'dropsenabled'
+						or tag_href.rstrip('/').endswith('/dropsenabled')
+					):
 						has_drops_tag = True
 						break
-				if preferred_streamers and path.lower() in preferred_streamers:
+				if has_drops_tag and preferred_streamers and path.lower() in preferred_streamers:
 					preferred_candidate = url
 					break
 				if has_drops_tag:
@@ -3523,7 +3544,7 @@ async def pick_live_rust_stream_with_drops(context, preferred_streamers=None):
 			return preferred_candidate
 		if drops_candidates:
 			return drops_candidates[0]
-		return fallback_first
+		return None
 	finally:
 		await page.close()
 
@@ -3541,6 +3562,8 @@ async def pick_live_stream_from_enabled_games(context, enabled_games: list[dict]
 			logging.debug(f"Failed loading streamers for {game_name or game_url}: {e}")
 			continue
 		for stream in streamers:
+			if stream.get("has_drops") is not True:
+				continue
 			streamer = (stream.get("streamer") or "").strip()
 			stream_url = (stream.get("stream_url") or "").strip()
 			if not streamer or not stream_url:
@@ -3565,6 +3588,26 @@ async def pick_live_stream_from_enabled_games(context, enabled_games: list[dict]
 	)
 	return candidates[0]
 
+
+async def selected_stream_matches_target(stream_page, target: dict) -> bool:
+	"""Confirm navigation stayed on the selected channel, game, and Drops campaign."""
+	try:
+		metadata = await read_twitch_channel_metadata(stream_page)
+	except Exception as exc:
+		logging.debug(f"Failed reading selected stream metadata: {exc}")
+		return False
+	expected_login = _extract_channel_login(target.get("stream_url"))
+	return bool(
+		metadata
+		and expected_login
+		and metadata.get("login") == expected_login
+		and metadata.get("drops_enabled") is True
+		and twitch_directories_match(
+			target.get("game_url"),
+			metadata.get("game_url"),
+		)
+	)
+
 async def watch_selected_games_cycle(context, inv_page, enabled_games: list[dict]) -> bool:
 	"""Watch selected non-Rust games with optional streamer filters."""
 	target = await pick_live_stream_from_enabled_games(context, enabled_games)
@@ -3584,12 +3627,23 @@ async def watch_selected_games_cycle(context, inv_page, enabled_games: list[dict
 			"status": "selected game mode"
 		})
 		send_notification("Twitch Drops", f"Watching {target.get('streamer')} for {target.get('game')}")
-		await ensure_stream_playing(stream_page)
+		if (
+			not await ensure_stream_playing(stream_page)
+			or not await selected_stream_matches_target(stream_page, target)
+		):
+			logging.warning("Selected stream no longer matches its channel, game, or Drops tag")
+			return False
 		await set_low_quality(stream_page)
 		# Short watch slice; workflow loop will repick based on current live status/preferences.
 		for _ in range(4):
 			if EXIT_EVENT.is_set():
 				return True
+			if (
+				not await selected_stream_matches_target(stream_page, target)
+				or not await ensure_live_video_playing(stream_page)
+			):
+				logging.warning("Selected stream changed while watching; repicking")
+				return False
 			try:
 				progress_map = await get_inventory_progress_map(inv_page)
 				if progress_map:
@@ -3606,6 +3660,9 @@ async def watch_selected_games_cycle(context, inv_page, enabled_games: list[dict
 		update_current_working_item(None)
 
 async def ensure_stream_playing(stream_page):
+	if not await accept_mature_content_gate(stream_page):
+		logging.warning("Twitch content gate could not be cleared; skipping this stream")
+		return False
 	try:
 		await stream_page.wait_for_selector('button[data-a-target="player-play-pause-button"]', timeout=30000)
 		label = await stream_page.get_attribute('button[data-a-target="player-play-pause-button"]', 'aria-label')
@@ -3617,8 +3674,8 @@ async def ensure_stream_playing(stream_page):
 				timeout=2000, 
 				wait_after_click=1.0
 			)
-	except Exception:
-		pass
+	except Exception as exc:
+		logging.debug(f"Play control was unavailable: {exc}")
 	try:
 		# Ensure muted (only click if currently not muted)
 		val = await stream_page.get_attribute('[data-a-target="player-volume-slider"]', 'aria-valuenow')
@@ -3640,6 +3697,11 @@ async def ensure_stream_playing(stream_page):
 			pass
 	except Exception:
 		pass
+	try:
+		return await ensure_live_video_playing(stream_page)
+	except Exception as exc:
+		logging.debug(f"Stream playback verification failed: {exc}")
+		return False
 
 async def click_ui_element(page, selectors, description="UI element", timeout=2000, wait_after_click=0.3):
     """
@@ -4354,7 +4416,10 @@ async def run_drops_workflow(context, test_mode=False):
 					continue
 				await maybe_accept_cookies(stream_page)
 				send_notification("Twitch Drops", f"Now watching {target_name} for '{target_item}'")
-				await ensure_stream_playing(stream_page)
+				if not await ensure_stream_playing(stream_page):
+					logging.info("Skipping gated or unavailable streamer target")
+					await stream_page.close()
+					continue
 				await set_low_quality(stream_page)
 				completed = await poll_until_reward_complete(
 					context,
@@ -4501,7 +4566,10 @@ async def run_drops_workflow(context, test_mode=False):
 				if item_txt and alias_txt:
 					desc = f"{item_txt} ({alias_txt})"
 				send_notification("Twitch Drops", f"Watching {target_name} for general drop '{desc}'")
-				await ensure_stream_playing(stream_page)
+				if not await ensure_stream_playing(stream_page):
+					logging.info("Skipping gated or unavailable general-drop stream")
+					await stream_page.close()
+					continue
 				await set_low_quality(stream_page)
 				completed, switch = await poll_general_until_complete_or_streamer_available(
 					context,

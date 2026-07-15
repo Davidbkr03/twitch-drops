@@ -21,6 +21,8 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
+The bundled web server is intended for localhost or a trusted private network. Do not expose it directly to the public internet: registration is open, and saved Twitch credentials and auth tokens are stored in the application database. A public deployment needs a production web server or reverse proxy, TLS, access controls, and encrypted secret storage.
+
 Replace `SECRET_KEY` and `POSTGRES_PASSWORD` with long random values. `DATABASE_URL` in `.env.example` is informational; Compose constructs the app connection string from `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`.
 
 Build and start the stack:
@@ -78,7 +80,17 @@ For Twitch login compatibility, the app prefers installed stable Microsoft Edge,
 
 Open [http://localhost:5000](http://localhost:5000), register a local account, and use **Open Twitch Login in Normal Browser** for the first Twitch sign-in. Close the login browser after authentication, then press **Start**. The automation browser reuses the same persistent profile.
 
-### Legacy single-user mode
+## Web app target selection
+
+Press **Start** and wait for the dashboard to report **Browser launched**, then use **Browse** under **Games & Streamers** to load the games currently represented in Twitch's Drops Enabled directory. Add a game with **+** to let the automator choose any eligible live channel, or open **Channels** and add a specific Twitch channel. All specific-channel targets are tried before general game targets.
+
+The watcher validates the final channel URL, current game/category, live state, and exact `DropsEnabled` tag before starting or continuing its watch timer. It rejects failed redirects, login/directory/VOD routes, offline or unavailable players, channels that changed games, and channels that lost Drops eligibility. Twitch recycles directory cards while scrolling, so discovery accumulates every rendered batch instead of reading only the final viewport.
+
+When Twitch displays a mature-audience gate, both the current **Continue Watching** / **Start Watching** controls and the older overlay control are supported. Watch time does not start until that gate clears. If no eligible channel remains, the app reports that state and retries on the configured check interval.
+
+Browser profiles and watch targets persist across restarts, but an automation session does not start itself after the app or container restarts; sign in to the dashboard and press **Start** again.
+
+## Legacy single-user mode
 
 Run the original standalone application:
 
@@ -161,6 +173,9 @@ These files are ignored by Git. Stop the application before deleting browser pro
 - **Twitch rejects the embedded login as unsupported:** for a local multi-user install, stop automation and use **Open Twitch Login in Normal Browser**. Close that browser after login, then press **Start**.
 - **Docker or remote server needs Twitch authentication:** import the `auth-token` from an already signed-in browser because the container cannot open a native desktop browser.
 - **Legacy mode needs authentication:** use **Start Guided Login**.
+- **Preview says Watching but Twitch shows a content gate:** update and restart or rebuild the application/container, then press **Start** in the dashboard. The current version clicks Twitch's **Continue Watching** or **Start Watching** gate automatically and refuses to count a gate that remains visible.
+- **A selected channel is skipped:** confirm it is live in the selected game and visibly has the `DropsEnabled` tag. Preferred channels are intentionally rejected after a category change, a VOD/login redirect, or loss of Drops eligibility.
+- **Browse returns no games or channels:** Twitch may have no matching live cards, the saved login may have expired, or Twitch may have changed the directory markup. Check the browser preview and reauthenticate before retrying.
 - **Inspect container failures:** run `docker compose ps` and `docker compose logs --tail=200 app db`.
 
 ## Uninstall

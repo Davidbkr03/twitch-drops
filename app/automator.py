@@ -10,10 +10,22 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
+
+from app.twitch_pages import (
+    MATURE_GATE_SELECTOR,
+    accept_mature_content_gate,
+    collect_virtualized_cards,
+    ensure_live_video_playing,
+    normalize_twitch_channel_login,
+    normalize_twitch_game_url,
+    read_twitch_channel_metadata,
+    twitch_channel_login_from_url,
+    twitch_directory_path,
+    twitch_directories_match,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +66,86 @@ BROWSER_ARGS = [
 
 VIEWPORT = {"width": 1366, "height": 768}
 DEFAULT_BROWSER_CHANNELS = ("msedge", "chrome")
+
+_GAME_CARD_EXTRACTOR_JS = r"""
+() => {
+    const out = [];
+    document.querySelectorAll('article').forEach(card => {
+        const game = card.querySelector(
+            'a[data-a-target="preview-card-game-link"], '
+            'a[href*="/directory/category/"], a[href*="/directory/game/"]'
+        );
+        if (!game) return;
+        const name = (game.textContent || '').trim();
+        let parsed;
+        try { parsed = new URL(game.getAttribute('href') || '', location.origin); }
+        catch { return; }
+        if (!/^(www\.)?twitch\.tv$/i.test(parsed.hostname)) return;
+        if (!/^\/directory\/(category|game)\/[^/]+\/?$/i.test(parsed.pathname)) return;
+        const viewers = (card.querySelector(
+            '[data-a-target="animated-channel-viewers-count"], [data-a-target*="viewers"]'
+        )?.textContent || '').trim();
+        if (name) out.push({name, url: parsed.href, viewers});
+    });
+    return out;
+}
+"""
+
+_STREAM_CARD_EXTRACTOR_JS = r"""
+() => {
+    const out = [];
+    document.querySelectorAll('article').forEach(card => {
+        const channel = card.querySelector(
+            'a[data-a-target="preview-card-image-link"], '
+            'a[data-a-target="preview-card-channel-link"], '
+            'a[data-a-target="preview-card-title-link"]'
+        );
+        if (!channel) return;
+        let parsed;
+        try { parsed = new URL(channel.getAttribute('href') || '', location.origin); }
+        catch { return; }
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (!/^(www\.)?twitch\.tv$/i.test(parsed.hostname)) return;
+        if (parts.length !== 1 || !/^[a-z0-9_]{1,25}$/i.test(parts[0])) return;
+        const login = parts[0].toLowerCase();
+        const tags = Array.from(card.querySelectorAll(
+            '[aria-label^="Tag, "], [data-a-target="tag"], '
+            'a[href*="/directory/all/tags/"]'
+        ));
+        const hasDrops = tags.some(node => {
+            const values = [
+                node.textContent || '',
+                (node.getAttribute('aria-label') || '').replace(/^Tag,\s*/i, ''),
+            ].map(value => value.replace(/[^a-z0-9]/gi, '').toLowerCase());
+            let path = '';
+            try { path = new URL(node.getAttribute('href') || '', location.origin).pathname; }
+            catch {}
+            return values.includes('dropsenabled')
+                || path.toLowerCase().endsWith('/dropsenabled');
+        });
+        const game = card.querySelector(
+            'a[data-a-target="preview-card-game-link"], '
+            'a[href*="/directory/category/"], a[href*="/directory/game/"]'
+        );
+        let gameUrl = '';
+        try { gameUrl = new URL(game?.getAttribute('href') || '', location.origin).href; }
+        catch {}
+        const viewers = (card.querySelector(
+            '[data-a-target="animated-channel-viewers-count"], [data-a-target*="viewers"]'
+        )?.textContent || '').trim();
+        out.push({
+            name: login,
+            login,
+            url: `https://www.twitch.tv/${login}`,
+            viewers,
+            drops: hasDrops,
+            gameName: (game?.textContent || '').trim(),
+            gameUrl,
+        });
+    });
+    return out;
+}
+"""
 
 
 def browser_channel_candidates(configured_channel: str | None = None) -> tuple[str | None, ...]:
@@ -152,40 +244,6 @@ def screencast_options(quality: int) -> dict:
         "everyNthFrame": 1,
     }
 
-
-def normalize_twitch_game_url(value: str) -> str:
-    """Validate and normalize a Twitch directory URL supplied by a user."""
-    invalid_url = "game_url must be an HTTPS Twitch directory URL"
-    if not isinstance(value, str):
-        raise ValueError("game_url must be a string")
-    raw = value.strip()
-    if not raw:
-        raise ValueError("game_url required")
-
-    try:
-        parsed = urlsplit(urljoin("https://www.twitch.tv", raw))
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError(invalid_url) from exc
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname not in {"twitch.tv", "www.twitch.tv"}
-        or parsed.username
-        or parsed.password
-        or port not in {None, 443}
-        or "\\" in parsed.path
-    ):
-        raise ValueError(invalid_url)
-
-    allowed_paths = (
-        "/directory/category/",
-        "/directory/game/",
-        "/directory/all/tags/dropsenabled",
-    )
-    if not any(parsed.path.startswith(prefix) for prefix in allowed_paths):
-        raise ValueError("game_url must point to a Twitch game directory")
-
-    return urlunsplit(("https", "www.twitch.tv", parsed.path, parsed.query, ""))
 
 # Comprehensive stealth patches injected into every page.
 # Twitch specifically checks WebGL renderer (SwiftShader = virtual env)
@@ -380,7 +438,12 @@ class AutomationManager:
         if automator:
             status = automator.get_status()
         else:
-            status = {"running": False, "logged_in": False, "twitch_saved": False}
+            status = {
+                "running": False,
+                "browser_ready": False,
+                "logged_in": False,
+                "twitch_saved": False,
+            }
         status["native_login_active"] = self.native_login_active_for_user(user_id)
         return status
 
@@ -426,10 +489,12 @@ class UserAutomator:
             "running": False,
             "logged_in": False,
             "browser_channel": None,
+            "browser_ready": False,
             "twitch_user": None,
             "twitch_saved": False,
             "watching": None,
             "watching_game": None,
+            "watching_game_url": None,
             "stream_name": None,
             "watch_seconds": 0,
             "message": "Idle",
@@ -457,7 +522,12 @@ class UserAutomator:
         except Exception:
             pass
 
-        self._update_status(running=True, twitch_saved=twitch_saved, message="Starting…")
+        self._update_status(
+            running=True,
+            browser_ready=False,
+            twitch_saved=twitch_saved,
+            message="Starting…",
+        )
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
@@ -613,7 +683,7 @@ class UserAutomator:
             # Fallback to context-level script
             await self.context.add_init_script(_STEALTH_JS)
 
-        self._update_status(message="Browser launched")
+        self._update_status(browser_ready=True, message="Browser launched")
 
     # ---- screencast ----
 
@@ -1075,7 +1145,7 @@ class UserAutomator:
             )
             for btn in claim_btns:
                 try:
-                    name = await btn.evaluate(r"""
+                    claim_info = await btn.evaluate(r"""
                         button => {
                             let container = button;
                             for (let i = 0; i < 10; i++) {
@@ -1084,20 +1154,41 @@ class UserAutomator:
                                 if (container.querySelector('img') &&
                                     container.querySelector('button')) break;
                             }
-                            if (!container) return 'Drop claimed';
+                            if (!container) return {name: 'Drop claimed', game: ''};
                             const texts = Array.from(
                                 container.querySelectorAll('h3, h4, p, span')
                             ).map(el => (el.textContent || '').trim()).filter(text =>
                                 text.length > 2 && text.length < 120 &&
                                 !/^claim(ed)?$/i.test(text) && !/^\d+%$/.test(text)
                             );
-                            return texts[0] || 'Drop claimed';
+                            let gameLink = null;
+                            let campaign = container;
+                            for (let i = 0; i < 12 && campaign; i++) {
+                                const links = Array.from(campaign.querySelectorAll(
+                                    'a[href*="/directory/category/"], '
+                                    'a[href*="/directory/game/"]'
+                                ));
+                                const paths = new Set(links.map(link => {
+                                    try { return new URL(link.href, location.origin).pathname; }
+                                    catch { return ''; }
+                                }).filter(Boolean));
+                                if (paths.size === 1) { gameLink = links[0]; break; }
+                                if (paths.size > 1) break;
+                                campaign = campaign.parentElement;
+                            }
+                            return {
+                                name: texts[0] || 'Drop claimed',
+                                game: (gameLink?.textContent || '').trim(),
+                            };
                         }
                     """)
                     await btn.click()
                     await asyncio.sleep(1.5)
+                    if not isinstance(claim_info, dict):
+                        claim_info = {"name": claim_info or "Drop claimed", "game": ""}
                     claimed.append({
-                        "name": normalize_drop_name(name or "Drop claimed"),
+                        "name": normalize_drop_name(claim_info.get("name")),
+                        "game": (claim_info.get("game") or "").strip() or None,
                         "time": datetime.now(timezone.utc).isoformat(),
                     })
                 except Exception:
@@ -1144,10 +1235,29 @@ class UserAutomator:
                         // "Reward name/type 1% of 2 hours". Preserve the
                         // visible text here; Python strips the progress suffix.
                         const name = (container.innerText || '').trim();
-                        const key = image + '_' + pct;
+                        let gameLink = null;
+                        let campaign = container;
+                        for (let i = 0; i < 12 && campaign; i++) {
+                            const links = Array.from(campaign.querySelectorAll(
+                                'a[href*="/directory/category/"], '
+                                'a[href*="/directory/game/"]'
+                            ));
+                            const paths = new Set(links.map(link => {
+                                try { return new URL(link.href, location.origin).pathname; }
+                                catch { return ''; }
+                            }).filter(Boolean));
+                            if (paths.size === 1) { gameLink = links[0]; break; }
+                            if (paths.size > 1) break;
+                            campaign = campaign.parentElement;
+                        }
+                        const game = (gameLink?.textContent || '').trim();
+                        let gameUrl = '';
+                        try { gameUrl = new URL(gameLink?.href || '', location.origin).pathname; }
+                        catch {}
+                        const key = `${gameUrl}|${name}|${image}|${pct}`;
                         if (seen.has(key)) return;
                         seen.add(key);
-                        items.push({ name, progress: pct, image });
+                        items.push({ name, progress: pct, image, game });
                     });
 
                     const campaigns = [];
@@ -1214,6 +1324,7 @@ class UserAutomator:
                     "name": normalize_drop_name(item.get("name")),
                     "progress": item.get("progress", 0),
                     "image": item.get("image", ""),
+                    "game": (item.get("game") or "").strip() or None,
                 })
 
             self._detect_completed_games(inventory.get("campaigns") or [])
@@ -1237,12 +1348,14 @@ class UserAutomator:
     def _detect_completed_games(self, campaigns: list):
         """Mark games complete only from affirmative, exact-category campaign records."""
         targets = self._load_watch_targets()
-        records_by_path: dict[str, list[bool]] = {}
+        records: list[tuple[str, bool]] = []
         for campaign in campaigns:
-            game_path = str(campaign.get("gamePath") or "").rstrip("/").casefold()
-            if not game_path.startswith("/directory/category/"):
+            game_path = str(campaign.get("gamePath") or "").strip()
+            if not game_path.casefold().startswith(
+                ("/directory/category/", "/directory/game/")
+            ):
                 continue
-            records_by_path.setdefault(game_path, []).append(campaign.get("complete") is True)
+            records.append((game_path, campaign.get("complete") is True))
 
         completed_games = set()
         for target in targets:
@@ -1250,12 +1363,12 @@ class UserAutomator:
             game_url = target.get("game_url")
             if not game_name or not game_url:
                 continue
-            try:
-                game_path = urlsplit(normalize_twitch_game_url(game_url)).path.rstrip("/").casefold()
-            except ValueError:
-                continue
-            records = records_by_path.get(game_path, [])
-            if records and all(records):
+            matching_records = [
+                complete
+                for campaign_url, complete in records
+                if twitch_directories_match(game_url, campaign_url)
+            ]
+            if matching_records and all(matching_records):
                 completed_games.add(game_name)
 
         self._completed_games.clear()
@@ -1266,38 +1379,93 @@ class UserAutomator:
             with self.app.app_context():
                 from app.models import DropLog
                 from app.extensions import db
-                for d in claimed:
-                    name = normalize_drop_name(d.get("name"))[:255]
-                    existing = DropLog.query.filter_by(
+
+                def find_log(name: str, status: str, game: str | None):
+                    query = DropLog.query.filter_by(
                         user_id=self.user_id,
                         drop_name=name,
-                        status="in_progress",
-                    ).first()
+                        status=status,
+                    )
+                    if game:
+                        exact = query.filter_by(game=game).first()
+                        if exact:
+                            return exact
+                        legacy = query.filter(DropLog.game.is_(None)).first()
+                        if legacy:
+                            legacy.game = game
+                        return legacy
+                    return query.filter(DropLog.game.is_(None)).first()
+
+                normalized_progress = [{
+                    **d,
+                    "name": normalize_drop_name(d.get("name"))[:255],
+                    "game": (d.get("game") or "").strip() or None,
+                } for d in in_progress]
+                claimed_keys: set[tuple[str, str | None]] = set()
+                resolved_game_less_claims: dict[str, str | None] = {}
+                for d in claimed:
+                    name = normalize_drop_name(d.get("name"))[:255]
+                    game = (d.get("game") or "").strip() or None
+                    if not game:
+                        database_games = {
+                            row.game
+                            for row in DropLog.query.filter_by(
+                                user_id=self.user_id,
+                                drop_name=name,
+                            ).filter(
+                                DropLog.status.in_(("in_progress", "claimed"))
+                            ).all()
+                            if row.game
+                        }
+                        incoming_games = {
+                            item["game"]
+                            for item in normalized_progress
+                            if item["name"] == name and item["game"]
+                        }
+                        candidate_games = database_games | incoming_games
+                        if len(candidate_games) == 1:
+                            game = next(iter(candidate_games))
+                        resolved_game_less_claims[name] = game
+                    existing = find_log(name, "in_progress", game)
                     if existing:
                         existing.status = "claimed"
                         existing.progress = 100
                         existing.claimed_at = datetime.now(timezone.utc)
                     else:
-                        db.session.add(DropLog(
-                            user_id=self.user_id,
-                            drop_name=name,
-                            game=d.get("game"),
-                            status="claimed",
-                            progress=100,
-                            claimed_at=datetime.now(timezone.utc),
-                        ))
-                for d in in_progress:
-                    name = normalize_drop_name(d.get("name"))[:255]
-                    ex = DropLog.query.filter_by(
-                        user_id=self.user_id, drop_name=name, status="in_progress",
-                    ).first()
+                        existing = find_log(name, "claimed", game)
+                        if existing:
+                            existing.progress = 100
+                            existing.claimed_at = (
+                                existing.claimed_at or datetime.now(timezone.utc)
+                            )
+                        else:
+                            db.session.add(DropLog(
+                                user_id=self.user_id,
+                                drop_name=name,
+                                game=game,
+                                status="claimed",
+                                progress=100,
+                                claimed_at=datetime.now(timezone.utc),
+                            ))
+                    claimed_keys.add((name, game))
+                for d in normalized_progress:
+                    name = d["name"]
+                    game = d["game"]
+                    if not game and name in resolved_game_less_claims:
+                        game = resolved_game_less_claims[name]
+                    if (name, game) in claimed_keys:
+                        continue
+                    progress = d.get("progress", 0)
+                    if progress >= 100 and find_log(name, "claimed", game):
+                        continue
+                    ex = find_log(name, "in_progress", game)
                     if ex:
-                        ex.progress = d.get("progress", 0)
+                        ex.progress = progress
                     else:
                         db.session.add(DropLog(
                             user_id=self.user_id, drop_name=name,
-                            game=d.get("game"), status="in_progress",
-                            progress=d.get("progress", 0),
+                            game=game, status="in_progress",
+                            progress=progress,
                         ))
                 db.session.commit()
         except Exception:
@@ -1317,19 +1485,52 @@ class UserAutomator:
                 self._update_status(
                     watching=None,
                     watching_game=None,
+                    watching_game_url=None,
                     stream_name=None,
                     message=f"{watching_game} campaign complete — finding another…",
                 )
             elif await self._is_stream_live():
-                self._update_watch_time()
-                self._update_status(message=f"Watching: {self.status.get('stream_name', '?')}")
-                await self._sleep(self._get_check_interval())
-                return
+                metadata = await self._read_channel_metadata()
+                expected_game_url = self.status.get("watching_game_url")
+                expected_login = twitch_channel_login_from_url(
+                    self.status.get("watching")
+                )
+                if (
+                    metadata
+                    and expected_login
+                    and metadata.get("login") == expected_login
+                    and metadata.get("drops_enabled")
+                    and (
+                        not expected_game_url
+                        or twitch_directories_match(
+                            expected_game_url,
+                            metadata.get("game_url"),
+                        )
+                    )
+                ):
+                    self._update_watch_time()
+                    self._update_status(
+                        message=f"Watching: {self.status.get('stream_name', '?')}"
+                    )
+                    await self._sleep(self._get_check_interval())
+                    return
+                self._stop_watch_timer()
+                self._update_status(
+                    watching=None,
+                    watching_game=None,
+                    watching_game_url=None,
+                    stream_name=None,
+                    message=(
+                        "Stream redirected, changed category, or lost Drops Enabled "
+                        "— finding another…"
+                    ),
+                )
             else:
                 self._stop_watch_timer()
                 self._update_status(
                     watching=None,
                     watching_game=None,
+                    watching_game_url=None,
                     stream_name=None,
                     message="Stream went offline — finding another…",
                 )
@@ -1340,21 +1541,59 @@ class UserAutomator:
 
     async def _is_stream_live(self) -> bool:
         try:
-            url = self.page.url or ""
-            if any(x in url for x in ["/directory", "/drops", "/login"]):
+            if not self.page or not twitch_channel_login_from_url(self.page.url):
                 return False
-            content_gate = await self.page.query_selector(
-                '[data-a-target="player-overlay-content-gate"]'
-            )
+
+            content_gate = await self.page.query_selector(MATURE_GATE_SELECTOR)
+            if content_gate:
+                try:
+                    if not await content_gate.is_visible():
+                        content_gate = None
+                except Exception:
+                    pass
             if content_gate:
                 gate_text = (await content_gate.text_content() or "").lower()
-                if "offline" in gate_text:
+                if any(
+                    marker in gate_text
+                    for marker in ("offline", "unavailable", "has ended", "not available")
+                ):
                     return False
-                await self._accept_mature_content()
-            live = await self.page.query_selector('video, .video-player')
-            return live is not None
+                is_mature_gate = any(
+                    marker in gate_text
+                    for marker in (
+                        "mature",
+                        "certain audiences",
+                        "continue watching",
+                        "start watching",
+                    )
+                )
+                if not is_mature_gate or not await self._accept_mature_content():
+                    return False
+
+            return await ensure_live_video_playing(self.page)
         except Exception:
+            logger.debug("User %s live-state detection failed", self.user_id, exc_info=True)
             return False
+
+    async def _read_channel_metadata(self) -> dict | None:
+        """Read canonical channel, category, and Drops eligibility from the page."""
+        try:
+            return await read_twitch_channel_metadata(self.page)
+        except Exception:
+            logger.debug("User %s channel metadata read failed", self.user_id, exc_info=True)
+            return None
+
+    def _stream_matches_target(
+        self,
+        metadata: dict | None,
+        target_game_url: str,
+        expected_login: str | None = None,
+    ) -> bool:
+        if not metadata or not metadata.get("drops_enabled"):
+            return False
+        if expected_login and metadata.get("login") != expected_login:
+            return False
+        return twitch_directories_match(target_game_url, metadata.get("game_url"))
 
     async def _find_best_stream(self):
         """Pick the best stream from the user's selected games, skipping completed ones."""
@@ -1389,12 +1628,31 @@ class UserAutomator:
 
             if preferred_streamer:
                 # Specific streamer requested — go directly
-                self._update_status(message=f"Checking {preferred_streamer}…")
-                stream_url = f"https://www.twitch.tv/{preferred_streamer}"
-                await self._goto(stream_url)
+                try:
+                    preferred_login = normalize_twitch_channel_login(preferred_streamer)
+                except ValueError:
+                    logger.warning(
+                        "User %s has invalid preferred streamer: %r",
+                        self.user_id,
+                        preferred_streamer,
+                    )
+                    continue
+                self._update_status(message=f"Checking {preferred_login}…")
+                stream_url = f"https://www.twitch.tv/{preferred_login}"
+                if not await self._goto(stream_url):
+                    continue
                 await asyncio.sleep(4)
-                if await self._is_stream_live():
-                    await self._start_watching(preferred_streamer, stream_url, game_name)
+                metadata = await self._read_channel_metadata()
+                if (
+                    await self._is_stream_live()
+                    and self._stream_matches_target(metadata, game_url, preferred_login)
+                    and await self._start_watching(
+                        metadata["display_name"],
+                        metadata["url"],
+                        metadata["game_name"] or game_name,
+                        metadata["game_url"],
+                    )
+                ):
                     return
                 continue
 
@@ -1405,54 +1663,78 @@ class UserAutomator:
             except ValueError:
                 logger.warning("User %s has invalid game URL: %r", self.user_id, game_url)
                 continue
-            await self._goto(url)
+            if not await self._goto(url):
+                continue
             await asyncio.sleep(4)
 
             try:
                 drops_directory = "/tags/dropsenabled" in url.lower()
-                candidate_hrefs = await self.page.evaluate(r"""
-                    dropsDirectory => Array.from(document.querySelectorAll(
-                        'a[data-a-target="preview-card-image-link"]'
-                    )).filter(anchor => {
-                        if (dropsDirectory) return true;
-                        const card = anchor.closest('article') || anchor.parentElement;
-                        return /drops\s*enabled/i.test(card?.innerText || '');
-                    }).map(anchor => anchor.getAttribute('href')).filter(Boolean)
-                """, drops_directory)
-                for href in candidate_hrefs:
-                    stream_url = urljoin("https://www.twitch.tv", href)
-                    await self._goto(stream_url)
-                    await asyncio.sleep(5)
-                    if not await self._is_stream_live():
-                        await self._goto(url)
-                        await asyncio.sleep(2)
+                candidates = await collect_virtualized_cards(
+                    self.page,
+                    _STREAM_CARD_EXTRACTOR_JS,
+                    key=lambda item: str(item.get("login") or "").casefold() or None,
+                    max_scrolls=8,
+                    scroll_delay=0.75,
+                )
+                candidates = [
+                    candidate
+                    for candidate in candidates or []
+                    if isinstance(candidate, dict)
+                    and (drops_directory or candidate.get("drops") is True)
+                ]
+                seen_logins = set()
+                for candidate in candidates:
+                    expected_login = twitch_channel_login_from_url(candidate.get("url"))
+                    if not expected_login or expected_login in seen_logins:
                         continue
-                    name = ""
-                    try:
-                        el = await self.page.query_selector(
-                            '[data-a-target="stream-title"], h1'
-                        )
-                        if el:
-                            name = (await el.text_content() or "").strip()
-                    except Exception:
-                        pass
-                    name = name or stream_url.rstrip("/").split("/")[-1]
-                    await self._start_watching(name, stream_url, game_name)
-                    return
+                    seen_logins.add(expected_login)
+                    stream_url = f"https://www.twitch.tv/{expected_login}"
+                    if not await self._goto(stream_url):
+                        continue
+                    await asyncio.sleep(5)
+                    metadata = await self._read_channel_metadata()
+                    if (
+                        not await self._is_stream_live()
+                        or not self._stream_matches_target(metadata, url, expected_login)
+                    ):
+                        continue
+                    if await self._start_watching(
+                        metadata["display_name"],
+                        metadata["url"],
+                        metadata["game_name"] or game_name,
+                        metadata["game_url"],
+                    ):
+                        return
             except Exception:
-                pass
+                logger.debug("User %s stream selection failed", self.user_id, exc_info=True)
 
-        self._update_status(watching=None, watching_game=None, stream_name=None,
-                            message="No live streams found — will retry")
+        self._update_status(
+            watching=None,
+            watching_game=None,
+            watching_game_url=None,
+            stream_name=None,
+            message="No live streams found — will retry",
+        )
 
-    async def _start_watching(self, name: str, url: str, game: str):
-        await self._accept_mature_content()
+    async def _start_watching(
+        self,
+        name: str,
+        url: str,
+        game: str,
+        game_url: str,
+    ) -> bool:
+        if not await self._accept_mature_content() or not await self._is_stream_live():
+            return False
         await self._set_low_quality()
         self._start_watch_timer()
         self._update_status(
-            watching=url, watching_game=game, stream_name=name,
+            watching=url,
+            watching_game=game,
+            watching_game_url=game_url,
+            stream_name=name,
             message=f"Watching: {name} ({game})",
         )
+        return True
 
     def _load_watch_targets(self) -> list[dict]:
         try:
@@ -1461,11 +1743,12 @@ class UserAutomator:
                 rows = WatchTarget.query.filter_by(
                     user_id=self.user_id, enabled=True
                 ).all()
-                return [
+                targets = [
                     {"game_name": r.game_name, "game_url": r.game_url,
                      "streamer": r.streamer}
                     for r in rows
                 ]
+                return sorted(targets, key=lambda target: not bool(target.get("streamer")))
         except Exception:
             return []
 
@@ -1476,44 +1759,41 @@ class UserAutomator:
         """Scrape twitch.tv/directory/all/tags/dropsenabled for games with active drops."""
         page = await context.new_page()
         try:
-            await page.goto(
+            response = await page.goto(
                 "https://www.twitch.tv/directory/all/tags/dropsenabled",
                 wait_until="domcontentloaded", timeout=30000,
             )
+            if (
+                isinstance(getattr(response, "status", None), int)
+                and response.status >= 400
+            ):
+                raise RuntimeError(f"Twitch directory returned HTTP {response.status}")
+            if twitch_directory_path(page.url) != twitch_directory_path(
+                TWITCH_DROPS_ENABLED_URL
+            ):
+                raise RuntimeError(
+                    "Twitch redirected game discovery away from the directory"
+                )
             await asyncio.sleep(3)
-            # Scroll until no new content loads (lazy-load handling)
-            prev_height = 0
-            for _ in range(20):
-                cur_height = await page.evaluate("document.body.scrollHeight")
-                if cur_height == prev_height:
-                    break
-                prev_height = cur_height
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1.5)
-
-            games = await page.evaluate(r"""
-                () => {
-                    const out = [];
-                    const seen = new Set();
-                    document.querySelectorAll('article').forEach(card => {
-                        const gameEl = card.querySelector(
-                            'a[data-a-target="preview-card-game-link"], ' +
-                            'a[href*="/directory/category/"], a[href*="/directory/game/"]'
-                        );
-                        if (!gameEl) return;
-                        const name = (gameEl.textContent || '').trim();
-                        const href = (gameEl.getAttribute('href') || '').trim();
-                        if (!name || seen.has(name)) return;
-                        seen.add(name);
-                        const viewers = (card.querySelector(
-                            '[data-a-target="animated-channel-viewers-count"]'
-                        ) || {}).textContent || '';
-                        out.push({ name, url: href, viewers: viewers.trim() });
-                    });
-                    return out;
-                }
-            """)
-            return games or []
+            games = await collect_virtualized_cards(
+                page,
+                _GAME_CARD_EXTRACTOR_JS,
+                key=lambda item: str(item.get("url") or "").casefold() or None,
+                max_scrolls=20,
+                scroll_delay=1.5,
+            )
+            normalized = []
+            for game in games:
+                try:
+                    game_url = normalize_twitch_game_url(game.get("url") or "")
+                except ValueError:
+                    continue
+                normalized.append({
+                    "name": (game.get("name") or "").strip(),
+                    "url": game_url,
+                    "viewers": (game.get("viewers") or "").strip(),
+                })
+            return [game for game in normalized if game["name"]]
         finally:
             await page.close()
 
@@ -1523,49 +1803,46 @@ class UserAutomator:
         page = await context.new_page()
         try:
             url = normalize_twitch_game_url(game_url)
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=30000
+            )
+            if (
+                isinstance(getattr(response, "status", None), int)
+                and response.status >= 400
+            ):
+                raise RuntimeError(f"Twitch directory returned HTTP {response.status}")
+            if not twitch_directories_match(url, page.url):
+                raise RuntimeError(
+                    "Twitch redirected channel discovery away from the game"
+                )
             await asyncio.sleep(3)
-            # Scroll to load all streamers
-            prev_height = 0
-            for _ in range(15):
-                cur_height = await page.evaluate("document.body.scrollHeight")
-                if cur_height == prev_height:
-                    break
-                prev_height = cur_height
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1.5)
-            streamers = await page.evaluate(r"""
-                () => {
-                    const out = [];
-                    const seen = new Set();
-                    document.querySelectorAll('article').forEach(card => {
-                        const a = card.querySelector(
-                            'a[data-a-target="preview-card-title-link"], ' +
-                            'a[data-a-target="preview-card-image-link"]'
-                        );
-                        if (!a) return;
-                        const href = (a.getAttribute('href') || '').trim();
-                        const login = href.replace(/^\//, '').split('/')[0].toLowerCase();
-                        if (!login || seen.has(login)) return;
-                        seen.add(login);
-                        const tags = Array.from(
-                            card.querySelectorAll('[data-a-target="tag"], span')
-                        ).map(n => (n.textContent||'').trim().toLowerCase());
-                        const hasDrops = tags.some(t => t.includes('drops'));
-                        const viewers = (card.querySelector(
-                            '[data-a-target="animated-channel-viewers-count"]'
-                        ) || {}).textContent || '';
-                        out.push({
-                            name: login,
-                            url: 'https://www.twitch.tv/' + login,
-                            viewers: viewers.trim(),
-                            drops: hasDrops
-                        });
-                    });
-                    return out;
-                }
-            """)
-            return streamers or []
+            streamers = await collect_virtualized_cards(
+                page,
+                _STREAM_CARD_EXTRACTOR_JS,
+                key=lambda item: str(item.get("login") or "").casefold() or None,
+                max_scrolls=15,
+                scroll_delay=1.5,
+            )
+            eligible = []
+            for streamer in streamers:
+                if streamer.get("drops") is not True:
+                    continue
+                if (
+                    streamer.get("gameUrl")
+                    and not twitch_directories_match(url, streamer.get("gameUrl"))
+                ):
+                    continue
+                try:
+                    login = normalize_twitch_channel_login(streamer.get("login") or "")
+                except ValueError:
+                    continue
+                eligible.append({
+                    "name": login,
+                    "url": f"https://www.twitch.tv/{login}",
+                    "viewers": (streamer.get("viewers") or "").strip(),
+                    "drops": True,
+                })
+            return eligible
         finally:
             await page.close()
 
@@ -1585,14 +1862,12 @@ class UserAutomator:
 
     # ---- stream helpers ----
 
-    async def _accept_mature_content(self):
+    async def _accept_mature_content(self) -> bool:
         try:
-            btn = await self.page.query_selector('[data-a-target="player-overlay-mature-accept"]')
-            if btn:
-                await btn.click()
-                await asyncio.sleep(1)
+            return await accept_mature_content_gate(self.page)
         except Exception:
-            pass
+            logger.debug("User %s mature gate handling failed", self.user_id, exc_info=True)
+            return False
 
     async def _set_low_quality(self):
         try:
@@ -1615,11 +1890,13 @@ class UserAutomator:
 
     # ---- navigation / utility ----
 
-    async def _goto(self, url: str, timeout: int = 60000):
+    async def _goto(self, url: str, timeout: int = 60000) -> bool:
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return True
         except Exception:
-            logger.debug("nav to %s failed", url, exc_info=True)
+            logger.warning("User %s navigation to %s failed", self.user_id, url, exc_info=True)
+            return False
 
     async def _accept_cookies(self):
         try:
@@ -1662,6 +1939,7 @@ class UserAutomator:
 
     async def _cleanup(self):
         self._stop_watch_timer()
+        self._update_status(browser_ready=False)
         try:
             if self.cdp_session:
                 try:
